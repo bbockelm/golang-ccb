@@ -68,15 +68,16 @@ func run() error {
 	}
 
 	// Server security policy from the HTCondor configuration (SEC_* knobs), so
-	// this broker enforces the same policy as the collector's CCB. CCB sessions
-	// are authenticated but NOT encrypted: the proxy splices bytes, and the two
-	// real peers run their own end-to-end CEDAR security over the relay.
+	// this broker authenticates clients with the same policy and keys as the
+	// collector's CCB: GetServerSecurityConfig loads the server-side credentials
+	// (SSL server cert/key, token signing keys, trust domain) needed to *verify*
+	// presented authentications. CCB sessions are authenticated but NOT
+	// encrypted: the proxy splices bytes, and the two real peers run their own
+	// end-to-end CEDAR security over the relay.
 	//
-	// TODO(security-from-config): GetSecurityConfig currently loads client-side
-	// credentials; server-side credential loading (AUTH_SSL_SERVER_*, token
-	// signing keys) and per-command authorization (ALLOW_DAEMON for register,
-	// READ for request) are the separate "drop-in security" workstream.
-	sec, err := htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
+	// TODO(authz): per-command authorization (ALLOW_DAEMON for register, READ
+	// for request) is the remaining piece of drop-in security.
+	sec, err := htcondor.GetServerSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
