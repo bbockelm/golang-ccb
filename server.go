@@ -21,6 +21,7 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
+	"github.com/bbockelm/golang-htcondor/authz"
 )
 
 // Config configures a CCB Server.
@@ -39,6 +40,12 @@ type Config struct {
 	// RequestTimeout bounds how long a pending request waits for the target to
 	// respond / reverse-connect (default 60s).
 	RequestTimeout time.Duration
+
+	// Authz, if set, enforces HTCondor ALLOW_/DENY_ authorization per command
+	// (CCB_REGISTER -> DAEMON/ADVERTISE_*, CCB_REQUEST -> READ), matching the
+	// collector's CCB. If nil, all authenticated peers are authorized (the
+	// authentication policy in Security still applies).
+	Authz *authz.Policy
 
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
@@ -125,9 +132,43 @@ func (s *Server) contactString(id uint64) string {
 	return ccb.ContactString(s.cfg.PublicAddress, id)
 }
 
+// authorize applies the configured ALLOW_/DENY_ policy for command, using the
+// peer's IP and authenticated identity. It returns nil if authorized (or if no
+// policy is configured), and a descriptive error otherwise.
+func (s *Server) authorize(c *cedarserver.Conn, command int) error {
+	if s.cfg.Authz == nil {
+		return nil
+	}
+	ip := peerIP(c.RemoteAddr)
+	user := ""
+	if c.Negotiation != nil {
+		user = c.Negotiation.User
+	}
+	for _, perm := range authz.CommandPerms(ccb.CommandRegister, ccb.CommandRequest, command) {
+		if s.cfg.Authz.Verify(perm, ip, user) {
+			return nil
+		}
+	}
+	return fmt.Errorf("authorization denied for command %d from %s (user %q)", command, c.RemoteAddr, user)
+}
+
+// peerIP extracts the IP from a "host:port" peer address, returning nil if it
+// cannot be parsed.
+func peerIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	return net.ParseIP(host)
+}
+
 // handleRegister handles CCB_REGISTER: assign a ccbid, reply, then service the
 // persistent connection (result reports + heartbeats) until it drops.
 func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error {
+	if err := s.authorize(c, ccb.CommandRegister); err != nil {
+		s.log.Warn("register denied", "remote", c.RemoteAddr, "error", err)
+		return err
+	}
 	ad, err := ccb.ReadControlAd(ctx, c.Stream)
 	if err != nil {
 		return fmt.Errorf("register: reading ad: %w", err)

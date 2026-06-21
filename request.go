@@ -19,6 +19,11 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 		return fmt.Errorf("request: reading ad: %w", err)
 	}
 
+	if err := s.authorize(c, ccb.CommandRequest); err != nil {
+		s.log.Warn("request denied", "remote", c.RemoteAddr, "error", err)
+		return s.replyFailure(ctx, c, "authorization denied")
+	}
+
 	targetContact := ccb.AdString(ad, ccb.AttrCCBID)
 	connectID := ccb.AdString(ad, ccb.AttrClaimID)
 	returnAddr := ccb.AdString(ad, ccb.AttrMyAddress)

@@ -15,6 +15,7 @@ import (
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
+	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
@@ -75,8 +76,6 @@ func run() error {
 	// encrypted: the proxy splices bytes, and the two real peers run their own
 	// end-to-end CEDAR security over the relay.
 	//
-	// TODO(authz): per-command authorization (ALLOW_DAEMON for register, READ
-	// for request) is the remaining piece of drop-in security.
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
@@ -84,9 +83,18 @@ func run() error {
 	sec.Encryption = security.SecurityNever
 	sec.RemoteVersion = streamingVersionString
 
+	// Per-command authorization from the HTCondor ALLOW_/DENY_ knobs, so a peer
+	// that authenticates must also be authorized for CCB_REGISTER (DAEMON) /
+	// CCB_REQUEST (READ), exactly like the collector's CCB.
+	policy, err := authz.NewPolicy(d.Config(), "CCB")
+	if err != nil {
+		return fmt.Errorf("building authorization policy: %w", err)
+	}
+
 	srv, err := ccbserver.New(ccbserver.Config{
 		PublicAddress: pub,
 		Security:      sec,
+		Authz:         policy,
 		Logger:        d.Slog(),
 	})
 	if err != nil {
