@@ -25,7 +25,7 @@ require (
 	github.com/bbockelm/golang-htcondor v0.0.0
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/crypto v0.53.0
 )
 
 replace github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor

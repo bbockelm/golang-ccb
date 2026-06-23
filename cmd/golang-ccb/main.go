@@ -111,12 +111,35 @@ func run() error {
 		log.Info(logging.DestinationGeneral, "ccb reconnect persistence enabled", "file", path)
 	}
 
+	// Session-cache persistence: when CCB_SESSION_CACHE_FILE is configured, the
+	// CEDAR security session cache is persisted (encrypted under the pool signing
+	// keys) so clients can resume sessions across a restart instead of all
+	// re-authenticating at once.
+	var sessionStore ccbserver.SessionStore
+	if path, ok := d.Config().Get("CCB_SESSION_CACHE_FILE"); ok && path != "" {
+		keyMap, err := htcondor.LoadSigningKeys(d.Config())
+		if err != nil {
+			return fmt.Errorf("loading signing keys for session cache: %w", err)
+		}
+		keys := make([]ccbserver.SigningKey, 0, len(keyMap))
+		for id, material := range keyMap {
+			keys = append(keys, ccbserver.SigningKey{ID: id, Material: material})
+		}
+		sessionStore, err = ccbserver.OpenSessionStore(path, keys, d.Slog())
+		if err != nil {
+			return fmt.Errorf("opening session cache store: %w", err)
+		}
+		defer sessionStore.Close()
+		log.Info(logging.DestinationGeneral, "ccb session cache persistence enabled", "file", path, "signing_keys", len(keys))
+	}
+
 	srv, err := ccbserver.New(ccbserver.Config{
 		PublicAddress:       pub,
 		Security:            sec,
 		Authz:               policy,
 		ReconnectStore:      store,
 		ReconnectAllowAnyIP: configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
+		SessionStore:        sessionStore,
 		Logger:              d.Slog(),
 	})
 	if err != nil {
