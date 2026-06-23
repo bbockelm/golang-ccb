@@ -47,6 +47,21 @@ type Config struct {
 	// authentication policy in Security still applies).
 	Authz *authz.Policy
 
+	// ReconnectStore, if set, persists reconnect records so a target keeps its
+	// CCBID (and advertised sinful) across connection drops and broker
+	// restarts. If nil, reconnect state lives only for the process lifetime.
+	ReconnectStore ReconnectStore
+
+	// ReconnectAllowAnyIP permits a target to reclaim its CCBID from a
+	// different peer IP than it originally registered from (mirrors
+	// CCB_RECONNECT_ALLOWED_FROM_ANY_IP). Default false: the peer IP must match.
+	ReconnectAllowAnyIP bool
+
+	// ReconnectTTL bounds how long a reconnect record is retained after its
+	// target last disconnected before being swept (default 24h). Records for
+	// currently-connected targets are never swept.
+	ReconnectTTL time.Duration
+
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -57,12 +72,13 @@ type Server struct {
 	log *slog.Logger
 	srv *cedarserver.Server
 
-	mu       sync.Mutex
-	nextID   uint64
-	nextReq  uint64
-	targets  map[uint64]*target       // ccbid -> registered target
-	requests map[uint64]*request      // requestID -> pending standard request
-	proxies  map[string]*proxySession // connectID -> pending proxy session
+	mu         sync.Mutex
+	nextID     uint64
+	nextReq    uint64
+	targets    map[uint64]*target          // ccbid -> live registered target
+	reconnects map[uint64]*ReconnectRecord // ccbid -> reconnect credentials (survive disconnect)
+	requests   map[uint64]*request         // requestID -> pending standard request
+	proxies    map[string]*proxySession    // connectID -> pending proxy session
 }
 
 // target is a registered daemon holding a persistent connection.
@@ -104,15 +120,22 @@ func New(cfg Config) (*Server, error) {
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 60 * time.Second
 	}
+	if cfg.ReconnectTTL == 0 {
+		cfg.ReconnectTTL = 24 * time.Hour
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	s := &Server{
-		cfg:      cfg,
-		log:      cfg.Logger,
-		targets:  map[uint64]*target{},
-		requests: map[uint64]*request{},
-		proxies:  map[string]*proxySession{},
+		cfg:        cfg,
+		log:        cfg.Logger,
+		targets:    map[uint64]*target{},
+		reconnects: map[uint64]*ReconnectRecord{},
+		requests:   map[uint64]*request{},
+		proxies:    map[string]*proxySession{},
+	}
+	if err := s.loadReconnects(); err != nil {
+		return nil, err
 	}
 	s.srv = cedarserver.New(cfg.Security)
 	s.srv.Handle(ccb.CommandRegister, s.handleRegister)
@@ -121,10 +144,59 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// loadReconnects restores persisted reconnect records and advances nextID past
+// the highest known CCBID (plus a guard for records that may not have been
+// flushed before a prior crash), mirroring the C++ LoadReconnectInfo behavior.
+func (s *Server) loadReconnects() error {
+	if s.cfg.ReconnectStore == nil {
+		return nil
+	}
+	recs, err := s.cfg.ReconnectStore.Load(context.Background())
+	if err != nil {
+		return fmt.Errorf("loading reconnect records: %w", err)
+	}
+	var maxID uint64
+	for i := range recs {
+		r := recs[i]
+		s.reconnects[r.CCBID] = &r
+		if r.CCBID > maxID {
+			maxID = r.CCBID
+		}
+	}
+	if maxID > 0 {
+		// Guard against handing out a CCBID that a pre-restart registration may
+		// have been assigned but not yet persisted.
+		s.nextID = maxID + 100
+	}
+	s.log.Info("ccb reconnect records loaded", "count", len(recs), "next_ccbid", s.nextID+1)
+	return nil
+}
+
 // Serve accepts connections on l until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	s.log.Info("CCB server started", "address", s.cfg.PublicAddress, "listen", l.Addr().String())
+	if s.cfg.ReconnectStore != nil {
+		go s.sweepLoop(ctx)
+	}
 	return s.srv.Serve(ctx, l)
+}
+
+// sweepLoop periodically removes stale reconnect records until ctx is cancelled.
+func (s *Server) sweepLoop(ctx context.Context) {
+	interval := s.cfg.ReconnectTTL / 24
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.SweepReconnects()
+		}
+	}
 }
 
 // contactString builds the contact string advertised to clients.
@@ -181,29 +253,53 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 		conn:   c.Stream.GetConnection(),
 	}
 
-	cookie, err := ccb.GenerateConnectID()
-	if err != nil {
-		return err
+	peerIPStr := ""
+	if ip := peerIP(c.RemoteAddr); ip != nil {
+		peerIPStr = ip.String()
 	}
-	t.cookie = cookie
+	reqCookie := ccb.AdString(ad, ccb.AttrClaimID)
+	prevContact := ccb.AdString(ad, ccb.AttrCCBID)
 
 	s.mu.Lock()
-	// Reconnect: honor a prior ccbid if the cookie matches.
+	// Reconnect: honor a prior ccbid if the presented cookie (and, unless
+	// reconnect-from-any-ip is allowed, the peer IP) matches a known record.
+	// The record survives target disconnect and broker restart, so the target
+	// keeps its advertised sinful.
 	reused := false
-	if prevContact := ccb.AdString(ad, ccb.AttrCCBID); prevContact != "" {
+	if prevContact != "" && reqCookie != "" {
 		if prevID, ok := parseContactID(prevContact); ok {
-			if old, ok := s.targets[prevID]; ok && old.cookie == ccb.AdString(ad, ccb.AttrClaimID) {
+			if rec, ok := s.reconnects[prevID]; ok && rec.Cookie == reqCookie &&
+				(s.cfg.ReconnectAllowAnyIP || rec.PeerIP == peerIPStr) {
 				t.id = prevID
+				t.cookie = rec.Cookie // keep the client's existing ClaimId valid
 				reused = true
 			}
 		}
 	}
 	if !reused {
+		cookie, err := ccb.GenerateConnectID()
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
 		s.nextID++
 		t.id = s.nextID
+		t.cookie = cookie
 	}
 	s.targets[t.id] = t
+	rec := &ReconnectRecord{
+		CCBID:     t.id,
+		Cookie:    t.cookie,
+		PeerIP:    peerIPStr,
+		Name:      name,
+		UpdatedAt: time.Now(),
+	}
+	s.reconnects[t.id] = rec
 	s.mu.Unlock()
+
+	if s.cfg.ReconnectStore != nil {
+		s.cfg.ReconnectStore.Put(*rec)
+	}
 
 	contact := s.contactString(t.id)
 	reply := ccb.NewAd(map[string]any{
@@ -267,7 +363,49 @@ func (s *Server) deliverResult(ad *classad.ClassAd) {
 func (s *Server) removeTarget(id uint64) {
 	s.mu.Lock()
 	delete(s.targets, id)
+	// Keep the reconnect record (so the target can reclaim its CCBID), but
+	// stamp it so the sweep TTL counts from disconnect.
+	var rec *ReconnectRecord
+	if r, ok := s.reconnects[id]; ok {
+		r.UpdatedAt = time.Now()
+		cp := *r
+		rec = &cp
+	}
 	s.mu.Unlock()
+
+	if rec != nil && s.cfg.ReconnectStore != nil {
+		s.cfg.ReconnectStore.Put(*rec)
+	}
+}
+
+// SweepReconnects removes reconnect records for targets that are not currently
+// connected and whose records are older than ReconnectTTL, mirroring the C++
+// SweepReconnectInfo. It is safe to call periodically.
+func (s *Server) SweepReconnects() {
+	cutoff := time.Now().Add(-s.cfg.ReconnectTTL)
+	var stale []uint64
+	s.mu.Lock()
+	for id, rec := range s.reconnects {
+		if _, live := s.targets[id]; live {
+			continue
+		}
+		if rec.UpdatedAt.Before(cutoff) {
+			stale = append(stale, id)
+		}
+	}
+	for _, id := range stale {
+		delete(s.reconnects, id)
+	}
+	s.mu.Unlock()
+
+	if s.cfg.ReconnectStore != nil {
+		for _, id := range stale {
+			s.cfg.ReconnectStore.Delete(id)
+		}
+	}
+	if len(stale) > 0 {
+		s.log.Info("ccb reconnect records swept", "count", len(stale))
+	}
 }
 
 // parseTargetID parses the CCBID a requester names: per the protocol this is

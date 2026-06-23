@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
@@ -91,11 +93,27 @@ func run() error {
 		return fmt.Errorf("building authorization policy: %w", err)
 	}
 
+	// Reconnect persistence: when CCB_RECONNECT_FILE is configured, registered
+	// targets keep their CCBID (and advertised sinful) across drops and broker
+	// restarts. The SQLite store batches writes (~50ms) so a burst of
+	// registrations does not fsync per connection.
+	var store ccbserver.ReconnectStore
+	if path, ok := d.Config().Get("CCB_RECONNECT_FILE"); ok && path != "" {
+		store, err = ccbserver.OpenSQLiteReconnectStore(path, 50*time.Millisecond, d.Slog())
+		if err != nil {
+			return fmt.Errorf("opening reconnect store: %w", err)
+		}
+		defer store.Close()
+		log.Info(logging.DestinationGeneral, "ccb reconnect persistence enabled", "file", path)
+	}
+
 	srv, err := ccbserver.New(ccbserver.Config{
-		PublicAddress: pub,
-		Security:      sec,
-		Authz:         policy,
-		Logger:        d.Slog(),
+		PublicAddress:       pub,
+		Security:            sec,
+		Authz:               policy,
+		ReconnectStore:      store,
+		ReconnectAllowAnyIP: configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
+		Logger:              d.Slog(),
 	})
 	if err != nil {
 		return fmt.Errorf("creating CCB server: %w", err)
@@ -105,4 +123,20 @@ func run() error {
 		"public", pub, "listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
 	return d.Serve(context.Background(), ln, srv.Serve)
+}
+
+// configBool reads an HTCondor-style boolean knob, returning def if unset or
+// unrecognized.
+func configBool(cfg interface{ Get(string) (string, bool) }, key string, def bool) bool {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "t", "yes", "y", "1":
+		return true
+	case "false", "f", "no", "n", "0":
+		return false
+	}
+	return def
 }
