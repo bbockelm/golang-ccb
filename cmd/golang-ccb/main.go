@@ -62,11 +62,15 @@ func run() error {
 	if pub == "" {
 		if tcp, ok := ln.Addr().(*net.TCPAddr); ok {
 			pub = tcp.String()
-		} else {
+		} else if sinful, ok := d.AdvertisedSinful(); ok {
 			// A shared-port (Unix socket) listener has no routable address of
-			// its own; the advertised contact must be the broker's command
-			// sinful. TODO: derive it from the collector address + sock id.
-			return fmt.Errorf("running behind shared port: pass -public <host:port> (the broker's advertised address)")
+			// its own; advertise the broker's shared-port command sinful
+			// (the shared-port server host:port routed to our sock id).
+			pub = sinful
+			log.Info(logging.DestinationGeneral, "advertising shared-port CCB contact",
+				"address", pub, "sock", d.SharedPortName())
+		} else {
+			return fmt.Errorf("running behind shared port but could not derive an advertised address; pass -public <host:port?sock=name>")
 		}
 	}
 
