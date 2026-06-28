@@ -61,12 +61,16 @@ func run() error {
 	// Session-cache persistence: open the store *after* New so its database file
 	// is condor-owned (not root-owned), then restore + arrange snapshots. The
 	// signing keys it reads are root-owned and loaded as root via droppriv.
+	//
+	// The session cache is advisory — it only lets clients resume sessions across
+	// a restart. If it cannot be opened or restored (missing signing keys,
+	// unwritable path, ...), log and run without it rather than refusing to start.
 	if sessionStore, err := buildSessionStore(cfg); err != nil {
-		return err
+		log.Warn(logging.DestinationGeneral, "session-cache persistence unavailable; continuing without it", "error", err)
 	} else if sessionStore != nil {
 		defer sessionStore.Close()
 		if err := d.EnableSessionPersistence(sessionStore, 0); err != nil {
-			return fmt.Errorf("enabling session persistence: %w", err)
+			log.Warn(logging.DestinationGeneral, "restoring the session cache failed; continuing without restored sessions", "error", err)
 		}
 	}
 
