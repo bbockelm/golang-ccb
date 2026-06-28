@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -18,8 +19,11 @@ import (
 	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/authz"
+	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
+	"github.com/bbockelm/golang-htcondor/sessioncache"
+	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
 )
@@ -40,8 +44,25 @@ func run() error {
 	public := flag.String("public", "", "public address advertised in CCB contacts (host:port); defaults to the TCP listen address")
 	flag.Parse()
 
-	// Bootstrap config, logging, and condor_master integration.
-	d, err := daemon.New(daemon.Options{Subsys: "CCB"})
+	cfg, err := config.New()
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	// Session-cache persistence is built before the daemon so the daemon can
+	// restore it (into the global CEDAR session cache) during New, before
+	// serving. The caller owns Close.
+	sessionStore, err := buildSessionStore(cfg)
+	if err != nil {
+		return err
+	}
+	if sessionStore != nil {
+		defer sessionStore.Close()
+	}
+
+	// Bootstrap logging and condor_master integration; restores the session
+	// cache when sessionStore is set.
+	d, err := daemon.New(daemon.Options{Subsys: "CCB", Config: cfg, SessionStore: sessionStore})
 	if err != nil {
 		return err
 	}
@@ -111,35 +132,12 @@ func run() error {
 		log.Info(logging.DestinationGeneral, "ccb reconnect persistence enabled", "file", path)
 	}
 
-	// Session-cache persistence: when CCB_SESSION_CACHE_FILE is configured, the
-	// CEDAR security session cache is persisted (encrypted under the pool signing
-	// keys) so clients can resume sessions across a restart instead of all
-	// re-authenticating at once.
-	var sessionStore ccbserver.SessionStore
-	if path, ok := d.Config().Get("CCB_SESSION_CACHE_FILE"); ok && path != "" {
-		keyMap, err := htcondor.LoadSigningKeys(d.Config())
-		if err != nil {
-			return fmt.Errorf("loading signing keys for session cache: %w", err)
-		}
-		keys := make([]ccbserver.SigningKey, 0, len(keyMap))
-		for id, material := range keyMap {
-			keys = append(keys, ccbserver.SigningKey{ID: id, Material: material})
-		}
-		sessionStore, err = ccbserver.OpenSessionStore(path, keys, d.Slog())
-		if err != nil {
-			return fmt.Errorf("opening session cache store: %w", err)
-		}
-		defer sessionStore.Close()
-		log.Info(logging.DestinationGeneral, "ccb session cache persistence enabled", "file", path, "signing_keys", len(keys))
-	}
-
 	srv, err := ccbserver.New(ccbserver.Config{
 		PublicAddress:       pub,
 		Security:            sec,
 		Authz:               policy,
 		ReconnectStore:      store,
 		ReconnectAllowAnyIP: configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
-		SessionStore:        sessionStore,
 		Logger:              d.Slog(),
 	})
 	if err != nil {
@@ -150,6 +148,30 @@ func run() error {
 		"public", pub, "listen", ln.Addr().String(), "under_master", d.UnderMaster())
 
 	return d.Serve(context.Background(), ln, srv.Serve)
+}
+
+// buildSessionStore constructs the encrypted session-cache store when
+// CCB_SESSION_CACHE_FILE is configured, wrapping its DEK under the pool signing
+// keys. Returns (nil, nil) when persistence is not enabled.
+func buildSessionStore(cfg *config.Config) (sessioncache.SessionStore, error) {
+	path, ok := cfg.Get("CCB_SESSION_CACHE_FILE")
+	if !ok || path == "" {
+		return nil, nil
+	}
+	keyMap, err := htcondor.LoadSigningKeys(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("loading signing keys for session cache: %w", err)
+	}
+	keys := make([]sqlite.SigningKey, 0, len(keyMap))
+	for id, material := range keyMap {
+		keys = append(keys, sqlite.SigningKey{ID: id, Material: material})
+	}
+	store, err := sqlite.Open(path, keys, slog.Default())
+	if err != nil {
+		return nil, fmt.Errorf("opening session cache store: %w", err)
+	}
+	slog.Default().Info("ccb session cache persistence enabled", "file", path, "signing_keys", len(keys))
+	return store, nil
 }
 
 // configBool reads an HTCondor-style boolean knob, returning def if unset or

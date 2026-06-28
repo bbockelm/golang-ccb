@@ -62,16 +62,6 @@ type Config struct {
 	// currently-connected targets are never swept.
 	ReconnectTTL time.Duration
 
-	// SessionStore, if set, persists the CEDAR security session cache (encrypted
-	// at rest) so clients can resume sessions across a broker restart instead of
-	// re-authenticating. If nil, the session cache lives only for the process
-	// lifetime (the C++ default behavior).
-	SessionStore SessionStore
-
-	// SessionSnapshotInterval is how often the session cache is snapshotted to
-	// SessionStore (default 30s). Ignored when SessionStore is nil.
-	SessionSnapshotInterval time.Duration
-
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -81,8 +71,6 @@ type Server struct {
 	cfg Config
 	log *slog.Logger
 	srv *cedarserver.Server
-
-	sessions *sessionPersistence // nil unless SessionStore configured
 
 	mu         sync.Mutex
 	nextID     uint64
@@ -149,14 +137,6 @@ func New(cfg Config) (*Server, error) {
 	if err := s.loadReconnects(); err != nil {
 		return nil, err
 	}
-	if cfg.SessionStore != nil {
-		s.sessions = newSessionPersistence(cfg.SessionStore, s.log, cfg.SessionSnapshotInterval)
-		// Restore persisted sessions before serving so the very first request
-		// can resume an existing session.
-		if err := s.sessions.restore(context.Background()); err != nil {
-			return nil, fmt.Errorf("restoring session cache: %w", err)
-		}
-	}
 	s.srv = cedarserver.New(cfg.Security)
 	s.srv.Handle(ccb.CommandRegister, s.handleRegister)
 	s.srv.Handle(ccb.CommandRequest, s.handleRequest)
@@ -198,16 +178,7 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	if s.cfg.ReconnectStore != nil {
 		go s.sweepLoop(ctx)
 	}
-	if s.sessions != nil {
-		go s.sessions.run(ctx)
-	}
-	err := s.srv.Serve(ctx, l)
-	// On shutdown, take a final session snapshot synchronously so it completes
-	// before the caller closes the store.
-	if s.sessions != nil {
-		s.sessions.finalSnapshot()
-	}
-	return err
+	return s.srv.Serve(ctx, l)
 }
 
 // sweepLoop periodically removes stale reconnect records until ctx is cancelled.
