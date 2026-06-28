@@ -49,24 +49,26 @@ func run() error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	// Session-cache persistence is built before the daemon so the daemon can
-	// restore it (into the global CEDAR session cache) during New, before
-	// serving. The caller owns Close.
-	sessionStore, err := buildSessionStore(cfg)
-	if err != nil {
-		return err
-	}
-	if sessionStore != nil {
-		defer sessionStore.Close()
-	}
-
-	// Bootstrap logging and condor_master integration; restores the session
-	// cache when sessionStore is set.
-	d, err := daemon.New(daemon.Options{Subsys: "CCB", Config: cfg, SessionStore: sessionStore})
+	// Bootstrap logging and condor_master integration. New drops privileges to
+	// the condor user (when started as root), so anything opened after this owns
+	// its files as condor.
+	d, err := daemon.New(daemon.Options{Subsys: "CCB", Config: cfg})
 	if err != nil {
 		return err
 	}
 	log := d.Logger()
+
+	// Session-cache persistence: open the store *after* New so its database file
+	// is condor-owned (not root-owned), then restore + arrange snapshots. The
+	// signing keys it reads are root-owned and loaded as root via droppriv.
+	if sessionStore, err := buildSessionStore(cfg); err != nil {
+		return err
+	} else if sessionStore != nil {
+		defer sessionStore.Close()
+		if err := d.EnableSessionPersistence(sessionStore, 0); err != nil {
+			return fmt.Errorf("enabling session persistence: %w", err)
+		}
+	}
 
 	// Command-socket listener: the shared-port endpoint inherited from
 	// condor_master if present, otherwise a plain TCP bind.
@@ -109,6 +111,13 @@ func run() error {
 	}
 	sec.Encryption = security.SecurityNever
 	sec.RemoteVersion = streamingVersionString
+
+	// Reload the server's credentials (signing keys, SSL key/cert) on SIGHUP, the
+	// HTCondor reconfigure convention, so a rotated key or renewed certificate is
+	// picked up without a restart.
+	if rl, ok := sec.Credentials.(htcondor.CredentialReloader); ok {
+		d.OnReconfig(func(*config.Config) { rl.Reload() })
+	}
 
 	// Per-command authorization from the HTCondor ALLOW_/DENY_ knobs, so a peer
 	// that authenticates must also be authorized for CCB_REGISTER (DAEMON) /
