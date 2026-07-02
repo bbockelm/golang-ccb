@@ -3,8 +3,8 @@ module github.com/bbockelm/golang-ccb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.0.4
-	github.com/bbockelm/cedar v0.1.1
+	github.com/PelicanPlatform/classad v0.1.0
+	github.com/bbockelm/cedar v0.1.2
 )
 
 require (
@@ -35,5 +35,3 @@ require (
 )
 
 replace github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor
-
-replace github.com/bbockelm/cedar => /Users/bbockelm/projects/golang-cedar
