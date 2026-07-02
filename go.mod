@@ -5,7 +5,6 @@ go 1.25.7
 require (
 	github.com/PelicanPlatform/classad v0.0.4
 	github.com/bbockelm/cedar v0.1.1
-	modernc.org/sqlite v1.53.0
 )
 
 require (
@@ -25,6 +24,7 @@ require (
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.53.0 // indirect
 )
 
 require (
@@ -33,3 +33,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 )
+
+replace github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor
+
+replace github.com/bbockelm/cedar => /Users/bbockelm/projects/golang-cedar

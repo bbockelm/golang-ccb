@@ -137,6 +137,28 @@ func New(cfg Config) (*Server, error) {
 	if err := s.loadReconnects(); err != nil {
 		return nil, err
 	}
+	// Give the security layer our authorization policy so its post-auth response
+	// reports the authenticated identity (FQU) and the CCB commands this peer is
+	// authorized for -- HTCondor's SECMAN ValidCommands, which a C++ peer needs
+	// to establish the session. This mirrors authorize() below.
+	if cfg.Authz != nil {
+		cfg.Security.PostAuthPolicy = func(user, peerAddr string) (string, []int) {
+			ip := peerIP(peerAddr)
+			var valid []int
+			for _, cmd := range []int{ccb.CommandRegister, ccb.CommandRequest} {
+				for _, perm := range authz.CommandPerms(ccb.CommandRegister, ccb.CommandRequest, cmd) {
+					if cfg.Authz.Verify(perm, ip, user) {
+						valid = append(valid, cmd)
+						break
+					}
+				}
+			}
+			// The FQU is the authenticated identity, matching what authorize()
+			// verifies against (mapfile canonicalization is a future refinement).
+			return user, valid
+		}
+	}
+
 	s.srv = cedarserver.New(cfg.Security)
 	s.srv.Handle(ccb.CommandRegister, s.handleRegister)
 	s.srv.Handle(ccb.CommandRequest, s.handleRequest)

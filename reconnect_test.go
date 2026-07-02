@@ -1,18 +1,42 @@
 package ccbserver
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	htsqlite "github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 )
 
-func TestSQLiteStoreRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "reconnect.db")
-	st, err := openSQLiteStore(path, 10*time.Millisecond, nil)
+// openSharedTestStore opens an encrypted session-cache database at path and
+// returns a reconnect store sharing that database (mirroring how main.go wires
+// the two together), plus the SharedStore so the caller can close the database.
+func openSharedTestStore(t *testing.T, path string, flush time.Duration) (ReconnectStore, htsqlite.SharedStore) {
+	t.Helper()
+	keys := []htsqlite.SigningKey{{ID: "POOL", Material: bytes.Repeat([]byte{0x5a}, 32)}}
+	ss, err := htsqlite.Open(path, keys, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open session store: %v", err)
 	}
+	shared, ok := ss.(htsqlite.SharedStore)
+	if !ok {
+		_ = ss.Close()
+		t.Fatal("session store does not implement SharedStore")
+	}
+	rc, err := OpenSharedReconnectStore(shared.SharedDB(), shared.Seal, shared.Unseal, flush, nil)
+	if err != nil {
+		_ = ss.Close()
+		t.Fatalf("open reconnect store: %v", err)
+	}
+	return rc, shared
+}
+
+func TestSQLiteStoreRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	st, shared := openSharedTestStore(t, path, 10*time.Millisecond)
 
 	st.Put(ReconnectRecord{CCBID: 1, Cookie: "c1", PeerIP: "10.0.0.1", Name: "a", UpdatedAt: time.Unix(1000, 0)})
 	st.Put(ReconnectRecord{CCBID: 2, Cookie: "c2", PeerIP: "10.0.0.2", Name: "b", UpdatedAt: time.Unix(2000, 0)})
@@ -38,41 +62,47 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 		t.Errorf("after delete, expected only ccbid 1, got %+v", recs)
 	}
 
+	// The reconnect cookie must not appear in plaintext in the shared file.
 	if err := st.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+		t.Fatalf("close reconnect store: %v", err)
+	}
+	if raw, err := os.ReadFile(path); err != nil {
+		t.Fatalf("read db file: %v", err)
+	} else if bytes.Contains(raw, []byte("c1b")) {
+		t.Error("reconnect cookie found in plaintext in the shared database file")
+	}
+	if err := shared.Close(); err != nil {
+		t.Fatalf("close session store: %v", err)
 	}
 
-	// Reopen and confirm durability of the surviving record.
-	st2, err := openSQLiteStore(path, 10*time.Millisecond, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Reopen (simulated restart): a fresh session store + reconnect store on the
+	// same file must decrypt the surviving record.
+	st2, shared2 := openSharedTestStore(t, path, 10*time.Millisecond)
+	defer shared2.Close()
 	defer st2.Close()
-	recs, err = st2.Load(context.Background())
+	recs, err := st2.Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) != 1 || recs[0].CCBID != 1 || recs[0].Cookie != "c1b" {
+	if len(recs) != 1 || recs[0].CCBID != 1 || recs[0].Cookie != "c1b" || recs[0].PeerIP != "10.0.0.9" {
 		t.Errorf("reopened store has wrong contents: %+v", recs)
 	}
 }
 
 func TestSQLiteStoreFlushesOnClose(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "reconnect.db")
+	path := filepath.Join(t.TempDir(), "shared.db")
 	// Long flush interval: only Close() should persist the pending write.
-	st, err := openSQLiteStore(path, time.Hour, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st, shared := openSharedTestStore(t, path, time.Hour)
 	st.Put(ReconnectRecord{CCBID: 7, Cookie: "k", PeerIP: "1.2.3.4", Name: "n", UpdatedAt: time.Unix(5, 0)})
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	st2, err := openSQLiteStore(path, time.Hour, nil)
-	if err != nil {
+	if err := shared.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	st2, shared2 := openSharedTestStore(t, path, time.Hour)
+	defer shared2.Close()
 	defer st2.Close()
 	recs, _ := st2.Load(context.Background())
 	if len(recs) != 1 || recs[0].CCBID != 7 {

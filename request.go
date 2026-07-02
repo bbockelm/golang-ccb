@@ -14,8 +14,10 @@ import (
 // standard (direct reverse connect) and streaming/proxy mode, forwards the
 // request, and relays the result to the requester.
 func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
+	s.log.Info("CCB_REQUEST received", "remote", c.RemoteAddr)
 	ad, err := ccb.ReadControlAd(ctx, c.Stream)
 	if err != nil {
+		s.log.Warn("request: reading ad failed", "remote", c.RemoteAddr, "error", err)
 		return fmt.Errorf("request: reading ad: %w", err)
 	}
 

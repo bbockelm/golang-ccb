@@ -3,22 +3,29 @@ package ccbserver
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-// sqliteStore is a ReconnectStore backed by SQLite with a single writer
-// goroutine. Put/Delete enqueue operations that are coalesced per CCBID and
-// committed in one transaction at most once per flush interval, so a burst of
-// registrations costs one fsync per window rather than one per connection.
+// sqliteStore is a ReconnectStore backed by a table in a SQLite database, with a
+// single writer goroutine. Put/Delete enqueue operations that are coalesced per
+// CCBID and committed in one transaction at most once per flush interval, so a
+// burst of registrations costs one fsync per window rather than one per
+// connection.
+//
+// Each record's secret fields are encrypted at rest with the caller-supplied
+// seal/unseal (the session cache's data-encryption key), so the shared database
+// file leaks no reconnect cookies without a signing key. The database is owned
+// by the session cache; this store shares its handle and never closes it.
 type sqliteStore struct {
-	db    *sql.DB
-	log   *slog.Logger
-	flush time.Duration
+	db     *sql.DB
+	log    *slog.Logger
+	flush  time.Duration
+	seal   func([]byte) ([]byte, error)
+	unseal func([]byte) ([]byte, error)
 
 	ops  chan storeOp
 	done chan struct{}
@@ -30,52 +37,50 @@ type storeOp struct {
 	rec ReconnectRecord
 }
 
-// OpenSQLiteReconnectStore opens (creating if needed) a SQLite-backed
-// ReconnectStore at path, with the given flush interval (0 selects the 50ms
-// default). It is the public entry point for wiring persistence into a Server's
-// Config.ReconnectStore.
-func OpenSQLiteReconnectStore(path string, flush time.Duration, log *slog.Logger) (ReconnectStore, error) {
-	return openSQLiteStore(path, flush, log)
+// sealedReconnect is the plaintext payload sealed into a reconnect row's blob.
+// ccbid and updated_at remain plaintext columns so the writer can key and sweep
+// rows without decrypting; only the secret fields are encrypted.
+type sealedReconnect struct {
+	Cookie string `json:"c"`
+	PeerIP string `json:"p"`
+	Name   string `json:"n"`
 }
 
-// openSQLiteStore opens (creating if needed) the reconnect database at path and
-// starts its writer goroutine. flush is the maximum delay before a queued write
-// is committed (e.g. 50ms). The database uses WAL with synchronous=NORMAL so
-// commits are durable across process crashes without an fsync per transaction.
-func openSQLiteStore(path string, flush time.Duration, log *slog.Logger) (*sqliteStore, error) {
+// OpenSharedReconnectStore returns a ReconnectStore that persists reconnect
+// records in db -- typically the session cache's shared SQLite handle -- with
+// each record's secret fields encrypted via seal/unseal (the session cache's
+// DEK). It creates its table if needed. The store does NOT own db and never
+// closes it; the session cache owns the database lifecycle. flush is the maximum
+// delay before a queued write is committed (0 selects a 50ms default).
+func OpenSharedReconnectStore(db *sql.DB, seal, unseal func([]byte) ([]byte, error), flush time.Duration, log *slog.Logger) (ReconnectStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("reconnect store: nil database")
+	}
+	if seal == nil || unseal == nil {
+		return nil, fmt.Errorf("reconnect store: seal/unseal are required for encrypted persistence")
+	}
 	if log == nil {
 		log = slog.Default()
 	}
 	if flush <= 0 {
 		flush = 50 * time.Millisecond
 	}
-	// busy_timeout guards against transient locks; WAL + NORMAL trade an fsync
-	// per commit for a single fsync at checkpoint while remaining crash-safe.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("opening reconnect db: %w", err)
-	}
-	// A single underlying connection keeps us a true single writer and avoids
-	// WAL writer contention.
-	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS reconnect (
 		ccbid      INTEGER PRIMARY KEY,
-		cookie     TEXT NOT NULL,
-		peer_ip    TEXT NOT NULL,
-		name       TEXT NOT NULL,
+		sealed     BLOB NOT NULL,
 		updated_at INTEGER NOT NULL
 	)`); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("creating reconnect table: %w", err)
 	}
 
 	s := &sqliteStore{
-		db:    db,
-		log:   log,
-		flush: flush,
-		ops:   make(chan storeOp, 1024),
-		done:  make(chan struct{}),
+		db:     db,
+		log:    log,
+		flush:  flush,
+		seal:   seal,
+		unseal: unseal,
+		ops:    make(chan storeOp, 1024),
+		done:   make(chan struct{}),
 	}
 	s.wg.Add(1)
 	go s.writer()
@@ -83,7 +88,7 @@ func openSQLiteStore(path string, flush time.Duration, log *slog.Logger) (*sqlit
 }
 
 func (s *sqliteStore) Load(ctx context.Context) ([]ReconnectRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT ccbid, cookie, peer_ip, name, updated_at FROM reconnect`)
+	rows, err := s.db.QueryContext(ctx, `SELECT ccbid, sealed, updated_at FROM reconnect`)
 	if err != nil {
 		return nil, err
 	}
@@ -91,10 +96,24 @@ func (s *sqliteStore) Load(ctx context.Context) ([]ReconnectRecord, error) {
 	var out []ReconnectRecord
 	for rows.Next() {
 		var r ReconnectRecord
+		var sealed []byte
 		var ts int64
-		if err := rows.Scan(&r.CCBID, &r.Cookie, &r.PeerIP, &r.Name, &ts); err != nil {
+		if err := rows.Scan(&r.CCBID, &sealed, &ts); err != nil {
 			return nil, err
 		}
+		plain, err := s.unseal(sealed)
+		if err != nil {
+			// A record we cannot decrypt (e.g. after a key loss) is useless;
+			// drop it and let the target re-register rather than failing to load.
+			s.log.Warn("ccb reconnect store: dropping undecryptable record", "ccbid", r.CCBID, "error", err)
+			continue
+		}
+		var p sealedReconnect
+		if err := json.Unmarshal(plain, &p); err != nil {
+			s.log.Warn("ccb reconnect store: dropping malformed record", "ccbid", r.CCBID, "error", err)
+			continue
+		}
+		r.Cookie, r.PeerIP, r.Name = p.Cookie, p.PeerIP, p.Name
 		r.UpdatedAt = time.Unix(ts, 0)
 		out = append(out, r)
 	}
@@ -116,11 +135,12 @@ func (s *sqliteStore) enqueue(op storeOp) {
 	}
 }
 
-// Close stops the writer, flushing any pending operations, and closes the db.
+// Close stops the writer, flushing any pending operations. It does not close the
+// shared database (the session cache owns it).
 func (s *sqliteStore) Close() error {
 	close(s.done)
 	s.wg.Wait()
-	return s.db.Close()
+	return nil
 }
 
 // writer is the single goroutine that owns all writes. It coalesces operations
@@ -170,13 +190,23 @@ func (s *sqliteStore) commit(batch map[uint64]storeOp) {
 		if op.del {
 			_, err = tx.ExecContext(ctx, `DELETE FROM reconnect WHERE ccbid = ?`, op.rec.CCBID)
 		} else {
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO reconnect (ccbid, cookie, peer_ip, name, updated_at)
-				 VALUES (?, ?, ?, ?, ?)
-				 ON CONFLICT(ccbid) DO UPDATE SET
-				   cookie=excluded.cookie, peer_ip=excluded.peer_ip,
-				   name=excluded.name, updated_at=excluded.updated_at`,
-				op.rec.CCBID, op.rec.Cookie, op.rec.PeerIP, op.rec.Name, op.rec.UpdatedAt.Unix())
+			var payload []byte
+			payload, err = json.Marshal(sealedReconnect{
+				Cookie: op.rec.Cookie,
+				PeerIP: op.rec.PeerIP,
+				Name:   op.rec.Name,
+			})
+			if err == nil {
+				var sealed []byte
+				if sealed, err = s.seal(payload); err == nil {
+					_, err = tx.ExecContext(ctx,
+						`INSERT INTO reconnect (ccbid, sealed, updated_at)
+						 VALUES (?, ?, ?)
+						 ON CONFLICT(ccbid) DO UPDATE SET
+						   sealed=excluded.sealed, updated_at=excluded.updated_at`,
+						op.rec.CCBID, sealed, op.rec.UpdatedAt.Unix())
+				}
+			}
 		}
 		if err != nil {
 			s.log.Warn("ccb reconnect store: write failed, rolling back batch", "error", err)
