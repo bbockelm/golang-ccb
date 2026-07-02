@@ -137,31 +137,20 @@ func New(cfg Config) (*Server, error) {
 	if err := s.loadReconnects(); err != nil {
 		return nil, err
 	}
-	// Give the security layer our authorization policy so its post-auth response
-	// reports the authenticated identity (FQU) and the CCB commands this peer is
-	// authorized for -- HTCondor's SECMAN ValidCommands, which a C++ peer needs
-	// to establish the session. This mirrors authorize() below.
-	if cfg.Authz != nil {
-		cfg.Security.PostAuthPolicy = func(user, peerAddr string) (string, []int) {
-			ip := peerIP(peerAddr)
-			var valid []int
-			for _, cmd := range []int{ccb.CommandRegister, ccb.CommandRequest} {
-				for _, perm := range authz.CommandPerms(ccb.CommandRegister, ccb.CommandRequest, cmd) {
-					if cfg.Authz.Verify(perm, ip, user) {
-						valid = append(valid, cmd)
-						break
-					}
-				}
-			}
-			// The FQU is the authenticated identity, matching what authorize()
-			// verifies against (mapfile canonicalization is a future refinement).
-			return user, valid
-		}
-	}
-
 	s.srv = cedarserver.New(cfg.Security)
-	s.srv.Handle(ccb.CommandRegister, s.handleRegister)
-	s.srv.Handle(ccb.CommandRequest, s.handleRequest)
+
+	// Give the command server our authorization policy. It uses each command's
+	// registered levels (below) to compute the session's ValidCommands after
+	// authentication -- HTCondor's SECMAN ValidCommands, which a C++ peer needs to
+	// reuse the session -- and authorize() below verifies the same levels per
+	// command. CCB_REGISTER accepts DAEMON or any ADVERTISE_* level (matching the
+	// C++ ccb_server); CCB_REQUEST needs READ. CCB_REVERSE_CONNECT is raw (ALLOW).
+	if cfg.Authz != nil {
+		s.srv.Authorizer = cfg.Authz.Authorize
+	}
+	s.srv.Handle(ccb.CommandRegister, s.handleRegister,
+		"DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER")
+	s.srv.Handle(ccb.CommandRequest, s.handleRequest, "READ")
 	s.srv.HandleRaw(ccb.CommandReverseConnect, s.handleReverseConnect)
 	return s, nil
 }
@@ -226,20 +215,21 @@ func (s *Server) contactString(id uint64) string {
 	return ccb.ContactString(s.cfg.PublicAddress, id)
 }
 
-// authorize applies the configured ALLOW_/DENY_ policy for command, using the
-// peer's IP and authenticated identity. It returns nil if authorized (or if no
-// policy is configured), and a descriptive error otherwise.
+// authorize applies the configured ALLOW_/DENY_ policy for command, verifying
+// the peer's authenticated identity against the authorization levels the command
+// was registered with (the single source of truth also used to advertise
+// ValidCommands). It returns nil if authorized (or if no policy is configured),
+// and a descriptive error otherwise.
 func (s *Server) authorize(c *cedarserver.Conn, command int) error {
 	if s.cfg.Authz == nil {
 		return nil
 	}
-	ip := peerIP(c.RemoteAddr)
 	user := ""
 	if c.Negotiation != nil {
 		user = c.Negotiation.User
 	}
-	for _, perm := range authz.CommandPerms(ccb.CommandRegister, ccb.CommandRequest, command) {
-		if s.cfg.Authz.Verify(perm, ip, user) {
+	for _, perm := range s.srv.CommandPerms(command) {
+		if s.cfg.Authz.Authorize(perm, c.RemoteAddr, user) {
 			return nil
 		}
 	}
