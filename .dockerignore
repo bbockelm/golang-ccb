@@ -1,0 +1,14 @@
+# Keep the build context small and reproducible.
+.git
+.github
+.gitignore
+.golangci.yml
+Dockerfile
+.dockerignore
+README.md
+
+# Local build artifacts / test output (also gitignored).
+/golang-ccb
+*.test
+*.out
+test-results.xml

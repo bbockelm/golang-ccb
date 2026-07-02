@@ -1,0 +1,36 @@
+# golangci-lint configuration
+# See https://golangci-lint.run/usage/configuration/
+#
+# A focused set: the reliable correctness linters (plus complexity/spelling),
+# minus the style- and HTTP-oriented ones that mostly fire on the exec-based
+# integration harness. Errors are checked everywhere, including tests.
+
+version: '2'
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # Check for unchecked errors
+    - govet         # Vet examines Go source code
+    - ineffassign   # Detect ineffectual assignments
+    - staticcheck   # Static analysis
+    - unused        # Check for unused code
+    - misspell      # Find commonly misspelled words
+    - unconvert     # Remove unnecessary conversions
+    - errorlint     # Find code that will break with error wrapping
+    - gocyclo       # Cyclomatic complexity
+    - bodyclose     # Checks HTTP response body is closed
+
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Track the minimum Go version named in go.mod (currently 1.25).
+        # Add new minor versions here when go.mod's `go` directive moves forward.
+        go-version: ['1.25']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go-version }}
+        cache: true
+
+    - name: Install HTCondor
+      run: |
+        # The CCB-under-condor_master integration test needs the HTCondor
+        # daemons and tools (condor_master, condor_submit, condor_wait) on PATH;
+        # without them it skips. Install the pool binaries from the HTCondor repo.
+        wget -qO - https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-25.x-Key | sudo gpg --dearmor -o /usr/share/keyrings/htcondor-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/htcondor-archive-keyring.gpg] http://research.cs.wisc.edu/htcondor/repo/ubuntu/25.x $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/htcondor.list
+        sudo apt-get update
+        sudo apt-get install -y condor
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Install gotestsum
+      run: go install gotest.tools/gotestsum@latest
+
+    - name: Run go vet
+      run: go vet ./...
+
+    - name: Run tests
+      # The integration test runs a personal HTCondor pool and a job through the
+      # Go CCB; give it room. Unit tests run under the race detector.
+      run: gotestsum --junitfile=test-results.xml -- -race -timeout=15m -coverprofile=coverage.out -covermode=atomic ./...
+
+    - name: Upload coverage to Codecov
+      if: matrix.go-version == '1.25'
+      uses: codecov/codecov-action@v4
+      with:
+        files: ./coverage.out
+        flags: unittests
+        fail_ci_if_error: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+        cache: true
+
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v7
+      with:
+        args: --timeout=5m
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+        cache: true
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Build the golang-ccb binary
+      run: go build -v -o golang-ccb ./cmd/golang-ccb
