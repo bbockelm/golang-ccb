@@ -28,10 +28,8 @@ require (
 )
 
 require (
-	github.com/bbockelm/golang-htcondor v0.2.0
+	github.com/bbockelm/golang-htcondor v0.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 )
-
-replace github.com/bbockelm/golang-htcondor => /Users/bbockelm/projects/golang-htcondor
