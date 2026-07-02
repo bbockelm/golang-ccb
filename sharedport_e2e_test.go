@@ -120,7 +120,7 @@ func TestCCBBehindSharedPort(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.Serve(ctx, ccbLn)
+	go func() { _ = srv.Serve(ctx, ccbLn) }()
 
 	// A target registers directly with the CCB backend; its contact carries the
 	// shared-port broker address.
@@ -140,7 +140,7 @@ func TestCCBBehindSharedPort(t *testing.T) {
 	})
 	lctx, lcancel := context.WithCancel(context.Background())
 	defer lcancel()
-	go lis.Run(lctx)
+	go func() { _ = lis.Run(lctx) }()
 
 	contact := waitForContact(t, lis)
 	broker, _, ok := addresses.SplitCCBContact(contact)

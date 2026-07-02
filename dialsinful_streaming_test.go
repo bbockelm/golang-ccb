@@ -30,7 +30,7 @@ func (l *logCatcher) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 func (l *logCatcher) WithAttrs([]slog.Attr) slog.Handler { return l }
-func (l *logCatcher) WithGroup(string) slog.Handler       { return l }
+func (l *logCatcher) WithGroup(string) slog.Handler      { return l }
 
 func (l *logCatcher) saw(msg string) bool {
 	l.mu.Lock()
@@ -63,7 +63,7 @@ func startTestServerWithLog(t *testing.T) (addr string, rec *logCatcher, cancel 
 		t.Fatal(err)
 	}
 	ctx, c := context.WithCancel(context.Background())
-	go srv.Serve(ctx, ln)
+	go func() { _ = srv.Serve(ctx, ln) }()
 	return addr, rec, c
 }
 
@@ -94,7 +94,7 @@ func startCedarTarget(t *testing.T, brokerAddr string, served chan<- struct{}) (
 		},
 	})
 	ctx, c := context.WithCancel(context.Background())
-	go lis.Run(ctx)
+	go func() { _ = lis.Run(ctx) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

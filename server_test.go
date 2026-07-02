@@ -45,7 +45,7 @@ func startTestServer(t *testing.T) (addr string, cancel func()) {
 		t.Fatal(err)
 	}
 	ctx, c := context.WithCancel(context.Background())
-	go srv.Serve(ctx, ln)
+	go func() { _ = srv.Serve(ctx, ln) }()
 	return addr, c
 }
 
@@ -67,7 +67,7 @@ func startEchoTarget(t *testing.T, brokerAddr string) (contact string, cancel fu
 		},
 	})
 	ctx, c := context.WithCancel(context.Background())
-	go lis.Run(ctx)
+	go func() { _ = lis.Run(ctx) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -154,7 +154,7 @@ func TestStreamingGateFailsFast(t *testing.T) {
 	}
 	ctx, c := context.WithCancel(context.Background())
 	defer c()
-	go srv.Serve(ctx, ln)
+	go func() { _ = srv.Serve(ctx, ln) }()
 	contact, stopTgt := startEchoTarget(t, addr)
 	defer stopTgt()
 
@@ -182,7 +182,7 @@ func assertEcho(t *testing.T, conn net.Conn) {
 	}
 	buf := make([]byte, 4)
 	if err := conn.SetReadDeadline(time.Now().Add(4 * time.Second)); err == nil {
-		defer conn.SetReadDeadline(time.Time{})
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	}
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("read: %v", err)

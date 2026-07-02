@@ -32,7 +32,7 @@ func TestReconnectReusesCCBID(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.Serve(ctx, ln)
+	go func() { _ = srv.Serve(ctx, ln) }()
 
 	lis := ccb.NewListener(ccb.ListenerConfig{
 		BrokerAddr:        addr,
@@ -44,7 +44,7 @@ func TestReconnectReusesCCBID(t *testing.T) {
 	})
 	lctx, lcancel := context.WithCancel(context.Background())
 	defer lcancel()
-	go lis.Run(lctx)
+	go func() { _ = lis.Run(lctx) }()
 
 	// Wait for the initial registration and capture its CCBID.
 	contact := waitForContact(t, lis)

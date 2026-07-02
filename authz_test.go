@@ -39,7 +39,7 @@ func startTestServerWithAuthz(t *testing.T, cfg testCfg) (addr string, cancel fu
 		t.Fatal(err)
 	}
 	ctx, c := context.WithCancel(context.Background())
-	go srv.Serve(ctx, ln)
+	go func() { _ = srv.Serve(ctx, ln) }()
 	return addr, c
 }
 
@@ -93,7 +93,7 @@ func TestAuthzDeniesRegister(t *testing.T) {
 	})
 	ctx, c := context.WithCancel(context.Background())
 	defer c()
-	go lis.Run(ctx)
+	go func() { _ = lis.Run(ctx) }()
 
 	// Give the listener time to attempt (and be denied) registration; it must
 	// never obtain a contact.

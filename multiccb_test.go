@@ -63,7 +63,7 @@ func TestMultiBrokerListener(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go lis.Run(ctx)
+	go func() { _ = lis.Run(ctx) }()
 
 	waitRegistered(t, lis, 2)
 	contacts := lis.Contacts()
@@ -106,7 +106,7 @@ func TestHappyEyeballsAcrossBrokers(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go lis.Run(ctx)
+	go func() { _ = lis.Run(ctx) }()
 
 	waitRegistered(t, lis, 2)
 	contacts := allContacts(t, lis.Contacts())
