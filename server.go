@@ -138,21 +138,42 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s.srv = cedarserver.New(cfg.Security)
-
-	// Give the command server our authorization policy. It uses each command's
-	// registered levels (below) to compute the session's ValidCommands after
-	// authentication -- HTCondor's SECMAN ValidCommands, which a C++ peer needs to
-	// reuse the session -- and authorize() below verifies the same levels per
-	// command. CCB_REGISTER accepts DAEMON or any ADVERTISE_* level (matching the
-	// C++ ccb_server); CCB_REQUEST needs READ. CCB_REVERSE_CONNECT is raw (ALLOW).
 	if cfg.Authz != nil {
 		s.srv.Authorizer = cfg.Authz.Authorize
 	}
-	s.srv.Handle(ccb.CommandRegister, s.handleRegister,
-		"DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER")
-	s.srv.Handle(ccb.CommandRequest, s.handleRequest, "READ")
-	s.srv.HandleRaw(ccb.CommandReverseConnect, s.handleReverseConnect)
+	s.RegisterOn(s.srv)
 	return s, nil
+}
+
+// RegisterOn registers the CCB command handlers onto an existing cedar
+// command-dispatch server. A standalone golang-ccb registers on its own internal
+// server (via New); a host daemon that wants an *embedded* CCB -- e.g. the
+// collector serving CCB on its own shared command socket, like the C++ collector's
+// ENABLE_CCB_SERVER -- creates the Server, calls RegisterOn(hostServer), then runs
+// the host's own Serve loop and StartBackground for reconnect sweeping.
+//
+// The command server uses each command's registered levels to compute the
+// session's ValidCommands after authentication (HTCondor's SECMAN ValidCommands, a
+// C++ peer needs them to reuse the session) and, when the host server has an
+// Authorizer, to authorize per command. CCB_REGISTER accepts DAEMON or any
+// ADVERTISE_* level (matching the C++ ccb_server); CCB_REQUEST needs READ.
+// CCB_REVERSE_CONNECT is raw (no security handshake), so it is registered with
+// HandleRaw regardless of the host server's policy.
+func (s *Server) RegisterOn(cs *cedarserver.Server) {
+	cs.Handle(ccb.CommandRegister, s.handleRegister,
+		"DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER")
+	cs.Handle(ccb.CommandRequest, s.handleRequest, "READ")
+	cs.HandleRaw(ccb.CommandReverseConnect, s.handleReverseConnect)
+}
+
+// StartBackground starts the server's background maintenance (reconnect-record
+// sweeping) under ctx. A standalone server does this from Serve; an embedded
+// server whose host runs the Serve loop must call it explicitly. No-op without a
+// reconnect store.
+func (s *Server) StartBackground(ctx context.Context) {
+	if s.cfg.ReconnectStore != nil {
+		go s.sweepLoop(ctx)
+	}
 }
 
 // loadReconnects restores persisted reconnect records and advances nextID past
@@ -186,9 +207,7 @@ func (s *Server) loadReconnects() error {
 // Serve accepts connections on l until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 	s.log.Info("CCB server started", "address", s.cfg.PublicAddress, "listen", l.Addr().String())
-	if s.cfg.ReconnectStore != nil {
-		go s.sweepLoop(ctx)
-	}
+	s.StartBackground(ctx)
 	return s.srv.Serve(ctx, l)
 }
 
