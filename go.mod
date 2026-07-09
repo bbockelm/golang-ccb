@@ -3,8 +3,8 @@ module github.com/bbockelm/golang-ccb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.1.0
-	github.com/bbockelm/cedar v0.1.2
+	github.com/PelicanPlatform/classad v0.4.0
+	github.com/bbockelm/cedar v0.3.0
 )
 
 require (
