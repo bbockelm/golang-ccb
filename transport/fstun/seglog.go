@@ -118,6 +118,17 @@ func (w *segWriter) reap(ackedDataOff uint64) {
 	w.reapOff = append([]segEnd(nil), kept...)
 }
 
+// syncNow forces the current segment to the backing store regardless of the
+// syncEnb setting -- used for handshake frames (the SYN) so the peer sees them
+// promptly on NFS even when per-append syncing is off.
+func (w *segWriter) syncNow() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		_ = w.f.Sync()
+	}
+}
+
 func (w *segWriter) close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()

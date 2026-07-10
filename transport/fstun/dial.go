@@ -23,12 +23,12 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	connDir := filepath.Join(cfg.Root, connID)
-	c, err := handshake(ctx, rc, params, connDir, roleInitiator)
+	c, err := handshake(ctx, rc, params, cfg.Root, connID, roleInitiator)
 	if err != nil {
-		// Never-established: the initiator owns cleanup of its own subtree so a
-		// failed dial does not leak a directory (the acceptor never engaged it).
-		_ = os.RemoveAll(connDir)
+		// Never-established: the initiator owns cleanup so a failed dial leaks
+		// neither its (hashed) work subtree nor its inbox marker.
+		_ = os.RemoveAll(connPath(cfg.Root, connID))
+		_ = os.Remove(inboxMarkerPath(cfg.Root, connID))
 		return nil, err
 	}
 	return c, nil
@@ -36,23 +36,30 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 
 // handshake creates the send direction, writes our SYN as frame 0, opens the recv
 // direction, and waits for the peer's SYN. On success it starts a live Conn.
-func handshake(ctx context.Context, rc resolvedConfig, params synParams, connDir string, r role) (*Conn, error) {
+func handshake(ctx context.Context, rc resolvedConfig, params synParams, root, connID string, r role) (*Conn, error) {
+	connDir := connPath(root, connID)
 	sendDir := filepath.Join(connDir, r.sendDir())
 	w, err := newSegWriter(sendDir, rc.segmentSize, rc.sync)
 	if err != nil {
 		return nil, fmt.Errorf("fstun: opening send dir: %w", err)
 	}
-	// Our SYN is frame 0 of the send direction, written before any DATA.
+	// Our SYN is frame 0 of the send direction, written before any DATA; force it
+	// to the server so the peer can read it promptly even when Sync is off.
 	syn := &frame{typ: frameSYN, seq: 0, dataOff: 0, payload: params.encode()}
 	if err := w.append(syn, 0); err != nil {
 		w.close()
 		return nil, fmt.Errorf("fstun: writing SYN: %w", err)
 	}
-	// The initiator rings the doorbell so the acceptor learns of this new subtree
-	// without listing the directory on a tight loop. Best-effort: the acceptor's
-	// slow scan is the backstop if the ring fails.
+	w.syncNow()
+
+	// The initiator announces itself AFTER its work subtree + SYN exist: it drops
+	// a marker in the small inbox and rings the doorbell, so the acceptor learns
+	// of the arrival by reading the inbox rather than listing the (hashed, large)
+	// work tree. Best-effort: the acceptor's slow inbox scan is the backstop.
 	if r == roleInitiator {
-		_ = ringDoorbell(filepath.Dir(connDir))
+		if writeInboxMarker(root, connID) == nil {
+			_ = ringDoorbell(root)
+		}
 	}
 
 	sr := newSegReader(filepath.Join(connDir, r.recvDir()))

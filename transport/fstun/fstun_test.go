@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -137,7 +138,7 @@ func TestLargeTransferRotationReap(t *testing.T) {
 	// Reaping: the initiator's c2s direction should not still hold all ~64
 	// segments once the acceptor has ACKed its consumption. Give ACKs a moment.
 	deadline := time.Now().Add(5 * time.Second)
-	c2s := filepath.Join(cfg.Root, connIDOf(t, cfg.Root), "c2s")
+	c2s := filepath.Join(connPath(cfg.Root, soleConnID(t, cfg.Root)), "c2s")
 	for {
 		segs := countSegs(t, c2s)
 		if segs <= 4 { // a small tail remains unreaped; that's fine
@@ -253,17 +254,26 @@ func TestDecodeFrameTornTail(t *testing.T) {
 	}
 }
 
-// connIDOf returns the single conn-id subdirectory under root (the test creates
-// exactly one pipe).
-func connIDOf(t *testing.T, root string) string {
+// soleConnID returns the single conn-id in the hashed work tree (the test creates
+// exactly one pipe), skipping the inbox and doorbell.
+func soleConnID(t *testing.T, root string) string {
 	t.Helper()
-	entries, err := os.ReadDir(root)
+	fanouts, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range entries {
-		if e.IsDir() {
-			return e.Name()
+	for _, fo := range fanouts {
+		if !fo.IsDir() || fo.Name() == inboxDirName || strings.HasPrefix(fo.Name(), ".") {
+			continue
+		}
+		rests, err := os.ReadDir(filepath.Join(root, fo.Name()))
+		if err != nil {
+			continue
+		}
+		for _, re := range rests {
+			if re.IsDir() {
+				return fo.Name() + re.Name()
+			}
 		}
 	}
 	t.Fatal("no conn-id subdir found")

@@ -135,15 +135,23 @@ designed around exactly those constraints.
 
 ```
 <root>/                       # owned by the outside CCB (acceptor)
-  <conn-id>/                  # one subdirectory == one byte-pipe, created by an
-                              #   inside CCB (initiator). <conn-id> is a random
-                              #   unguessable token.
-    c2s/                      # initiator→acceptor direction (client→server)
-      000000.seg              # append-only segment, rolled at SegmentSize (128MiB)
-      000001.seg
-    s2c/                      # acceptor→initiator direction (server→client)
-      000000.seg
+  .doorbell                   # single file; initiators bump its mtime on arrival
+  inbox/                      # small: one empty marker per not-yet-engaged tunnel
+    <conn-id>                 #   named after the conn-id; acceptor removes on pickup
+  <ab>/                       # hashed fan-out: first 2 hex chars of the conn-id
+    <cdef...>/                # rest of the conn-id -> one byte-pipe (one tunnel)
+      c2s/                    # initiator→acceptor direction (client→server)
+        000000.seg            # append-only segment, rolled at SegmentSize (128MiB)
+        000001.seg
+      s2c/                    # acceptor→initiator direction (server→client)
+        000000.seg
 ```
+
+The conn-id is a random unguessable token; hashing it into `<ab>/<cdef…>` fans the
+work tree over up to 256 directories so none accumulates every tunnel (some
+filesystems degrade with huge single-directory entry counts). The acceptor never
+lists the work tree except once at startup (§4.1.1), so the fan-out exists purely
+to bound per-directory size, not to speed a scan.
 
 **Single writer per file.** The initiator only ever appends to `c2s/`; the
 acceptor only ever appends to `s2c/`. This sidesteps NFS's lack of atomic
@@ -153,25 +161,38 @@ writer of `s2c`), so control still flows both ways with single-writer files.
 
 #### 4.1.1 Arrival signalling — the doorbell
 
-Listing a directory on NFS is expensive, and doing it on a tight loop to spot new
-initiators does not scale. Instead the initiator **rings a doorbell**: after
-creating its subtree and writing its SYN it bumps the mtime of a single
-`<root>/.doorbell` file with one atomic `Chtimes` (`SETATTR`) and fsyncs the root
-directory, pushing the new subtree's directory entry out of its local write-back
-cache. The acceptor watches that *one* file's mtime with a cheap `stat`
-aggressively (data-path poll interval); a change triggers a full `readdir`. A slow
-full scan every **30 s** is the guaranteed backstop.
+Listing the work tree on NFS is expensive, and doing it on a tight loop to spot
+new initiators does not scale. Discovery is therefore two cheap levels — a
+doorbell and an inbox — and the work tree is listed **only once, at startup**.
 
-*Does this race?* Yes, benignly. Even after the initiator fsyncs, the acceptor may
-`readdir` a stale cached listing (NFS close-to-open only guarantees freshness at
-open, and the acceptor's directory attribute cache may not have expired) that
-omits the just-created subtree. We do **not** rely on the doorbell being ordered
-before a fresh listing: a ring triggers several **follow-up rescans**, and the
-30 s scan is the hard guarantee, so a stale listing is *retried*, never lost.
-Prompt detection also depends on the mount's attribute-cache timeouts (`actimeo`);
-the backstop makes correctness independent of them. The acceptor never prunes its
-"seen" set from a listing (a transiently-stale `readdir` could otherwise cause a
-double-accept); entries are forgotten only when a subtree is reaped.
+After creating its subtree and writing its SYN, the initiator (1) drops an empty
+marker `<root>/inbox/<conn-id>` (O_TRUNC create, then fsync the inbox directory so
+the entry reaches the server), and (2) **rings the doorbell** — bumps the mtime of
+a single `<root>/.doorbell` file with one atomic `Chtimes` (`SETATTR`). The
+acceptor watches only that one doorbell file's mtime with a cheap `stat`
+aggressively (data-path poll interval); a change triggers a `readdir` of the
+**inbox** — which is small, holding only markers not yet engaged. For each marker
+the acceptor resolves the hashed work path `connPath(<conn-id>)`, and once the
+initiator's `c2s` SYN segment is visible it engages the tunnel and removes the
+marker (the acceptor owns inbox cleanup). A slow inbox scan every **30 s** is the
+guaranteed backstop; the work tree itself is read only by the one-time startup
+scan that re-engages tunnels that predate a restart.
+
+*Does this race?* Yes, benignly. NFS may surface metadata **out of order** — the
+acceptor can see the inbox marker before the initiator's work subtree (or before
+its `c2s` SYN segment) is visible, since close-to-open only guarantees freshness
+at open and the directory attribute cache may not have expired. So the acceptor
+does **not** assume the work subtree is present when a marker appears: if
+`connPath(<conn-id>)/c2s/000000.seg` does not yet resolve, the marker is left in
+place and retried on the next scan. A ring triggers several **follow-up rescans**,
+and the 30 s inbox scan is the hard backstop, so a marker whose subtree is briefly
+invisible is *retried*, never lost. The marker is removed only once the tunnel is
+engaged (or by the initiator's own cleanup on a failed dial, or the age-sweep for
+orphans). Prompt detection also depends on the mount's attribute-cache timeouts
+(`actimeo`); the backstop makes correctness independent of them. The acceptor
+never prunes its "seen" set from a listing (a transiently-stale view could
+otherwise cause a double-accept); entries are forgotten only when a tunnel is
+reaped or fails its handshake.
 
 *Why `Chtimes`, not append or `truncate`?* The doorbell is shared by *many*
 initiators (one outside CCB serves many inside CCBs), so the ring op must be safe
