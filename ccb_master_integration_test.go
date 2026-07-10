@@ -98,15 +98,6 @@ SEC_CLIENT_AUTHENTICATION_METHODS = FS, IDTOKENS
 SEC_PASSWORD_DIRECTORY = %s
 SEC_TOKEN_POOL_SIGNING_KEY_FILE = %s
 TRUST_DOMAIN = ccb.test
-# cedar (and thus the Go CCB) implements only AES-GCM. Released HTCondor picks
-# an antiquated cipher (BLOWFISH, or 3DES in FIPS mode) for its non-negotiated
-# *family* session (how master-child daemons talk) via getPreferredOldCrypt-
-# Protocol, for pre-8.9.x backward compatibility, which cedar cannot decrypt.
-# Restricting the pool to AES forces the family session to AES-GCM. This knob
-# becomes unnecessary once the "prefer AES for non-negotiated/family sessions"
-# HTCondor change ships (branch V25_X-HTCONDOR-prefer-aes-sessions); modern
-# pools should set it anyway, as a pre-8.9 daemon could not join such a pool.
-SEC_DEFAULT_CRYPTO_METHODS = AES
 
 # --- A tiny, fast vanilla job works ---
 START = TRUE
