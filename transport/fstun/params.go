@@ -35,9 +35,11 @@ func decodeUint64(b []byte) (uint64, error) {
 // higher version is expected to be backward compatible; a lower one is rejected.
 const protocolVersion uint16 = 1
 
-// synParams is a SYN frame's payload: the version and the sender's proposed pipe
-// parameters. The established parameters are the element-wise min of both SYNs so
-// each side honours the other's tighter limit (§4.4).
+// synParams is a SYN frame's payload: the protocol version and the sender's own
+// send-side parameters. Each side chooses its own segment size / window / max
+// frame independently (the reader is agnostic, bounded only by maxPayload), so
+// these are not negotiated -- they are carried for the version check and for
+// diagnostics.
 type synParams struct {
 	version     uint16
 	segmentSize uint64 // bytes per segment file before rolling
@@ -64,34 +66,4 @@ func decodeSynParams(b []byte) (synParams, error) {
 		window:      binary.BigEndian.Uint64(b[10:18]),
 		maxFrame:    binary.BigEndian.Uint32(b[18:22]),
 	}, nil
-}
-
-// merge returns the negotiated parameters: the tighter (smaller) of each field,
-// so neither side is asked to exceed a limit it proposed.
-func (p synParams) merge(o synParams) synParams {
-	return synParams{
-		version:     minU16(p.version, o.version),
-		segmentSize: minU64(p.segmentSize, o.segmentSize),
-		window:      minU64(p.window, o.window),
-		maxFrame:    minU32(p.maxFrame, o.maxFrame),
-	}
-}
-
-func minU16(a, b uint16) uint16 {
-	if a < b {
-		return a
-	}
-	return b
-}
-func minU32(a, b uint32) uint32 {
-	if a < b {
-		return a
-	}
-	return b
-}
-func minU64(a, b uint64) uint64 {
-	if a < b {
-		return a
-	}
-	return b
 }

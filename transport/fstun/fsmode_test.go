@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -60,7 +61,7 @@ func TestForcedNetworkModeRoundTrip(t *testing.T) {
 			n, err := acc.Read(b)
 			got = append(got, b[:n]...)
 			if err != nil {
-				if err == io.EOF {
+				if errors.Is(err, io.EOF) {
 					return
 				}
 				t.Errorf("read: %v", err)

@@ -54,8 +54,6 @@ const (
 	headerLen = 22
 	// crcLen is the trailing CRC32C.
 	crcLen = 4
-	// frameOverhead is the non-payload cost of a frame on disk.
-	frameOverhead = headerLen + crcLen
 	// maxPayload bounds a single frame's payload so a torn tail is cheap to
 	// re-read and a hostile length cannot force a huge allocation.
 	maxPayload = 1 << 20 // 1 MiB
@@ -80,9 +78,6 @@ type frame struct {
 	dataOff uint64 // cumulative DATA payload bytes BEFORE this frame
 	payload []byte
 }
-
-// encodedLen is the number of bytes this frame occupies on disk.
-func (f *frame) encodedLen() int { return frameOverhead + len(f.payload) }
 
 // appendTo encodes f (header, payload, CRC) onto dst and returns the extended
 // slice.

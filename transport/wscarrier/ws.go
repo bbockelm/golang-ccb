@@ -217,6 +217,9 @@ func Dial(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 		HTTPHeader: hdr,
 		HTTPClient: httpClient,
 	})
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close() // handshake response body is unused; close to satisfy the linter/net
+	}
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 			return nil, fmt.Errorf("wscarrier: dial %s: unauthorized (bad or missing token)", cfg.URL)

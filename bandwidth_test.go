@@ -3,6 +3,7 @@ package ccbserver
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -74,7 +75,7 @@ func blast(conn net.Conn, size int64) error {
 				off += int64(n)
 			}
 			if e != nil {
-				if e == io.EOF && off == size {
+				if errors.Is(e, io.EOF) && off == size {
 					return
 				}
 				rerr = fmt.Errorf("read at offset %d/%d: %w", off, size, e)

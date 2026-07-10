@@ -269,7 +269,7 @@ func (c *Conn) maybeAck() {
 	rd := c.recvData
 	c.recvMu.Unlock()
 	c.sendMu.Lock()
-	due := rd-c.lastAckSent >= uint64(c.params.window)/4
+	due := rd-c.lastAckSent >= c.params.window/4
 	c.sendMu.Unlock()
 	if due {
 		c.sendAck(rd)
