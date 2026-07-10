@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/PelicanPlatform/classad v0.4.0
-	github.com/bbockelm/cedar v0.3.0
+	github.com/bbockelm/cedar v0.4.0
 )
 
 require (

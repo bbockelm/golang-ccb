@@ -7,12 +7,14 @@ package ccbserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -41,6 +43,13 @@ type Config struct {
 	// respond / reverse-connect (default 60s).
 	RequestTimeout time.Duration
 
+	// TargetIdleTimeout reaps a registered target that sends nothing (not even a
+	// heartbeat) for this long -- detecting a silently-dead target (e.g. a network
+	// partition with no TCP RST), the equivalent of the C++ CCB's polling reap.
+	// It should be a few times the targets' CCB_HEARTBEAT_INTERVAL. Default 3600s
+	// (3x the 1200s heartbeat default); set negative to disable.
+	TargetIdleTimeout time.Duration
+
 	// Authz, if set, enforces HTCondor ALLOW_/DENY_ authorization per command
 	// (CCB_REGISTER -> DAEMON/ADVERTISE_*, CCB_REQUEST -> READ), matching the
 	// collector's CCB. If nil, all authenticated peers are authorized (the
@@ -62,15 +71,74 @@ type Config struct {
 	// currently-connected targets are never swept.
 	ReconnectTTL time.Duration
 
+	// OutboundProxy enables the CCB_PROXY_CONNECT handler (CCB tunneling's
+	// outbound mode): an authenticated DAEMON-authorized requester asks this
+	// broker to dial a target on its behalf and splice. Default false -- an
+	// outbound proxy for anyone is an open-relay/SSRF risk, so it is opt-in and
+	// bounded by OutboundTargetAllowlist. Mirrors config CCB_OUTBOUND_PROXY.
+	OutboundProxy bool
+
+	// OutboundTargetAllowlist bounds which targets an outbound proxy may dial
+	// (host, CIDR, or "*"-glob patterns matched against the target host).
+	// Deny-by-default: an empty list permits NO remote targets. Loopback and
+	// link-local targets are always refused regardless of the list. Mirrors
+	// config CCB_OUTBOUND_TARGET_ALLOWLIST. Enforced by the broker that performs
+	// the actual TCP dial (the exit); a next-hop forwarder defers egress control
+	// to the exit. Only meaningful with OutboundProxy.
+	OutboundTargetAllowlist []string
+
+	// OutboundNextHop, if set, makes this an "inside" CCB: instead of dialing an
+	// outbound target directly, it forwards the CCB_PROXY_CONNECT to this next-hop
+	// CCB broker (a Sinful) and splices the resulting pipe -- the recursive
+	// two-CCB tunnel (§4.3). Empty ⇒ this is an exit CCB that dials directly.
+	// Mirrors config CCB_OUTBOUND_NEXT_HOP. Only meaningful with OutboundProxy.
+	OutboundNextHop string
+
+	// OutboundNextHopSecurity authenticates this broker (as a CCB client, at
+	// DAEMON) to OutboundNextHop. Required when OutboundNextHop is set. Keep
+	// Encryption at NEVER, like the inbound Security, so the upstream leg can be
+	// spliced.
+	OutboundNextHopSecurity *security.SecurityConfig
+
+	// Upstream, if set, makes this an "inside" CCB for INBOUND tunneling: it
+	// registers with the upstream (outside) CCB and feeds the reverse-connected
+	// sockets that broker forwards down into its own command server, so a client
+	// can rendezvous a local registrant through the upstream (recursive streaming
+	// proxy, §4.4). It also stamps its derived tunnel contact
+	// (<upstream>#<assigned-id>) as the broker in the contacts it hands local
+	// registrants, so their advertised sinfuls nest. Independent of OutboundNextHop
+	// (the outbound path); a full inside CCB typically points both at the same
+	// upstream broker.
+	Upstream *UpstreamConfig
+
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
 }
 
+// UpstreamConfig configures an inside CCB's registration with its upstream
+// (outside) CCB for inbound tunneling.
+type UpstreamConfig struct {
+	// BrokerAddr is the upstream CCB's address ("host:port"). Required.
+	BrokerAddr string
+	// Security authenticates the registration (as a CCB client) to the upstream.
+	// Required. Keep Encryption at NEVER so forwarded sockets can be spliced.
+	Security *security.SecurityConfig
+	// HeartbeatInterval is the upstream registration heartbeat (default 1200s).
+	HeartbeatInterval time.Duration
+
+	// ReadyFile, if set, is written with this inside CCB's derived tunnel contact
+	// once upstream registration completes -- the readiness barrier a local master
+	// waits on before injecting the child daemons' CCB_ADDRESS (Model 1,
+	// CCB_TUNNEL_READY_FILE in §7). Written atomically (temp + rename).
+	ReadyFile string
+}
+
 // Server is a CCB broker.
 type Server struct {
-	cfg Config
-	log *slog.Logger
-	srv *cedarserver.Server
+	cfg      Config
+	log      *slog.Logger
+	srv      *cedarserver.Server
+	outbound outboundTransport // how an outbound proxy reaches a target (direct dial or next-hop CCB)
 
 	mu         sync.Mutex
 	nextID     uint64
@@ -79,6 +147,15 @@ type Server struct {
 	reconnects map[uint64]*ReconnectRecord // ccbid -> reconnect credentials (survive disconnect)
 	requests   map[uint64]*request         // requestID -> pending standard request
 	proxies    map[string]*proxySession    // connectID -> pending proxy session
+
+	// Inbound tunneling (Config.Upstream). tunnelContact is this inside CCB's own
+	// contact via the upstream ("<outside>#<id>"), used as the broker prefix when
+	// stamping local registrants' contacts so they nest; empty until the upstream
+	// registration completes. tunnelReady is closed at that point.
+	upstream        *ccb.Listener
+	tunnelContact   atomic.Pointer[string]
+	tunnelReady     chan struct{}
+	tunnelReadyOnce sync.Once
 }
 
 // target is a registered daemon holding a persistent connection.
@@ -120,6 +197,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = 60 * time.Second
 	}
+	if cfg.TargetIdleTimeout == 0 {
+		cfg.TargetIdleTimeout = 3600 * time.Second // 3x the 1200s heartbeat default
+	}
 	if cfg.ReconnectTTL == 0 {
 		cfg.ReconnectTTL = 24 * time.Hour
 	}
@@ -133,6 +213,32 @@ func New(cfg Config) (*Server, error) {
 		reconnects: map[uint64]*ReconnectRecord{},
 		requests:   map[uint64]*request{},
 		proxies:    map[string]*proxySession{},
+	}
+	// Choose how an outbound proxy reaches a target: forward to a next-hop CCB
+	// (inside CCB, two-CCB tunnel) or dial directly (exit CCB).
+	if cfg.OutboundNextHop != "" {
+		if cfg.OutboundNextHopSecurity == nil {
+			return nil, fmt.Errorf("ccbserver: OutboundNextHopSecurity is required when OutboundNextHop is set")
+		}
+		// Trivial self-loop guard. A deeper A->B->A cycle is a misconfiguration
+		// bounded by the connect timeout; the wire format carries no hop counter,
+		// so we cannot detect it here without breaking §4.1 compatibility.
+		if hop := strings.Trim(cfg.OutboundNextHop, "<>"); hop == cfg.PublicAddress || hop == s.proxyAddrSinful() {
+			return nil, fmt.Errorf("ccbserver: OutboundNextHop %q points at this broker (routing loop)", cfg.OutboundNextHop)
+		}
+		s.outbound = &nextHopTransport{
+			broker:  cfg.OutboundNextHop,
+			sec:     cfg.OutboundNextHopSecurity,
+			timeout: cfg.RequestTimeout,
+		}
+	} else {
+		s.outbound = &tcpDirectTransport{s: s}
+	}
+	if cfg.Upstream != nil {
+		if cfg.Upstream.BrokerAddr == "" || cfg.Upstream.Security == nil {
+			return nil, fmt.Errorf("ccbserver: Upstream requires BrokerAddr and Security")
+		}
+		s.tunnelReady = make(chan struct{})
 	}
 	if err := s.loadReconnects(); err != nil {
 		return nil, err
@@ -164,6 +270,17 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 		"DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER")
 	cs.Handle(ccb.CommandRequest, s.handleRequest, "READ")
 	cs.HandleRaw(ccb.CommandReverseConnect, s.handleReverseConnect)
+	// Outbound tunneling (opt-in): dial a target on a requester's behalf and
+	// splice. DAEMON authorization only -- never the open level the raw
+	// reverse-connect rendezvous uses -- because it is an open-relay/SSRF risk.
+	if s.cfg.OutboundProxy {
+		cs.Handle(ccb.CommandProxyConnect, s.handleProxyConnect, "DAEMON")
+	}
+	// Inbound tunneling: an inside CCB answers a master's CCB_GET_TUNNEL_ADDRESS
+	// with its derived tunnel address (Model 2 off-host CCB orchestration).
+	if s.cfg.Upstream != nil {
+		cs.Handle(ccb.CommandGetTunnelAddress, s.handleGetTunnelAddress, "DAEMON")
+	}
 }
 
 // StartBackground starts the server's background maintenance (reconnect-record
@@ -173,6 +290,9 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 func (s *Server) StartBackground(ctx context.Context) {
 	if s.cfg.ReconnectStore != nil {
 		go s.sweepLoop(ctx)
+	}
+	if s.cfg.Upstream != nil {
+		s.startUpstream(ctx)
 	}
 }
 
@@ -229,8 +349,15 @@ func (s *Server) sweepLoop(ctx context.Context) {
 	}
 }
 
-// contactString builds the contact string advertised to clients.
+// contactString builds the contact string advertised to a local registrant.
+// For an inside CCB (Upstream configured) that has completed upstream
+// registration, the broker prefix is this CCB's own tunnel contact
+// ("<outside>#<id>"), so the registrant's contact nests ("<outside>#<id>#<its
+// id>"); otherwise it is this CCB's own public address.
 func (s *Server) contactString(id uint64) string {
+	if tc := s.tunnelContact.Load(); tc != nil && *tc != "" {
+		return *tc + "#" + strconv.FormatUint(id, 10)
+	}
 	return ccb.ContactString(s.cfg.PublicAddress, id)
 }
 
@@ -353,11 +480,23 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 }
 
 // serveTarget reads result reports and heartbeats from a target's persistent
-// connection until it errors.
+// connection until it errors. If TargetIdleTimeout is set, a target that sends
+// nothing (not even a heartbeat) for that long is reaped -- the goroutine-per-
+// target equivalent of the C++ CCB's polling reap of a silently-dead target
+// (e.g. a network partition with no TCP RST), so its registration does not leak.
 func (s *Server) serveTarget(ctx context.Context, t *target) {
 	for {
+		if s.cfg.TargetIdleTimeout > 0 {
+			_ = t.conn.SetReadDeadline(time.Now().Add(s.cfg.TargetIdleTimeout))
+		}
 		ad, err := ccb.ReadControlAd(ctx, t.stream)
 		if err != nil {
+			if s.cfg.TargetIdleTimeout > 0 {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					s.log.Info("target reaped: idle past TargetIdleTimeout", "ccbid", t.id, "name", t.name)
+				}
+			}
 			return
 		}
 		if cmd, ok := ccb.AdInt(ad, ccb.AttrCommand); ok && int(cmd) == ccb.CommandAlive {
@@ -439,14 +578,20 @@ func (s *Server) SweepReconnects() {
 	}
 }
 
-// parseTargetID parses the CCBID a requester names: per the protocol this is
-// the bare numeric ccbid (CCBClient sends only the id after the '#'), but we
-// also accept a full "addr#id" contact for robustness.
+// parseTargetID parses the CCBID a requester names in a CCB_REQUEST. Per the
+// protocol this is the BARE numeric ccbid (both CCBClient and the Go client send
+// only the id for the hop). Parsing is STRICT -- a value not wholly consumed as a
+// single unsigned integer is rejected -- which is what makes an *old* client's
+// mis-parse of a nested contact fail cleanly: an old client splits on the first
+// '#' and sends e.g. "42#17", which we reject rather than lenient-routing to
+// registrant 42 (see the CCB tunneling design §4.7). Do NOT accept a full
+// "addr#id" contact here; that fallback would reintroduce the leniency.
 func parseTargetID(s string) (uint64, bool) {
-	if id, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64); err == nil {
-		return id, true
+	id, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, false
 	}
-	return parseContactID(s)
+	return id, true
 }
 
 // parseContactID extracts the numeric ccbid from a contact string "addr#id".

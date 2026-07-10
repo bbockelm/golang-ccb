@@ -166,13 +166,53 @@ func run() error {
 		log.Info(logging.DestinationGeneral, "ccb reconnect persistence enabled (shared, encrypted)", "file", sessionFile)
 	}
 
+	// Outbound-proxy (exit) mode: enable the CCB_PROXY_CONNECT handler and its
+	// deny-by-default target allow-list from config. The exit dials targets
+	// directly, so it needs no CCB client credentials.
+	outboundProxy := configBool(d.Config(), "CCB_OUTBOUND_PROXY", false)
+	var outboundAllowlist []string
+	if v, ok := d.Config().Get("CCB_OUTBOUND_TARGET_ALLOWLIST"); ok {
+		outboundAllowlist = ccb.SplitBrokerList(v)
+	}
+
+	// Inside-CCB roles: when CCB_OUTBOUND_NEXT_HOP is set this broker forwards
+	// outbound proxy requests to that next hop AND registers upstream with it for
+	// inbound tunneling (§5). Both make this broker a CCB *client* of the next hop,
+	// so build a client-side security config (this daemon's own credentials),
+	// unencrypted like the inbound side so relayed bytes can be spliced.
+	var outboundNextHop string
+	var nextHopSec *security.SecurityConfig
+	var upstream *ccbserver.UpstreamConfig
+	if hop, ok := d.Config().Get("CCB_OUTBOUND_NEXT_HOP"); ok && hop != "" {
+		outboundNextHop = hop
+		nextHopSec, err = htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "CLIENT")
+		if err != nil {
+			return fmt.Errorf("building next-hop client security config: %w", err)
+		}
+		nextHopSec.Encryption = security.SecurityNever
+		nextHopSec.RemoteVersion = streamingVersionString
+		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
+		upstream = &ccbserver.UpstreamConfig{
+			BrokerAddr: hop,
+			Security:   nextHopSec,
+			ReadyFile:  readyFile,
+		}
+		log.Info(logging.DestinationGeneral, "inside CCB: tunneling through next hop",
+			"next_hop", hop, "ready_file", readyFile)
+	}
+
 	srv, err := ccbserver.New(ccbserver.Config{
-		PublicAddress:       pub,
-		Security:            sec,
-		Authz:               policy,
-		ReconnectStore:      store,
-		ReconnectAllowAnyIP: configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
-		Logger:              d.Slog(),
+		PublicAddress:           pub,
+		Security:                sec,
+		Authz:                   policy,
+		ReconnectStore:          store,
+		ReconnectAllowAnyIP:     configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
+		OutboundProxy:           outboundProxy,
+		OutboundTargetAllowlist: outboundAllowlist,
+		OutboundNextHop:         outboundNextHop,
+		OutboundNextHopSecurity: nextHopSec,
+		Upstream:                upstream,
+		Logger:                  d.Slog(),
 	})
 	if err != nil {
 		return fmt.Errorf("creating CCB server: %w", err)
