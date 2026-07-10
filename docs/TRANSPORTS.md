@@ -91,35 +91,43 @@ good pipe.
 
 ---
 
-## 3. Carrier A — WebSocket over HTTP/2 (sketch)
+## 3. Carrier A — WebSocket carrier (`transport/wscarrier`, implemented)
 
 Goal: collapse the node to **one** outbound TCP connection to a public HTTPS
 endpoint, which many networks permit even when arbitrary outbound TCP is blocked.
+Because the inside CCB opens exactly one WebSocket and yamux-muxes everything over
+it, one connection already carries the node's entire CCB footprint — so a plain
+HTTP/1.1 `Upgrade` suffices; HTTP/2 (RFC 8441) is an optional future refinement,
+not a requirement.
 
-- **Server**: the outside CCB listens on a *separate* HTTPS port (distinct from its
-  CEDAR port) with a normal TLS cert. A single HTTP/2 origin means the browser/h2
-  client coalesces requests onto one TCP connection; a WebSocket upgrade
-  (RFC 8441 `:protocol = websocket` over h2, or h1 `Upgrade` if h2 unavailable)
-  gives a bidirectional binary frame stream. Each accepted WebSocket = one carrier
-  byte-pipe → `yamux.Server`.
-- **Client (inside CCB)**: dial `wss://host:port/ccb/tunnel`, authenticate, hold
-  the socket open; `yamux.Client` over it. `session.Open()` per `dialBroker`.
+- **Server** (`wscarrier.Listen`): the outside CCB serves an HTTP(S) endpoint
+  (`wss://host:port/ccb/tunnel`) on a port distinct from its CEDAR port. Each
+  authenticated WebSocket upgrade becomes one carrier byte-pipe (`websocket.NetConn`
+  over binary messages), presented via a `net.Listener` so `carrier.MuxListener`
+  and the cedar command loop run over it unchanged.
+- **Client** (`wscarrier.Dial`): the inside CCB dials the URL with a bearer token,
+  holds the socket open, and `carrier.MuxDialer` runs a yamux client over it;
+  `Open()` per `dialBroker`. Selected by a `ws://`/`wss://` scheme on
+  `Upstream.BrokerAddr` / `OutboundNextHop`.
 - **Auth**: bearer token in the `Authorization` header of the upgrade request.
-  Reuse HTCondor token discovery — prefer an **IDTOKEN** (the pool's, via the
-  existing `htcondor` token-discovery path used for `IDTOKENS` auth), else a
-  **SciToken** from the standard discovery (`BEARER_TOKEN`, `BEARER_TOKEN_FILE`,
-  `$XDG_RUNTIME_DIR/bt_u<uid>`, ...). The server validates the token exactly as
-  CEDAR's token auth does and maps it to a DAEMON authorization decision before
-  accepting the tunnel.
-- **Framing**: WebSocket binary messages carry raw yamux bytes; no extra framing.
-  WebSocket ping/pong + yamux keepalive detect a dead peer.
-- **Why h2/single-connection matters**: the point is the *socket-count* limit, not
-  bandwidth. Forcing one TCP connection means the node's entire CCB footprint —
-  registration and every proxied connection — rides that one socket via yamux.
+  The transport is credential-agnostic — a `TokenVerifier` (server) and token
+  string / `TokenSource` (client) are supplied by the CCB layer. `ccbserver`
+  ships `DiscoverBearerToken` (client: WLCG discovery — `BEARER_TOKEN`,
+  `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>` — then an
+  HTCondor IDTOKEN from the token directory) and `SciTokenVerifier` (server:
+  cedar `security.VerifySciToken` against the issuer JWKS). **Remaining:** an
+  IDTOKEN server verifier (pool-signing-key HMAC) — cedar has the pieces
+  (`loadSigningKey`/`computeTokenSignature`) but not yet a standalone exported
+  verify; until then the daemon supplies its own `CarrierTokenVerify` for IDTOKENs.
+- **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
+  ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
+  (authenticated peer; yamux bounds its own windows).
+- **TLS**: `wss://` requires a server `CarrierTLS` and (client) `CarrierClientTLS`
+  for CA roots; `ws://` is plaintext, for test/dev only.
 
-Deferred until the filesystem carrier lands; the yamux + cedar-dialer seam it
-needs is shared, so it becomes mostly "implement `Dial`/`Listen` over gorilla or
-`x/net/websocket` + token discovery."
+Config knobs on the CCB `Config`: `CarrierListen` (`wss://…`), `CarrierTLS`,
+`CarrierTokenVerify` (server); `CarrierClientTLS`, `CarrierToken` /
+`CarrierTokenSource` (client).
 
 ---
 

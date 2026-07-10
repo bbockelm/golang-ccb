@@ -7,6 +7,7 @@ package ccbserver
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -113,11 +114,35 @@ type Config struct {
 
 	// CarrierListen, if set, makes this (outside) CCB accept inside CCBs arriving
 	// over a non-TCP carrier instead of (or in addition to) TCP. It is a carrier
-	// address, e.g. "fs:/gpfs/pool/ccb-tunnel" for the filesystem carrier. Each
-	// inside CCB that dials the carrier becomes one yamux-multiplexed pipe whose
-	// streams are served by the same command loop as TCP connections. See
-	// docs/TRANSPORTS.md. Empty ⇒ TCP only.
+	// address, e.g. "fs:/gpfs/pool/ccb-tunnel" (filesystem) or
+	// "wss://host:port/ccb/tunnel" (WebSocket over TLS). Each inside CCB that
+	// dials the carrier becomes one yamux-multiplexed pipe whose streams are
+	// served by the same command loop as TCP connections. See docs/TRANSPORTS.md.
+	// Empty ⇒ TCP only.
 	CarrierListen string
+
+	// CarrierTLS is the server TLS config for a wss:// CarrierListen (required for
+	// wss). Ignored for fs: and ws://.
+	CarrierTLS *tls.Config
+
+	// CarrierTokenVerify validates an inside CCB's bearer token for a WebSocket
+	// CarrierListen and returns an identity for logging. Required for ws/wss.
+	// Wire HTCondor token verification here (e.g. SciToken via
+	// cedar security.VerifySciToken, or a pool IDTOKEN check).
+	CarrierTokenVerify func(ctx context.Context, token string) (identity string, err error)
+
+	// CarrierClientTLS is the client TLS config used when THIS (inside) CCB dials
+	// a wss:// upstream/next-hop (CA roots, etc.).
+	CarrierClientTLS *tls.Config
+
+	// CarrierToken is the static bearer token this (inside) CCB presents when
+	// dialing a WebSocket carrier. If empty, CarrierTokenSource is used.
+	CarrierToken string
+
+	// CarrierTokenSource supplies the bearer token when dialing a WebSocket
+	// carrier and CarrierToken is empty (e.g. HTCondor token discovery, re-read
+	// per dial so a rotated credential is picked up).
+	CarrierTokenSource func(ctx context.Context) (token string, err error)
 
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger

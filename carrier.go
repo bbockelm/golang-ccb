@@ -2,25 +2,31 @@ package ccbserver
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 
 	"github.com/bbockelm/golang-ccb/transport/carrier"
 	"github.com/bbockelm/golang-ccb/transport/fstun"
+	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
 
 // A broker address may name a non-TCP carrier instead of a "host:port" Sinful.
 // The scheme selects how the inside CCB reaches the outside CCB (and how the
-// outside CCB accepts inside CCBs). Currently only the filesystem carrier ("fs")
-// is implemented; a WebSocket carrier ("wss") is planned (see docs/TRANSPORTS.md).
+// outside CCB accepts inside CCBs). See docs/TRANSPORTS.md.
 //
-//	fs:<absolute-dir>   e.g. fs:/gpfs/pool/ccb-tunnel
+//	fs:<absolute-dir>          filesystem carrier, e.g. fs:/gpfs/pool/ccb-tunnel
+//	ws://host:port/path        WebSocket carrier (plaintext; test/dev)
+//	wss://host:port/path       WebSocket carrier over TLS (production)
 type carrierRef struct {
-	scheme string
+	scheme string // "fs" or "ws" ("ws" covers ws:// and wss://)
 	path   string // filesystem root for scheme "fs"
+	url    string // full ws/wss URL for scheme "ws"
+	tls    bool   // wss (TLS)
 }
 
 // parseCarrierRef reports whether addr names a carrier, and if so parses it. A
@@ -30,6 +36,12 @@ func parseCarrierRef(addr string) (carrierRef, bool) {
 	addr = strings.TrimSpace(addr)
 	if p, ok := strings.CutPrefix(addr, "fs:"); ok {
 		return carrierRef{scheme: "fs", path: p}, true
+	}
+	if strings.HasPrefix(addr, "wss://") {
+		return carrierRef{scheme: "ws", url: addr, tls: true}, true
+	}
+	if strings.HasPrefix(addr, "ws://") {
+		return carrierRef{scheme: "ws", url: addr}, true
 	}
 	return carrierRef{}, false
 }
@@ -54,13 +66,48 @@ type carrierClient struct {
 	ref carrierRef
 	log *slog.Logger
 
+	// WebSocket dial parameters (scheme "ws"); unused for "fs".
+	token       string
+	tokenSource func(ctx context.Context) (string, error)
+	clientTLS   *tls.Config
+
 	mu   sync.Mutex
 	md   *carrier.MuxDialer
 	done bool
 }
 
-func newCarrierClient(ref carrierRef, log *slog.Logger) *carrierClient {
-	return &carrierClient{ref: ref, log: log}
+func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) *carrierClient {
+	return &carrierClient{
+		ref:         ref,
+		log:         log,
+		token:       cfg.CarrierToken,
+		tokenSource: cfg.CarrierTokenSource,
+		clientTLS:   cfg.CarrierClientTLS,
+	}
+}
+
+// dialPipe establishes the underlying carrier byte pipe for this ref.
+func (c *carrierClient) dialPipe(ctx context.Context) (net.Conn, error) {
+	switch c.ref.scheme {
+	case "fs":
+		return fstun.Dial(ctx, c.ref.fstunConfig())
+	case "ws":
+		return wscarrier.Dial(ctx, wscarrier.DialConfig{
+			URL:         c.ref.url,
+			Token:       c.token,
+			TokenSource: c.tokenSource,
+			TLS:         c.clientTLS,
+		})
+	default:
+		return nil, fmt.Errorf("ccbserver: unknown carrier scheme %q", c.ref.scheme)
+	}
+}
+
+func (c *carrierClient) describe() string {
+	if c.ref.scheme == "ws" {
+		return "ws:" + c.ref.url
+	}
+	return c.ref.scheme + ":" + c.ref.path
 }
 
 // dial is the ccb.BrokerDialer handed to cedar: it opens a fresh logical
@@ -90,17 +137,17 @@ func (c *carrierClient) session(ctx context.Context) (*carrier.MuxDialer, error)
 		_ = c.md.Close()
 		c.md = nil
 	}
-	pipe, err := fstun.Dial(ctx, c.ref.fstunConfig())
+	pipe, err := c.dialPipe(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("carrier %s:%s: dialing pipe: %w", c.ref.scheme, c.ref.path, err)
+		return nil, fmt.Errorf("carrier %s: dialing pipe: %w", c.describe(), err)
 	}
 	md, err := carrier.NewMuxDialer(pipe)
 	if err != nil {
 		_ = pipe.Close()
-		return nil, fmt.Errorf("carrier %s:%s: yamux client: %w", c.ref.scheme, c.ref.path, err)
+		return nil, fmt.Errorf("carrier %s: yamux client: %w", c.describe(), err)
 	}
 	c.md = md
-	c.log.Info("carrier session established", "scheme", c.ref.scheme, "path", c.ref.path)
+	c.log.Info("carrier session established", "carrier", c.describe())
 	return md, nil
 }
 
@@ -136,11 +183,11 @@ func (s *Server) detectCarrier() (*carrierClient, error) {
 			return nil, fmt.Errorf("ccbserver: Upstream and OutboundNextHop name different carriers (%v vs %v); a single carrier pipe is required", refs[0], r)
 		}
 	}
-	return newCarrierClient(refs[0], s.log), nil
+	return newCarrierClient(refs[0], s.cfg, s.log), nil
 }
 
 // startCarrierListener runs an outside CCB's acceptor for inside CCBs arriving
-// over a carrier: one fstun pipe per inside CCB, yamux-server multiplexed into
+// over a carrier: one byte pipe per inside CCB, yamux-server multiplexed into
 // ordinary command streams served by the same cedar command loop as TCP.
 func (s *Server) startCarrierListener(ctx context.Context) {
 	ref, ok := parseCarrierRef(s.cfg.CarrierListen)
@@ -148,20 +195,47 @@ func (s *Server) startCarrierListener(ctx context.Context) {
 		s.log.Error("CarrierListen is not a recognized carrier address", "value", s.cfg.CarrierListen)
 		return
 	}
-	ln, err := fstun.Listen(ref.fstunConfig())
+	inner, err := s.carrierNetListener(ref)
 	if err != nil {
-		s.log.Error("failed to start carrier listener", "scheme", ref.scheme, "path", ref.path, "error", err)
+		s.log.Error("failed to start carrier listener", "carrier", s.cfg.CarrierListen, "error", err)
 		return
 	}
-	ml := carrier.NewMuxListener(ln)
+	ml := carrier.NewMuxListener(inner)
 	go func() {
 		<-ctx.Done()
 		_ = ml.Close()
 	}()
 	go func() {
-		s.log.Info("CCB carrier listener started", "scheme", ref.scheme, "path", ref.path)
+		s.log.Info("CCB carrier listener started", "carrier", s.cfg.CarrierListen)
 		if err := s.srv.Serve(ctx, ml); err != nil && ctx.Err() == nil {
 			s.log.Error("carrier listener serve ended", "error", err)
 		}
 	}()
+}
+
+// carrierNetListener builds the underlying (pre-yamux) net.Listener for a carrier.
+func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
+	switch ref.scheme {
+	case "fs":
+		return fstun.Listen(ref.fstunConfig())
+	case "ws":
+		if s.cfg.CarrierTokenVerify == nil {
+			return nil, fmt.Errorf("ccbserver: a WebSocket CarrierListen requires CarrierTokenVerify")
+		}
+		u, err := url.Parse(ref.url)
+		if err != nil {
+			return nil, fmt.Errorf("ccbserver: bad carrier URL %q: %w", ref.url, err)
+		}
+		if ref.tls && s.cfg.CarrierTLS == nil {
+			return nil, fmt.Errorf("ccbserver: a wss:// CarrierListen requires CarrierTLS")
+		}
+		return wscarrier.Listen(wscarrier.ListenConfig{
+			Addr:   u.Host,
+			Path:   u.Path,
+			TLS:    s.cfg.CarrierTLS,
+			Verify: s.cfg.CarrierTokenVerify,
+		})
+	default:
+		return nil, fmt.Errorf("ccbserver: unknown carrier scheme %q", ref.scheme)
+	}
 }
