@@ -112,13 +112,17 @@ not a requirement.
 - **Auth**: bearer token in the `Authorization` header of the upgrade request.
   The transport is credential-agnostic — a `TokenVerifier` (server) and token
   string / `TokenSource` (client) are supplied by the CCB layer. `ccbserver`
-  ships `DiscoverBearerToken` (client: WLCG discovery — `BEARER_TOKEN`,
-  `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>` — then an
-  HTCondor IDTOKEN from the token directory) and `SciTokenVerifier` (server:
-  cedar `security.VerifySciToken` against the issuer JWKS). **Remaining:** an
-  IDTOKEN server verifier (pool-signing-key HMAC) — cedar has the pieces
-  (`loadSigningKey`/`computeTokenSignature`) but not yet a standalone exported
-  verify; until then the daemon supplies its own `CarrierTokenVerify` for IDTOKENs.
+  ships:
+  - `DiscoverBearerToken` (client): WLCG discovery — `BEARER_TOKEN`,
+    `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>` — then an
+    HTCondor IDTOKEN from the token directory.
+  - `BearerTokenVerifier(sec)` (server): accepts **either** an HTCondor IDTOKEN
+    (verified against the pool signing key via cedar `security.VerifyIDToken` —
+    HKDF+HMAC over `header.payload`) **or** a SciToken (cedar
+    `security.VerifySciToken` against the issuer JWKS), dispatching on the token.
+    `IDTokenVerifier(sec)` / `SciTokenVerifier` are the single-type variants.
+  The daemon wires `BearerTokenVerifier(Config.Security)` automatically for a
+  `ws(s)://` `CarrierListen`.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
   ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
   (authenticated peer; yamux bounds its own windows).

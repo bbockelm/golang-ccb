@@ -91,15 +91,43 @@ func readFirstToken(path string) (string, error) {
 // SciTokenVerifier is a Config.CarrierTokenVerify that accepts a SciToken/WLCG
 // JWT, verifying it against its issuer's JWKS (cedar security.VerifySciToken),
 // and returns "<issuer>/<subject>" as the identity. It rejects non-SciToken
-// bearer tokens (an HTCondor IDTOKEN needs the pool-signing-key HMAC path, which
-// the daemon should wire separately -- see the note below).
+// bearer tokens; use BearerTokenVerifier to also accept HTCondor IDTOKENs.
 func SciTokenVerifier(ctx context.Context, token string) (string, error) {
 	if !security.IsSciToken(token) {
-		return "", fmt.Errorf("ccbserver: bearer token is not a SciToken (IDTOKEN verification not wired)")
+		return "", fmt.Errorf("ccbserver: bearer token is not a SciToken")
 	}
 	claims, err := security.VerifySciToken(token)
 	if err != nil {
 		return "", fmt.Errorf("ccbserver: SciToken verification failed: %w", err)
 	}
 	return claims.Issuer + "/" + claims.Subject, nil
+}
+
+// IDTokenVerifier returns a Config.CarrierTokenVerify that accepts an HTCondor
+// IDTOKEN, verifying its HKDF+HMAC signature against the pool/named signing key
+// located from sec (cedar security.VerifyIDToken). The identity is the token
+// subject. sec must carry the signing-key location (TokenPoolSigningKeyFile /
+// TokenSigningKeyDir); a server's Config.Security is the natural choice.
+func IDTokenVerifier(sec *security.SecurityConfig) func(ctx context.Context, token string) (string, error) {
+	return func(_ context.Context, token string) (string, error) {
+		claims, err := security.VerifyIDToken(token, sec)
+		if err != nil {
+			return "", err
+		}
+		return claims.Subject, nil
+	}
+}
+
+// BearerTokenVerifier returns a Config.CarrierTokenVerify that accepts EITHER an
+// HTCondor IDTOKEN (HKDF+HMAC against the pool signing key in sec) or a SciToken
+// (verified against its issuer's JWKS), dispatching on the token's header. This
+// is the general choice for a pool that admits both credential types.
+func BearerTokenVerifier(sec *security.SecurityConfig) func(ctx context.Context, token string) (string, error) {
+	idVerify := IDTokenVerifier(sec)
+	return func(ctx context.Context, token string) (string, error) {
+		if security.IsSciToken(token) {
+			return SciTokenVerifier(ctx, token)
+		}
+		return idVerify(ctx, token)
+	}
 }
