@@ -46,17 +46,32 @@ type Config struct {
 	// the reader already tolerates torn tails, and the FS is assumed to make
 	// appends eventually visible.
 	Sync bool
+
+	// AgeSweepInterval is how often the acceptor sweeps the root for crash
+	// residue -- orphaned inbox markers and stale work subtrees that normal GC
+	// (engage + idle-reap, initiator cleanup) does not cover (default 10m).
+	// Negative disables the sweep. This is the only routine operation that walks
+	// the work tree, so it is deliberately infrequent.
+	AgeSweepInterval time.Duration
+
+	// AgeSweepThreshold is the minimum age (since last activity) before the sweep
+	// reaps an un-engaged subtree or an un-picked-up marker (default 15m). Must
+	// comfortably exceed the time a live tunnel can look idle to the sweep so an
+	// in-flight or briefly-quiet tunnel is never reaped.
+	AgeSweepThreshold time.Duration
 }
 
 // resolvedConfig is Config with defaults applied and split into the fields the
 // runtime actually consults.
 type resolvedConfig struct {
-	pollInterval     time.Duration
-	heartbeat        time.Duration
-	idleTimeout      time.Duration
-	handshakeTimeout time.Duration
-	segmentSize      int64
-	sync             bool
+	pollInterval      time.Duration
+	heartbeat         time.Duration
+	idleTimeout       time.Duration
+	handshakeTimeout  time.Duration
+	segmentSize       int64
+	sync              bool
+	ageSweepInterval  time.Duration // <= 0 disables the sweep
+	ageSweepThreshold time.Duration
 }
 
 func (cfg Config) resolve() (resolvedConfig, synParams, error) {
@@ -84,13 +99,22 @@ func (cfg Config) resolve() (resolvedConfig, synParams, error) {
 	if mf > maxPayload {
 		mf = maxPayload
 	}
+	ageInt := cfg.AgeSweepInterval
+	switch {
+	case ageInt == 0:
+		ageInt = 10 * time.Minute
+	case ageInt < 0:
+		ageInt = 0 // disabled
+	}
 	rc := resolvedConfig{
-		pollInterval:     def(cfg.PollInterval, 25*time.Millisecond),
-		heartbeat:        def(cfg.Heartbeat, 5*time.Second),
-		idleTimeout:      def(cfg.IdleTimeout, 60*time.Second),
-		handshakeTimeout: def(cfg.HandshakeTimeout, 30*time.Second),
-		segmentSize:      seg,
-		sync:             cfg.Sync,
+		pollInterval:      def(cfg.PollInterval, 25*time.Millisecond),
+		heartbeat:         def(cfg.Heartbeat, 5*time.Second),
+		idleTimeout:       def(cfg.IdleTimeout, 60*time.Second),
+		handshakeTimeout:  def(cfg.HandshakeTimeout, 30*time.Second),
+		segmentSize:       seg,
+		sync:              cfg.Sync,
+		ageSweepInterval:  ageInt,
+		ageSweepThreshold: def(cfg.AgeSweepThreshold, 15*time.Minute),
 	}
 	params := synParams{
 		version:     protocolVersion,

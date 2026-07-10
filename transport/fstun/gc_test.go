@@ -156,6 +156,68 @@ func TestInboxMarkerWithoutSubtreeTolerated(t *testing.T) {
 	}
 }
 
+// TestAgeSweepReapsOrphans verifies the crash-residue sweep removes an orphaned
+// inbox marker (no work subtree) and a stale, never-engaged work subtree.
+func TestAgeSweepReapsOrphans(t *testing.T) {
+	root := t.TempDir()
+	ln, err := Listen(fastCfg(root))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// Orphan marker with no work subtree.
+	orphanID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if err := writeInboxMarker(root, orphanID); err != nil {
+		t.Fatal(err)
+	}
+	// Stale work subtree that never got a SYN segment (so it is never engaged).
+	staleID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := os.MkdirAll(filepath.Join(connPath(root, staleID), "c2s"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let them age past the threshold we will sweep with.
+	time.Sleep(80 * time.Millisecond)
+	ln.ageSweep(40 * time.Millisecond)
+
+	if _, err := os.Stat(inboxMarkerPath(root, orphanID)); !os.IsNotExist(err) {
+		t.Fatalf("orphan inbox marker not reaped (err=%v)", err)
+	}
+	if _, err := os.Stat(connPath(root, staleID)); !os.IsNotExist(err) {
+		t.Fatalf("stale work subtree not reaped (err=%v)", err)
+	}
+}
+
+// TestAgeSweepSparesRecent verifies the sweep leaves a recently-active subtree
+// and a fresh marker (in-flight tunnels must not be reaped).
+func TestAgeSweepSparesRecent(t *testing.T) {
+	root := t.TempDir()
+	ln, err := Listen(fastCfg(root))
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	freshID := "cccccccccccccccccccccccccccccccc"
+	if err := writeInboxMarker(root, freshID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(connPath(root, freshID), "c2s"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Large threshold: everything just created is well within it.
+	ln.ageSweep(time.Hour)
+
+	if _, err := os.Stat(inboxMarkerPath(root, freshID)); err != nil {
+		t.Fatalf("fresh marker wrongly reaped: %v", err)
+	}
+	if _, err := os.Stat(connPath(root, freshID)); err != nil {
+		t.Fatalf("fresh subtree wrongly reaped: %v", err)
+	}
+}
+
 // TestInitiatorReapsFailedDial verifies the client removes its own subtree when a
 // dial never establishes (no acceptor), so a failed attempt does not leak.
 func TestInitiatorReapsFailedDial(t *testing.T) {

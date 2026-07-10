@@ -95,6 +95,14 @@ func (l *Listener) watchLoop() {
 	defer fast.Stop()
 	defer slow.Stop()
 
+	// Infrequent crash-residue sweep (the only routine walk of the work tree).
+	var ageC <-chan time.Time
+	if l.rc.ageSweepInterval > 0 {
+		age := time.NewTicker(l.rc.ageSweepInterval)
+		defer age.Stop()
+		ageC = age.C
+	}
+
 	rescans := 0
 	for {
 		select {
@@ -102,6 +110,8 @@ func (l *Listener) watchLoop() {
 			return
 		case <-slow.C:
 			l.scanInbox() // cheap backstop; the inbox holds only un-engaged arrivals
+		case <-ageC:
+			l.ageSweep(l.rc.ageSweepThreshold)
 		case <-fast.C:
 			if db.changed(l.root) {
 				rescans = doorbellRescans
@@ -215,6 +225,104 @@ func (l *Listener) reapWhenDone(connID string, c *Conn) {
 	_ = os.RemoveAll(connPath(l.root, connID))
 	_ = os.Remove(inboxMarkerPath(l.root, connID)) // in case a marker lingered
 	l.forget(connID)
+}
+
+// ageSweep reaps crash residue that normal GC does not cover: inbox markers that
+// were never engaged and work subtrees with no live pipe and no recent activity.
+// It is the only routine operation that walks the work tree, so it runs rarely
+// (AgeSweepInterval). An engaged tunnel is in seen (reaped by reapWhenDone
+// instead); an in-flight or briefly-quiet one has recent activity and is skipped
+// by the threshold, so neither is ever reaped here.
+func (l *Listener) ageSweep(threshold time.Duration) {
+	cutoff := time.Now().Add(-threshold)
+
+	// 1) Orphaned inbox markers: never engaged, older than the threshold. (An
+	// engaged tunnel's marker was already removed at pickup.)
+	inbox := filepath.Join(l.root, inboxDirName)
+	if entries, err := os.ReadDir(inbox); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			id := e.Name()
+			l.mu.Lock()
+			engaged := l.seen[id]
+			l.mu.Unlock()
+			if engaged {
+				continue
+			}
+			if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+				_ = os.Remove(filepath.Join(inbox, id))
+			}
+		}
+	}
+
+	// 2) Stale work subtrees: not engaged and no recent activity in either
+	// direction (a partial/abandoned handshake, or a subtree both of whose peers
+	// died). This is the infrequent work-tree walk.
+	fanouts, err := os.ReadDir(l.root)
+	if err != nil {
+		return
+	}
+	for _, fo := range fanouts {
+		if !fo.IsDir() || fo.Name() == inboxDirName || strings.HasPrefix(fo.Name(), ".") {
+			continue
+		}
+		foPath := filepath.Join(l.root, fo.Name())
+		rests, err := os.ReadDir(foPath)
+		if err != nil {
+			continue
+		}
+		for _, re := range rests {
+			if !re.IsDir() {
+				continue
+			}
+			id := fo.Name() + re.Name()
+			l.mu.Lock()
+			engaged := l.seen[id]
+			l.mu.Unlock()
+			if engaged {
+				continue
+			}
+			connDir := filepath.Join(foPath, re.Name())
+			if subtreeLastActivity(connDir).After(cutoff) {
+				continue // in-flight or recently active; leave it
+			}
+			_ = os.RemoveAll(connDir)
+		}
+	}
+}
+
+// subtreeLastActivity returns the newest mtime among a tunnel subtree's segment
+// files and its direction directories (the dirs are the fallback so a freshly-
+// created, still-empty subtree looks recent, not ancient). Zero if nothing can
+// be statted (treated as long-idle -> reap-eligible).
+func subtreeLastActivity(connDir string) time.Time {
+	var newest time.Time
+	consider := func(t time.Time) {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if fi, err := os.Stat(connDir); err == nil {
+		consider(fi.ModTime())
+	}
+	for _, dir := range []string{"c2s", "s2c"} {
+		d := filepath.Join(connDir, dir)
+		if fi, err := os.Stat(d); err == nil {
+			consider(fi.ModTime())
+		}
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if fi, err := e.Info(); err == nil {
+				consider(fi.ModTime())
+			}
+		}
+	}
+	return newest
 }
 
 // forget drops a conn-id from the seen set so its subtree can be re-accepted if

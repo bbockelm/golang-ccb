@@ -297,9 +297,19 @@ or stalled reader cannot make the writer fill the filesystem.
   *initiator* cleans up its own subtree if a dial never establishes (handshake
   timeout / error) — the acceptor never engaged it, so ownership stays with the
   initiator for that case. A re-dial always uses a fresh random conn-id, so a
-  reaped-then-reconnecting client never collides. Residue from an acceptor crash
-  mid-tunnel is bounded (one subtree per live tunnel) and is a future age-sweep's
-  job; the slow scan already lists the root, so that sweep is cheap to add.
+  reaped-then-reconnecting client never collides.
+- **Age-sweep** (crash residue): the two cases the above does not cover are an
+  orphaned inbox marker (a client that died after dropping the marker but before
+  its work subtree became visible, so it is never engaged) and a stale work
+  subtree (a partial/abandoned handshake, or one both of whose peers died). An
+  infrequent acceptor sweep (`AgeSweepInterval`, default 10 m — the *only* routine
+  walk of the work tree) removes any inbox marker or work subtree that is not
+  engaged (not in `seen`) and has had no activity for `AgeSweepThreshold`
+  (default 15 m). The threshold comfortably exceeds how idle a live tunnel can
+  look, and an engaged tunnel is skipped (it is reaped via `Done()` instead), so
+  neither an in-flight nor a live-but-quiet tunnel is ever swept. Last activity is
+  the newest mtime among a subtree's segment files and direction directories (the
+  directories are the fallback so a freshly-created empty subtree reads as recent).
 
 ### 4.7 Reader loop (polling)
 
