@@ -48,11 +48,18 @@ func (s *Server) handleGetTunnelAddress(ctx context.Context, c *cedarserver.Conn
 // tunnel contact (the broker prefix for stamping local registrants).
 func (s *Server) startUpstream(ctx context.Context) {
 	up := s.cfg.Upstream
+	// When the upstream link is a carrier (e.g. fs:<dir>), register and service
+	// reverse-connects over the shared carrier pipe instead of TCP.
+	var upDial ccb.BrokerDialer
+	if s.carrier != nil && isCarrier(up.BrokerAddr) {
+		upDial = s.carrier.dial
+	}
 	lis := ccb.NewListener(ccb.ListenerConfig{
 		BrokerAddr:        up.BrokerAddr,
 		Security:          up.Security,
 		Name:              "ccb-inside " + s.cfg.PublicAddress,
 		HeartbeatInterval: up.HeartbeatInterval,
+		Dial:              upDial,
 		Handler: func(conn net.Conn) {
 			// A forwarded inbound rendezvous arrived: serve it as our own broker so
 			// the next-hop CCB_REQUEST (for a local registrant) is dispatched here.

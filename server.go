@@ -111,6 +111,14 @@ type Config struct {
 	// upstream broker.
 	Upstream *UpstreamConfig
 
+	// CarrierListen, if set, makes this (outside) CCB accept inside CCBs arriving
+	// over a non-TCP carrier instead of (or in addition to) TCP. It is a carrier
+	// address, e.g. "fs:/gpfs/pool/ccb-tunnel" for the filesystem carrier. Each
+	// inside CCB that dials the carrier becomes one yamux-multiplexed pipe whose
+	// streams are served by the same command loop as TCP connections. See
+	// docs/TRANSPORTS.md. Empty ⇒ TCP only.
+	CarrierListen string
+
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -156,6 +164,11 @@ type Server struct {
 	tunnelContact   atomic.Pointer[string]
 	tunnelReady     chan struct{}
 	tunnelReadyOnce sync.Once
+
+	// carrier, when non-nil, is this inside CCB's shared non-TCP link to its
+	// outside CCB (see carrier.go); its dial hook backs both the upstream
+	// registration and the outbound next-hop forwarding.
+	carrier *carrierClient
 }
 
 // target is a registered daemon holding a persistent connection.
@@ -214,6 +227,14 @@ func New(cfg Config) (*Server, error) {
 		requests:   map[uint64]*request{},
 		proxies:    map[string]*proxySession{},
 	}
+	// Detect a non-TCP carrier on the inside-CCB knobs (a shared pipe to the
+	// outside CCB backing both upstream registration and outbound forwarding).
+	cc, err := s.detectCarrier()
+	if err != nil {
+		return nil, err
+	}
+	s.carrier = cc
+
 	// Choose how an outbound proxy reaches a target: forward to a next-hop CCB
 	// (inside CCB, two-CCB tunnel) or dial directly (exit CCB).
 	if cfg.OutboundNextHop != "" {
@@ -223,14 +244,21 @@ func New(cfg Config) (*Server, error) {
 		// Trivial self-loop guard. A deeper A->B->A cycle is a misconfiguration
 		// bounded by the connect timeout; the wire format carries no hop counter,
 		// so we cannot detect it here without breaking §4.1 compatibility.
-		if hop := strings.Trim(cfg.OutboundNextHop, "<>"); hop == cfg.PublicAddress || hop == s.proxyAddrSinful() {
-			return nil, fmt.Errorf("ccbserver: OutboundNextHop %q points at this broker (routing loop)", cfg.OutboundNextHop)
+		// (Skipped for a carrier next-hop, which is not a "host:port" self.)
+		if !isCarrier(cfg.OutboundNextHop) {
+			if hop := strings.Trim(cfg.OutboundNextHop, "<>"); hop == cfg.PublicAddress || hop == s.proxyAddrSinful() {
+				return nil, fmt.Errorf("ccbserver: OutboundNextHop %q points at this broker (routing loop)", cfg.OutboundNextHop)
+			}
 		}
-		s.outbound = &nextHopTransport{
+		nt := &nextHopTransport{
 			broker:  cfg.OutboundNextHop,
 			sec:     cfg.OutboundNextHopSecurity,
 			timeout: cfg.RequestTimeout,
 		}
+		if cc != nil && isCarrier(cfg.OutboundNextHop) {
+			nt.dial = cc.dial // forward the proxy-connect over the carrier pipe
+		}
+		s.outbound = nt
 	} else {
 		s.outbound = &tcpDirectTransport{s: s}
 	}
@@ -290,6 +318,15 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 func (s *Server) StartBackground(ctx context.Context) {
 	if s.cfg.ReconnectStore != nil {
 		go s.sweepLoop(ctx)
+	}
+	if s.cfg.CarrierListen != "" {
+		s.startCarrierListener(ctx)
+	}
+	if s.carrier != nil {
+		go func() {
+			<-ctx.Done()
+			s.carrier.close()
+		}()
 	}
 	if s.cfg.Upstream != nil {
 		s.startUpstream(ctx)

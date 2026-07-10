@@ -54,6 +54,7 @@ type nextHopTransport struct {
 	broker  string
 	sec     *security.SecurityConfig
 	timeout time.Duration
+	dial    ccb.BrokerDialer // non-nil ⇒ reach the next hop over a carrier, not TCP
 }
 
 func (t *nextHopTransport) describe() string { return "next-hop " + t.broker }
@@ -63,6 +64,7 @@ func (t *nextHopTransport) connect(ctx context.Context, target string) (net.Conn
 		Security: t.sec,
 		Name:     "ccb-inside-forwarder",
 		Timeout:  t.timeout,
+		Dial:     t.dial,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("next-hop %s: %w", t.broker, err)

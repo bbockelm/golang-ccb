@@ -1,7 +1,5 @@
 github.com/PelicanPlatform/classad v0.4.0 h1:d409NSsyWQvMwBIPmwrX+6qTfWrDxlM6RdMIpP2uIWw=
 github.com/PelicanPlatform/classad v0.4.0/go.mod h1:z1d5dXdX+1pxBi8f8Ab/yCX8zKyiLam9CtQHSykMlWQ=
-github.com/bbockelm/cedar v0.3.0 h1:Np3d1fCtf6ZGCWweCS4ghPl2tWCAaPw20RI1m9AFlRA=
-github.com/bbockelm/cedar v0.3.0/go.mod h1:xzqomHCxjE/F9J5Wf6I/VJ/ZM6XHed4bhZEqhwlqCLY=
 github.com/bbockelm/golang-htcondor v0.2.1 h1:K1/RZELP2aEKaq2aAiIoVP2JaPwdaNLSEnq4HRS0LKw=
 github.com/bbockelm/golang-htcondor v0.2.1/go.mod h1:QFffS1KJ/96uy7Tp9SMJTgphlMyxHzunM9lMXHjU41s=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
@@ -22,6 +20,8 @@ github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
+github.com/hashicorp/yamux v0.1.2 h1:XtB8kyFOyHXYVFnwT5C3+Bdo8gArse7j2AQ0DA0Uey8=
+github.com/hashicorp/yamux v0.1.2/go.mod h1:C+zze2n6e/7wshOZep2A70/aQU6QBRWJO/G6FT1wIns=
 github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD/E=
 github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
 github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
