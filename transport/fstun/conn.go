@@ -71,6 +71,12 @@ type Conn struct {
 	closeOnce sync.Once
 	closed    chan struct{}
 	recvDone  chan struct{}
+
+	// dead is closed once the pipe is terminal for ANY reason -- local Close, a
+	// peer FIN/ERROR, or an idle/heartbeat timeout. The acceptor watches it to
+	// reap the on-disk subtree (see Listener).
+	deadOnce sync.Once
+	dead     chan struct{}
 }
 
 func newConn(cfg resolvedConfig, connDir string, r role, w *segWriter, sr *segReader, sendSeq uint64, params synParams) *Conn {
@@ -86,6 +92,7 @@ func newConn(cfg resolvedConfig, connDir string, r role, w *segWriter, sr *segRe
 		flowSig:  make(chan struct{}, 1),
 		closed:   make(chan struct{}),
 		recvDone: make(chan struct{}),
+		dead:     make(chan struct{}),
 	}
 	c.lastRecv.set(time.Now())
 	go c.recvLoop()
@@ -164,9 +171,16 @@ func (c *Conn) Close() error {
 		<-c.recvDone // let recvLoop stop touching the reader
 		c.w.close()
 		c.r.close()
+		c.markDead()
 	})
 	return nil
 }
+
+// Done is closed once the pipe is terminal (local Close, peer FIN/ERROR, or an
+// idle/heartbeat timeout). The acceptor uses it to reap the on-disk subtree.
+func (c *Conn) Done() <-chan struct{} { return c.dead }
+
+func (c *Conn) markDead() { c.deadOnce.Do(func() { close(c.dead) }) }
 
 func (c *Conn) LocalAddr() net.Addr  { return fstunAddr{c.connDir, c.role, false} }
 func (c *Conn) RemoteAddr() net.Addr { return fstunAddr{c.connDir, c.role, true} }
@@ -351,6 +365,9 @@ func (c *Conn) failRecv(err error) {
 	c.recvMu.Unlock()
 	c.signal(c.dataSig)
 	c.signal(c.flowSig)
+	// A hard failure (peer ERROR, idle/heartbeat timeout, reader error) is
+	// terminal -- unlike a FIN half-close -- so the pipe is reap-eligible.
+	c.markDead()
 }
 
 // maintLoop emits periodic heartbeats + a catch-up ACK, and enforces the idle

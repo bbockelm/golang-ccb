@@ -151,6 +151,45 @@ concurrent append — no file ever has two writers. ACKs for a direction are
 *piggybacked* into the opposite direction's file (the reader of `c2s` is the
 writer of `s2c`), so control still flows both ways with single-writer files.
 
+#### 4.1.1 Arrival signalling — the doorbell
+
+Listing a directory on NFS is expensive, and doing it on a tight loop to spot new
+initiators does not scale. Instead the initiator **rings a doorbell**: after
+creating its subtree and writing its SYN it bumps the mtime of a single
+`<root>/.doorbell` file with one atomic `Chtimes` (`SETATTR`) and fsyncs the root
+directory, pushing the new subtree's directory entry out of its local write-back
+cache. The acceptor watches that *one* file's mtime with a cheap `stat`
+aggressively (data-path poll interval); a change triggers a full `readdir`. A slow
+full scan every **30 s** is the guaranteed backstop.
+
+*Does this race?* Yes, benignly. Even after the initiator fsyncs, the acceptor may
+`readdir` a stale cached listing (NFS close-to-open only guarantees freshness at
+open, and the acceptor's directory attribute cache may not have expired) that
+omits the just-created subtree. We do **not** rely on the doorbell being ordered
+before a fresh listing: a ring triggers several **follow-up rescans**, and the
+30 s scan is the hard guarantee, so a stale listing is *retried*, never lost.
+Prompt detection also depends on the mount's attribute-cache timeouts (`actimeo`);
+the backstop makes correctness independent of them. The acceptor never prunes its
+"seen" set from a listing (a transiently-stale `readdir` could otherwise cause a
+double-accept); entries are forgotten only when a subtree is reaped.
+
+*Why `Chtimes`, not append or `truncate`?* The doorbell is shared by *many*
+initiators (one outside CCB serves many inside CCBs), so the ring op must be safe
+under concurrent writers. `O_APPEND` on NFS is **TOCTOU** — the client reads the
+size then writes at that offset, so concurrent appenders clobber each other and a
+stale-small cached size can even make a write land mid-file, so size is *not*
+reliably monotonic. `truncate` only signals via a size change, so it must either
+grow monotonically (append with extra steps, same race) or return to a prior size
+(the `SETATTR` may be elided and is undetectable between samples). `Chtimes` is a
+single atomic `SETATTR`: no read-modify-write, no growth, no torn content. Its
+weaknesses are benign because the doorbell is only a *hint* — correctness is the
+authoritative `readdir` plus the 30 s backstop: coarse server mtime granularity
+can merge closely-spaced rings (adds latency, never loses a tunnel), and clock
+skew / backward stamps still register because the acceptor compares to the *last
+mtime it observed*, not to its own clock. A dedicated file is also chosen over
+watching the root directory's own mtime because file attributes refresh faster by
+default (`acregmin` ~3 s vs `acdirmin` ~30 s).
+
 ### 4.2 Frame format (TLV + sequence)
 
 Every segment is a sequence of self-delimiting frames:
@@ -229,9 +268,17 @@ or stalled reader cannot make the writer fill the filesystem.
   received ACK ≥ that value (the reader has consumed the whole segment) the writer
   `unlink`s it. Single-owner deletion (the writer removes only its own direction's
   files) avoids racing the reader. The current segment is never reaped.
-- **Teardown**: after both directions are FIN'd and drained (or on `ERROR` /
-  idle-timeout), the acceptor removes the whole `<conn-id>/` subtree. A crash
-  leaves at most one stale subdir, reaped by an age sweep on the root.
+- **Teardown / GC**: the acceptor owns the root, so it is responsible for reaping
+  a tunnel's subtree. Each pipe exposes `Done()`, closed when the pipe is terminal
+  for *any* reason — a clean `Close` (both sides finished), a peer `ERROR`, or an
+  idle/heartbeat/ACK timeout (a FIN half-close is **not** terminal). The acceptor
+  removes the `<conn-id>/` subtree as soon as its pipe's `Done()` fires. The
+  *initiator* cleans up its own subtree if a dial never establishes (handshake
+  timeout / error) — the acceptor never engaged it, so ownership stays with the
+  initiator for that case. A re-dial always uses a fresh random conn-id, so a
+  reaped-then-reconnecting client never collides. Residue from an acceptor crash
+  mid-tunnel is bounded (one subtree per live tunnel) and is a future age-sweep's
+  job; the slow scan already lists the root, so that sweep is cheap to add.
 
 ### 4.7 Reader loop (polling)
 

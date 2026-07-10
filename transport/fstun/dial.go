@@ -24,7 +24,14 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		return nil, err
 	}
 	connDir := filepath.Join(cfg.Root, connID)
-	return handshake(ctx, rc, params, connDir, roleInitiator)
+	c, err := handshake(ctx, rc, params, connDir, roleInitiator)
+	if err != nil {
+		// Never-established: the initiator owns cleanup of its own subtree so a
+		// failed dial does not leak a directory (the acceptor never engaged it).
+		_ = os.RemoveAll(connDir)
+		return nil, err
+	}
+	return c, nil
 }
 
 // handshake creates the send direction, writes our SYN as frame 0, opens the recv
@@ -40,6 +47,12 @@ func handshake(ctx context.Context, rc resolvedConfig, params synParams, connDir
 	if err := w.append(syn, 0); err != nil {
 		w.close()
 		return nil, fmt.Errorf("fstun: writing SYN: %w", err)
+	}
+	// The initiator rings the doorbell so the acceptor learns of this new subtree
+	// without listing the directory on a tight loop. Best-effort: the acceptor's
+	// slow scan is the backstop if the ring fails.
+	if r == roleInitiator {
+		_ = ringDoorbell(filepath.Dir(connDir))
 	}
 
 	sr := newSegReader(filepath.Join(connDir, r.recvDir()))

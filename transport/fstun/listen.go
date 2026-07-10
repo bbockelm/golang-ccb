@@ -57,45 +57,76 @@ func Listen(cfg Config) (*Listener, error) {
 	return l, nil
 }
 
-// scanInterval is how often the acceptor rescans the root for new subtrees. The
-// SYN handshake tolerates a late-arriving peer, so this need not be as tight as
-// the data-path poll.
-func (l *Listener) scanInterval() time.Duration {
-	if d := l.rc.pollInterval; d > 100*time.Millisecond {
+const (
+	// slowScanInterval is the guaranteed full-readdir backstop. Listing an NFS
+	// directory is expensive, so we do it rarely and rely on the doorbell for
+	// prompt arrival detection.
+	slowScanInterval = 30 * time.Second
+	// doorbellRescans is how many follow-up scans a single ring triggers, to
+	// paper over an acceptor readdir that is briefly stale (NFS dir cache) and
+	// omits the just-created subtree.
+	doorbellRescans = 3
+)
+
+// doorbellInterval is how often the acceptor stats the single doorbell file: a
+// cheap one-file GETATTR (subject to the NFS attribute cache), not a directory
+// listing. Responsiveness therefore depends on the mount's attribute-cache
+// timeouts (actimeo); the slow scan is the hard guarantee regardless.
+func (l *Listener) doorbellInterval() time.Duration {
+	if d := l.rc.pollInterval; d > 0 {
 		return d
 	}
-	return 100 * time.Millisecond
+	return 25 * time.Millisecond
 }
 
+// watchLoop learns of new initiators by watching a single doorbell file
+// aggressively (cheap) and does a full directory scan only on a doorbell change
+// (plus a few follow-up rescans to tolerate a stale NFS listing) or on the slow
+// backstop timer.
 func (l *Listener) watchLoop() {
-	t := time.NewTimer(0)
-	defer t.Stop()
+	var db doorbellState
+	l.scan() // engage any subtrees already present (e.g. after a restart)
+	db.changed(l.root)
+
+	fast := time.NewTicker(l.doorbellInterval())
+	slow := time.NewTicker(slowScanInterval)
+	defer fast.Stop()
+	defer slow.Stop()
+
+	rescans := 0
 	for {
 		select {
 		case <-l.ctx.Done():
 			return
-		case <-t.C:
+		case <-slow.C:
 			l.scan()
-			t.Reset(l.scanInterval())
+		case <-fast.C:
+			if db.changed(l.root) {
+				rescans = doorbellRescans
+			}
+			if rescans > 0 {
+				l.scan()
+				rescans--
+			}
 		}
 	}
 }
 
-// scan starts accepting any subtree that has an initiator SYN segment and is not
-// yet seen, and forgets subtrees that have gone away (so seen does not grow
-// without bound over a long-lived acceptor).
+// scan engages any subtree that has an initiator SYN segment and is not yet
+// seen. It deliberately does NOT prune seen from the listing: a stale NFS readdir
+// could transiently omit a live subtree and cause a double-accept. seen is
+// forgotten authoritatively by forget() when a subtree is reaped or its
+// handshake fails.
 func (l *Listener) scan() {
 	entries, err := os.ReadDir(l.root)
 	if err != nil {
 		return
 	}
-	live := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		id := e.Name()
-		live[id] = struct{}{}
 		// An initiator writes its SYN into c2s/000000.seg before we should engage.
 		if _, err := os.Stat(filepath.Join(l.root, id, "c2s", segName(0))); err != nil {
 			continue
@@ -109,31 +140,45 @@ func (l *Listener) scan() {
 		l.mu.Unlock()
 		go l.accept(filepath.Join(l.root, id))
 	}
-	l.mu.Lock()
-	for id := range l.seen {
-		if _, ok := live[id]; !ok {
-			delete(l.seen, id)
-		}
-	}
-	l.mu.Unlock()
 }
 
 func (l *Listener) accept(connDir string) {
 	c, err := handshake(l.ctx, l.rc, l.params, connDir, roleAcceptor)
 	if err != nil {
-		// A single initiator that never completed the SYN handshake must not kill
-		// the accept loop; drop it. (The initiator's Dial has failed too.) Forget
-		// it so a later re-creation of the subtree can be retried.
-		l.mu.Lock()
-		delete(l.seen, filepath.Base(connDir))
-		l.mu.Unlock()
+		// The initiator never completed the SYN handshake; it cleans up its own
+		// subtree. Forget it so a later re-creation can be retried.
+		l.forget(connDir)
 		return
 	}
+	// The acceptor owns the root, so it reaps the subtree once the tunnel is
+	// terminal (Close, peer ERROR, or idle/heartbeat timeout).
+	go l.reapWhenDone(connDir, c)
 	select {
 	case l.accepted <- acceptResult{c: c}:
 	case <-l.ctx.Done():
 		_ = c.Close()
 	}
+}
+
+// reapWhenDone removes a finished tunnel's subtree once the pipe is terminal. On
+// listener shutdown it leaves the subtree in place (the tunnel may still be
+// live); crash residue is a future age-sweep's job.
+func (l *Listener) reapWhenDone(connDir string, c *Conn) {
+	select {
+	case <-c.Done():
+	case <-l.ctx.Done():
+		return
+	}
+	_ = os.RemoveAll(connDir)
+	l.forget(connDir)
+}
+
+// forget drops a conn-id from the seen set so its subtree can be re-accepted if
+// re-created.
+func (l *Listener) forget(connDir string) {
+	l.mu.Lock()
+	delete(l.seen, filepath.Base(connDir))
+	l.mu.Unlock()
 }
 
 // Accept returns the next established pipe. It blocks until one is ready.
