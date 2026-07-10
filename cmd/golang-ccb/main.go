@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -201,6 +203,18 @@ func run() error {
 			"next_hop", hop, "ready_file", readyFile)
 	}
 
+	// Non-TCP carrier wiring (see docs/TRANSPORTS.md). CCB_CARRIER_LISTEN makes
+	// this (outside) CCB accept inside CCBs over a filesystem ("fs:<dir>") or
+	// WebSocket ("ws://" / "wss://") carrier; a ws/wss Upstream/next-hop makes
+	// this (inside) CCB dial one.
+	cc, err := buildCarrierSettings(d.Config(), sec, outboundNextHop, upstream)
+	if err != nil {
+		return err
+	}
+	if isWSCarrier(cc.listen) {
+		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
+	}
+
 	srv, err := ccbserver.New(ccbserver.Config{
 		PublicAddress:           pub,
 		Security:                sec,
@@ -212,6 +226,12 @@ func run() error {
 		OutboundNextHop:         outboundNextHop,
 		OutboundNextHopSecurity: nextHopSec,
 		Upstream:                upstream,
+		CarrierListen:           cc.listen,
+		CarrierTLS:              cc.tls,
+		CarrierTokenVerify:      cc.verify,
+		CarrierClientTLS:        cc.clientTLS,
+		CarrierToken:            cc.token,
+		CarrierTokenSource:      cc.tokenSource,
 		Logger:                  d.Slog(),
 	})
 	if err != nil {
@@ -246,6 +266,79 @@ func buildSessionStore(cfg *config.Config) (sessioncache.SessionStore, error) {
 	}
 	slog.Default().Info("ccb session cache persistence enabled", "file", path, "signing_keys", len(keys))
 	return store, nil
+}
+
+// isWSCarrier reports whether addr names a WebSocket carrier (ws:// or wss://).
+func isWSCarrier(addr string) bool {
+	return strings.HasPrefix(addr, "ws://") || strings.HasPrefix(addr, "wss://")
+}
+
+// carrierSettings holds the resolved non-TCP carrier configuration for the CCB.
+type carrierSettings struct {
+	listen      string
+	tls         *tls.Config
+	verify      func(context.Context, string) (string, error)
+	clientTLS   *tls.Config
+	token       string
+	tokenSource func(context.Context) (string, error)
+}
+
+// buildCarrierSettings resolves the carrier knobs from config: the listener side
+// (CCB_CARRIER_LISTEN + TLS + token verification for a ws/wss listener) and the
+// client side (bearer token + CA for dialing a ws/wss upstream or next hop).
+func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig) (carrierSettings, error) {
+	var cc carrierSettings
+	cc.listen, _ = cfg.Get("CCB_CARRIER_LISTEN")
+
+	if isWSCarrier(cc.listen) {
+		// Verify inside CCBs' bearer tokens: an HTCondor IDTOKEN (against our pool
+		// signing key) or a SciToken (against its issuer's JWKS).
+		cc.verify = ccbserver.BearerTokenVerifier(sec)
+		if strings.HasPrefix(cc.listen, "wss://") {
+			certFile, _ := cfg.Get("CCB_CARRIER_TLS_CERT")
+			keyFile, _ := cfg.Get("CCB_CARRIER_TLS_KEY")
+			if certFile == "" || keyFile == "" {
+				return cc, fmt.Errorf("CCB_CARRIER_LISTEN is wss:// but CCB_CARRIER_TLS_CERT / CCB_CARRIER_TLS_KEY are not set")
+			}
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				return cc, fmt.Errorf("loading carrier TLS cert/key: %w", err)
+			}
+			cc.tls = &tls.Config{Certificates: []tls.Certificate{cert}}
+		}
+	}
+
+	// Client side: token + CA for dialing a ws/wss upstream or next hop.
+	if isWSCarrier(outboundNextHop) || (upstream != nil && isWSCarrier(upstream.BrokerAddr)) {
+		if tok, ok := cfg.Get("CCB_CARRIER_TOKEN"); ok && tok != "" {
+			cc.token = tok
+		} else {
+			cc.tokenSource = ccbserver.DiscoverBearerToken
+		}
+		if caFile, ok := cfg.Get("CCB_CARRIER_CA_FILE"); ok && caFile != "" {
+			tlsc, err := loadCarrierClientTLS(caFile)
+			if err != nil {
+				return cc, fmt.Errorf("loading carrier CA file: %w", err)
+			}
+			cc.clientTLS = tlsc
+		}
+	}
+	return cc, nil
+}
+
+// loadCarrierClientTLS builds a client TLS config trusting the CA bundle in
+// caFile, for dialing a wss:// carrier whose server cert is not chained to a
+// system root.
+func loadCarrierClientTLS(caFile string) (*tls.Config, error) {
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no certificates found in %s", caFile)
+	}
+	return &tls.Config{RootCAs: pool}, nil
 }
 
 // configBool reads an HTCondor-style boolean knob, returning def if unset or
