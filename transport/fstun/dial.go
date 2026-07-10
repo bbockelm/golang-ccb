@@ -39,7 +39,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 func handshake(ctx context.Context, rc resolvedConfig, params synParams, root, connID string, r role) (*Conn, error) {
 	connDir := connPath(root, connID)
 	sendDir := filepath.Join(connDir, r.sendDir())
-	w, err := newSegWriter(sendDir, rc.segmentSize, rc.sync)
+	w, err := newSegWriter(sendDir, rc)
 	if err != nil {
 		return nil, fmt.Errorf("fstun: opening send dir: %w", err)
 	}
@@ -62,7 +62,7 @@ func handshake(ctx context.Context, rc resolvedConfig, params synParams, root, c
 		}
 	}
 
-	sr := newSegReader(filepath.Join(connDir, r.recvDir()))
+	sr := newSegReader(filepath.Join(connDir, r.recvDir()), rc.netFS)
 	peer, err := waitSYN(ctx, sr, rc)
 	if err != nil {
 		w.close()

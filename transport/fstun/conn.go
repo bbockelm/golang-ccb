@@ -290,8 +290,12 @@ func (c *Conn) sendAck(upTo uint64) {
 
 func (c *Conn) recvLoop() {
 	defer close(c.recvDone)
-	poll := time.NewTimer(c.cfg.pollInterval)
-	defer poll.Stop()
+	// Adaptive poll: wait pollInterval after the last new data, doubling each
+	// empty check up to pollMax, then holding at pollMax. Any new frame resets it,
+	// so an active pipe stays responsive while an idle one backs off (cheap, and
+	// on a network FS each empty check is a close-to-open revalidation).
+	base, max := c.cfg.pollInterval, c.cfg.pollMax
+	cur := base
 	for {
 		select {
 		case <-c.closed:
@@ -302,6 +306,7 @@ func (c *Conn) recvLoop() {
 		switch {
 		case err == nil:
 			c.lastRecv.set(time.Now())
+			cur = base // got data; poll fast again
 			c.dispatch(f)
 			if f.typ == frameError {
 				return
@@ -314,11 +319,15 @@ func (c *Conn) recvLoop() {
 			return
 		}
 
-		poll.Reset(c.cfg.pollInterval)
 		select {
-		case <-poll.C:
+		case <-time.After(cur):
 		case <-c.closed:
 			return
+		}
+		if cur < max {
+			if cur *= 2; cur > max {
+				cur = max
+			}
 		}
 	}
 }

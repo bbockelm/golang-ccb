@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // segName is the on-disk name of segment index i within a direction directory.
@@ -18,14 +19,17 @@ func segName(i uint32) string { return fmt.Sprintf("%06d.seg", i) }
 type segWriter struct {
 	dir     string
 	maxSeg  int64 // roll when the current segment would exceed this
-	syncEnb bool
+	syncEnb bool  // fsync every append (local durability opt-in)
+	netFS   bool  // network filesystem: fsync-batch (Nagle) for cross-host visibility
+	flushIv time.Duration
 
-	mu      sync.Mutex
-	cur     uint32   // current segment index
-	f       *os.File // current segment file
-	size    int64    // bytes written to the current segment
-	closed  bool
-	reapOff []segEnd // closed segments awaiting reap, in order
+	mu         sync.Mutex
+	cur        uint32   // current segment index
+	f          *os.File // current segment file
+	size       int64    // bytes written to the current segment
+	closed     bool
+	reapOff    []segEnd    // closed segments awaiting reap, in order
+	flushTimer *time.Timer // armed on first unsynced write in netFS mode (Nagle)
 }
 
 // segEnd records a closed segment's index and the cumulative DATA byte offset at
@@ -35,12 +39,13 @@ type segEnd struct {
 	dataEnd uint64
 }
 
-// newSegWriter creates dir and opens segment 0 for appending.
-func newSegWriter(dir string, maxSeg int64, sync bool) (*segWriter, error) {
+// newSegWriter creates dir and opens segment 0 for appending, taking its sync
+// policy (local fsync-each-append vs network Nagle batching) from rc.
+func newSegWriter(dir string, rc resolvedConfig) (*segWriter, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	w := &segWriter{dir: dir, maxSeg: maxSeg, syncEnb: sync}
+	w := &segWriter{dir: dir, maxSeg: rc.segmentSize, syncEnb: rc.sync, netFS: rc.netFS, flushIv: rc.flushInterval}
 	if err := w.openCur(); err != nil {
 		return nil, err
 	}
@@ -78,10 +83,37 @@ func (w *segWriter) append(f *frame, dataEnd uint64) error {
 		return err
 	}
 	w.size += int64(len(enc))
-	if w.syncEnb {
+	switch {
+	case w.netFS:
+		// Nagle: coalesce a burst of appends into one fsync within flushIv, so the
+		// reader sees them (NFS makes writes visible only after they reach the
+		// server) without a round-trip per frame.
+		w.armFlushLocked()
+	case w.syncEnb:
 		_ = w.f.Sync()
 	}
 	return nil
+}
+
+// armFlushLocked schedules a single fsync flushIv from now if one is not already
+// pending. Caller holds mu.
+func (w *segWriter) armFlushLocked() {
+	if w.flushTimer == nil {
+		w.flushTimer = time.AfterFunc(w.flushIv, w.timedFlush)
+	}
+}
+
+// timedFlush is the Nagle timer callback: fsync the current segment once.
+func (w *segWriter) timedFlush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.flushTimer = nil
+	if w.closed {
+		return
+	}
+	if w.f != nil {
+		_ = w.f.Sync()
+	}
 }
 
 // roll closes the current segment with a ROLL frame and opens the next. Caller
@@ -92,7 +124,9 @@ func (w *segWriter) roll(dataEnd uint64) error {
 	if _, err := w.f.Write(rollFrame.appendTo(nil)); err != nil {
 		return err
 	}
-	if w.syncEnb {
+	// The ROLL must reach the server before we stop writing this segment, or the
+	// reader could stall at its tail never learning to advance.
+	if w.netFS || w.syncEnb {
 		_ = w.f.Sync()
 	}
 	_ = w.f.Close()
@@ -118,12 +152,16 @@ func (w *segWriter) reap(ackedDataOff uint64) {
 	w.reapOff = append([]segEnd(nil), kept...)
 }
 
-// syncNow forces the current segment to the backing store regardless of the
-// syncEnb setting -- used for handshake frames (the SYN) so the peer sees them
-// promptly on NFS even when per-append syncing is off.
+// syncNow forces the current segment to the backing store immediately (cancelling
+// any pending Nagle flush) -- used for handshake frames (the SYN) so the peer sees
+// them promptly even when per-append syncing is off.
 func (w *segWriter) syncNow() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.flushTimer != nil {
+		w.flushTimer.Stop()
+		w.flushTimer = nil
+	}
 	if w.f != nil {
 		_ = w.f.Sync()
 	}
@@ -136,8 +174,13 @@ func (w *segWriter) close() {
 		return
 	}
 	w.closed = true
+	if w.flushTimer != nil {
+		w.flushTimer.Stop()
+		w.flushTimer = nil
+	}
 	if w.f != nil {
-		if w.syncEnb {
+		// Flush any coalesced tail (e.g. the FIN) so the peer sees the close.
+		if w.netFS || w.syncEnb {
 			_ = w.f.Sync()
 		}
 		_ = w.f.Close()
@@ -148,7 +191,8 @@ func (w *segWriter) close() {
 // tolerates a partial tail (returns errIncompleteFrame so the caller waits) and
 // follows ROLL frames to the next segment. Not safe for concurrent use.
 type segReader struct {
-	dir string
+	dir   string
+	netFS bool // network filesystem: revalidate close-to-open before each read
 
 	cur uint32   // current segment index
 	f   *os.File // current segment file (nil until first read)
@@ -156,8 +200,8 @@ type segReader struct {
 	buf []byte   // carry-over bytes of a partially-read frame
 }
 
-func newSegReader(dir string) *segReader {
-	return &segReader{dir: dir}
+func newSegReader(dir string, netFS bool) *segReader {
+	return &segReader{dir: dir, netFS: netFS}
 }
 
 // next returns the next frame, or errIncompleteFrame if a complete frame is not
@@ -203,8 +247,22 @@ func (r *segReader) next() (frame, error) {
 }
 
 // fill appends any newly-visible bytes of the current segment (past r.off) into
-// r.buf. It returns whether any bytes were read.
+// r.buf. It returns whether any bytes were read. On a network filesystem it first
+// reopens the segment close-to-open, so the Stat/ReadAt see server-fresh
+// attributes and data rather than a stale client cache.
 func (r *segReader) fill() (bool, error) {
+	if r.netFS && r.f != nil {
+		name := r.f.Name()
+		_ = r.f.Close()
+		f, err := os.Open(name)
+		if err != nil {
+			// Vanished (e.g. reaped) or transient; drop the fd and retry next round
+			// via openWait. Not fatal.
+			r.f = nil
+			return false, nil
+		}
+		r.f = f
+	}
 	fi, err := r.f.Stat()
 	if err != nil {
 		return false, err

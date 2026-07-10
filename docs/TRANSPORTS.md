@@ -325,15 +325,30 @@ or stalled reader cannot make the writer fill the filesystem.
 
 ### 4.7 Reader loop (polling)
 
-Open the current segment at the last read offset. Read frames while a *complete*
-frame is available (4.2). On a partial tail or EOF, sleep `PollInterval`
-(default 25 ms, adaptive: back off toward 100 ms when idle, snap to fast on data)
-and retry. On `ROLL`, open the next segment (waiting for it to appear) and
-continue. On `FIN`, mark the recv side closed. On `ERROR`, fail the pipe.
-`fsnotify` is used as an *optimization* where the FS is local (snap out of the
-poll sleep early); correctness never depends on it.
+Read frames from the current segment at the last read offset while a *complete*
+frame is available (4.2). On a partial tail or EOF, wait and retry with an
+**adaptive backoff**: `PollInterval` after the last new data (default 10 ms),
+doubling on each empty check (20, 40, … ms) up to `PollMax` (default 320 ms),
+then holding at `PollMax`; any new frame snaps the wait back to `PollInterval`.
+On `ROLL`, open the next segment (waiting for it to appear) and continue. On
+`FIN`, mark the recv side closed. On `ERROR`, fail the pipe.
 
-### 4.8 `net.Conn` semantics
+On a **network filesystem** (§4.8) each empty check first reopens the segment
+**close-to-open** — closing and re-opening forces a fresh `GETATTR`, so the
+subsequent `stat`/`read` observe the server's current size and bytes rather than a
+stale client attribute/data cache. On a local FS the fd is kept open (the page
+cache is already coherent), so the backoff is pure sleeping.
+
+### 4.8 Filesystem-mode detection
+
+The fsync-batching (below) and close-to-open reads matter only on a filesystem
+without coherent cross-host caching. fstun detects this once, on the root: on
+Linux via `statfs` f_type against a set of network magics (NFS, Lustre, CephFS,
+SMB/CIFS, GFS2, OCFS2, GPFS, AFS, FUSE); on other OSes it assumes local.
+`Config.NetworkFS` (a `*bool`) overrides detection either way. On a local FS the
+carrier skips all of the fsync/reopen overhead.
+
+### 4.9 `net.Conn` semantics
 
 - `Read`: returns reassembled DATA payload; blocks until data, FIN (→ `io.EOF`),
   ERROR (→ that error), or the read deadline (→ timeout error).
@@ -344,12 +359,18 @@ poll sleep early); correctness never depends on it.
 - `SetDeadline`/`Set{Read,Write}Deadline`: drive the loop selects.
 - `LocalAddr`/`RemoteAddr`: synthetic `fstunAddr{root, connID, role}`.
 
-Durability note: the writer `Write`s and periodically `Fsync`s; a frame is only
-"real" to the reader once its bytes (and CRC) are visible, and torn tails are
-tolerated (4.2), so no cross-host locking or atomic rename is required on the data
-path — only the append-only + single-writer discipline.
+Durability / visibility note: on a network FS the writer coalesces appends and
+`Fsync`s them within `FlushInterval` (default 5 ms) — a Nagle-like batch, so a
+burst becomes one round-trip to the server instead of one per frame — and also
+fsyncs on a segment `ROLL`, on `Close` (flushing the `FIN`), and immediately for
+the `SYN` (`syncNow`). On a local FS it does not fsync at all (a peer sees writes
+through the shared page cache; `Sync` opts into per-append fsync only for crash
+durability). A frame is only "real" to the reader once its bytes (and CRC) are
+visible, and torn tails are tolerated (4.2), so no cross-host locking or atomic
+rename is required on the data path — only the append-only + single-writer
+discipline.
 
-### 4.9 Failure modes
+### 4.10 Failure modes
 
 - **Slow/dead reader**: backpressure stalls the writer (bounded backlog); heartbeat
   gap → the writer `ERROR`s/closes after `IdleTimeout`.

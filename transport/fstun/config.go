@@ -26,10 +26,29 @@ type Config struct {
 	// MaxFrame is the max DATA payload per frame (default 256 KiB, capped at 1 MiB).
 	MaxFrame int
 
-	// PollInterval is how often the reader re-checks for newly-visible bytes when
-	// idle (default 25 ms). Correctness never depends on it (NFS has no reliable
-	// change notification); it only trades latency for syscall load.
+	// PollInterval is the BASE of the reader's adaptive poll backoff: how soon
+	// after the last new data it first re-checks for more (default 10 ms). Each
+	// empty check then doubles the wait up to PollMax. Correctness never depends
+	// on it (NFS has no reliable change notification); it trades latency for load.
 	PollInterval time.Duration
+
+	// PollMax caps the reader's poll backoff: after PollInterval the wait doubles
+	// (20, 40, ... ms) up to PollMax, then stays there (default 320 ms).
+	PollMax time.Duration
+
+	// FlushInterval is the Nagle-like coalescing window for writes on a NETWORK
+	// filesystem: after the first unsynced append the writer fsyncs within this
+	// window, batching a burst into one round-trip to the server (default 5 ms).
+	// Ignored on a local FS, where a peer sees writes through the shared page
+	// cache without fsync.
+	FlushInterval time.Duration
+
+	// NetworkFS overrides detection of whether Root is on a network filesystem
+	// (NFS, Lustre, CephFS, SMB, GPFS, ...). On a network FS the writer
+	// fsync-batches (FlushInterval) and the reader revalidates close-to-open
+	// (reopen to force a GETATTR); on a local FS both are skipped. nil =>
+	// auto-detect (Linux: statfs magic; other OSes: assume local).
+	NetworkFS *bool
 
 	// Heartbeat is how often to emit a HEARTBEAT (also carrying a catch-up ACK)
 	// (default 5 s).
@@ -65,6 +84,9 @@ type Config struct {
 // runtime actually consults.
 type resolvedConfig struct {
 	pollInterval      time.Duration
+	pollMax           time.Duration
+	flushInterval     time.Duration
+	netFS             bool
 	heartbeat         time.Duration
 	idleTimeout       time.Duration
 	handshakeTimeout  time.Duration
@@ -106,8 +128,15 @@ func (cfg Config) resolve() (resolvedConfig, synParams, error) {
 	case ageInt < 0:
 		ageInt = 0 // disabled
 	}
+	netFS := detectNetworkFS(cfg.Root)
+	if cfg.NetworkFS != nil {
+		netFS = *cfg.NetworkFS
+	}
 	rc := resolvedConfig{
-		pollInterval:      def(cfg.PollInterval, 25*time.Millisecond),
+		pollInterval:      def(cfg.PollInterval, 10*time.Millisecond),
+		pollMax:           def(cfg.PollMax, 320*time.Millisecond),
+		flushInterval:     def(cfg.FlushInterval, 5*time.Millisecond),
+		netFS:             netFS,
 		heartbeat:         def(cfg.Heartbeat, 5*time.Second),
 		idleTimeout:       def(cfg.IdleTimeout, 60*time.Second),
 		handshakeTimeout:  def(cfg.HandshakeTimeout, 30*time.Second),
@@ -115,6 +144,9 @@ func (cfg Config) resolve() (resolvedConfig, synParams, error) {
 		sync:              cfg.Sync,
 		ageSweepInterval:  ageInt,
 		ageSweepThreshold: def(cfg.AgeSweepThreshold, 15*time.Minute),
+	}
+	if rc.pollMax < rc.pollInterval {
+		rc.pollMax = rc.pollInterval
 	}
 	params := synParams{
 		version:     protocolVersion,
