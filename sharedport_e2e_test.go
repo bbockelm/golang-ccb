@@ -129,7 +129,7 @@ func TestCCBBehindSharedPort(t *testing.T) {
 		Security:          plaintextSec(),
 		Name:              "sp-echo-target",
 		HeartbeatInterval: 30 * time.Second,
-		Handler: func(c net.Conn) {
+		Handler: func(c net.Conn, _ ccb.InboundMeta) {
 			defer c.Close()
 			buf := make([]byte, 4)
 			if _, err := io.ReadFull(c, buf); err != nil {

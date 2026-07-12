@@ -11,7 +11,7 @@ import (
 	"github.com/bbockelm/cedar/ccb"
 )
 
-func echoHandler(conn net.Conn) {
+func echoHandler(conn net.Conn, _ ccb.InboundMeta) {
 	defer conn.Close()
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, buf); err != nil {

@@ -86,7 +86,7 @@ func TestAuthzDeniesRegister(t *testing.T) {
 		Security:          plaintextSec(),
 		Name:              "denied-target",
 		HeartbeatInterval: 30 * time.Second,
-		Handler: func(conn net.Conn) {
+		Handler: func(conn net.Conn, _ ccb.InboundMeta) {
 			defer conn.Close()
 			_, _ = io.Copy(conn, conn)
 		},

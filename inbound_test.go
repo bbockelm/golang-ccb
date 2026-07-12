@@ -62,7 +62,7 @@ func startRegisteredCedarEP(t *testing.T, brokerAddr string, served chan<- struc
 		Security:          plaintextSec(),
 		Name:              "tunneled-ep",
 		HeartbeatInterval: 30 * time.Second,
-		Handler:           func(conn net.Conn) { _ = srv.ServeConn(context.Background(), conn) },
+		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = srv.ServeConn(context.Background(), conn) },
 	})
 	ctx, c := context.WithCancel(context.Background())
 	go func() { _ = lis.Run(ctx) }()

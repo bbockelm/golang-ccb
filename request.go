@@ -13,6 +13,20 @@ import (
 // handleRequest handles CCB_REQUEST. It looks up the target, decides between
 // standard (direct reverse connect) and streaming/proxy mode, forwards the
 // request, and relays the result to the requester.
+// requesterIdentity renders an audit string for the peer that opened this request:
+// its authenticated identity (if any) at its network address. Inner tunnel hops
+// forward this unchanged so every broker can log who the connection is really for.
+func requesterIdentity(c *cedarserver.Conn) string {
+	user := ""
+	if c.Negotiation != nil {
+		user = c.Negotiation.User
+	}
+	if user == "" {
+		user = "unauthenticated"
+	}
+	return user + " at " + c.RemoteAddr
+}
+
 func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 	s.log.Info("CCB_REQUEST received", "remote", c.RemoteAddr)
 	ad, err := ccb.ReadControlAd(ctx, c.Stream)
@@ -31,6 +45,10 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 	returnAddr := ccb.AdString(ad, ccb.AttrMyAddress)
 	name := ccb.AdString(ad, ccb.AttrName)
 	streamingRequired, _ := ccb.AdBool(ad, ccb.AttrCCBStreamingRequired)
+	// Recursive inbound tunnel: a non-empty route names the downstream CCBIDs to
+	// pop after this hop's target, meaning the target is itself a downstream CCB
+	// that must recurse. Such a request is inherently proxied/streamed.
+	route := ccb.AdString(ad, ccb.AttrCCBRoute)
 
 	if connectID == "" || returnAddr == "" {
 		return s.replyFailure(ctx, c, "request missing ClaimId or MyAddress")
@@ -48,10 +66,19 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 	}
 
 	// Decide mode: the requester is private (and needs proxying) if it asked
-	// for streaming, or if the return address is itself CCB-routed.
+	// for streaming, if the return address is itself CCB-routed, or if there is a
+	// downstream route to follow (a tunnel).
 	returnInfo, _ := addresses.ParseSinful(returnAddr)
-	if streamingRequired || returnInfo.IsCCB() {
-		return s.handleProxyRequest(ctx, c, t, connectID, name)
+	if streamingRequired || returnInfo.IsCCB() || route != "" {
+		rc := routeContext{
+			route: route,
+			// This is the client-facing (entry) broker: stamp the audit trail from
+			// the authenticated requester so inner hops can log who the connection is
+			// really for. Inner relay hops propagate these unchanged.
+			originalRequester: requesterIdentity(c),
+			priorHop:          s.proxyAddrSinful(),
+		}
+		return s.handleProxyRequest(ctx, c, t, connectID, name, rc)
 	}
 	return s.handleStandardRequest(ctx, c, t, connectID, returnAddr, name)
 }

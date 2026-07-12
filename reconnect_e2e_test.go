@@ -40,7 +40,7 @@ func TestReconnectReusesCCBID(t *testing.T) {
 		Name:              "reconnect-target",
 		HeartbeatInterval: 30 * time.Second,
 		ReconnectInterval: 100 * time.Millisecond,
-		Handler:           func(c net.Conn) { c.Close() },
+		Handler:           func(c net.Conn, _ ccb.InboundMeta) { c.Close() },
 	})
 	lctx, lcancel := context.WithCancel(context.Background())
 	defer lcancel()
