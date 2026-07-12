@@ -225,16 +225,19 @@ func TestOutboundProxyTwoCCB(t *testing.T) {
 	}
 }
 
-// TestOutboundProxyTargetNotAllowed verifies deny-by-default: a target that is not
-// in the allow-list is refused (before any dial).
+// TestOutboundProxyTargetNotAllowed verifies that a configured allow-list refuses a
+// target that does not match any entry (before any dial). (An *empty* allow-list
+// permits all non-loopback targets -- see the module doc; that is exercised by the
+// success-path tests, which pass no allow-list.)
 func TestOutboundProxyTargetNotAllowed(t *testing.T) {
 	targetIP := nonLoopbackIPv4(t)
 	served := make(chan struct{}, 1)
 	targetAddr, stopTgt := startCedarDialTarget(t, targetIP, served)
 	defer stopTgt()
 
-	// Empty allow-list => nothing permitted.
-	brokerAddr, _, stopSrv := startOutboundBroker(t, nil)
+	// A non-empty allow-list naming only a reserved TEST-NET range that cannot
+	// contain the real target IP => the target is not permitted.
+	brokerAddr, _, stopSrv := startOutboundBroker(t, []string{"192.0.2.0/24"})
 	defer stopSrv()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)

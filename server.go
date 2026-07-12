@@ -101,6 +101,12 @@ type Config struct {
 	// spliced.
 	OutboundNextHopSecurity *security.SecurityConfig
 
+	// OutboundTTL bounds the outbound-proxy hop count. It is the fallback applied
+	// to a CCB_PROXY_CONNECT that carries no CCBTTL (i.e. from an originator that
+	// did not set one). Each forwarding broker decrements and refuses at 0. <= 0 ⇒
+	// default 8. Mirrors config CCB_OUTBOUND_TTL.
+	OutboundTTL int
+
 	// Upstream, if set, makes this an "inside" CCB for INBOUND tunneling: it
 	// registers with the upstream (outside) CCB and feeds the reverse-connected
 	// sockets that broker forwards down into its own command server, so a client

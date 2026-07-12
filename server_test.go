@@ -57,7 +57,7 @@ func startEchoTarget(t *testing.T, brokerAddr string) (contact string, cancel fu
 		Security:          plaintextSec(),
 		Name:              "echo-target",
 		HeartbeatInterval: 30 * time.Second,
-		Handler: func(conn net.Conn) {
+		Handler: func(conn net.Conn, _ ccb.InboundMeta) {
 			defer conn.Close()
 			buf := make([]byte, 4)
 			if _, err := io.ReadFull(conn, buf); err != nil {

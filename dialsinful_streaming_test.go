@@ -88,7 +88,7 @@ func startCedarTarget(t *testing.T, brokerAddr string, served chan<- struct{}) (
 		Security:          plaintextSec(),
 		Name:              "cedar-target",
 		HeartbeatInterval: 30 * time.Second,
-		Handler: func(conn net.Conn) {
+		Handler: func(conn net.Conn, _ ccb.InboundMeta) {
 			// ServeConn takes ownership of (and closes) the spliced connection.
 			_ = srv.ServeConn(context.Background(), conn)
 		},

@@ -60,9 +60,17 @@ func (s *Server) startUpstream(ctx context.Context) {
 		Name:              "ccb-inside " + s.cfg.PublicAddress,
 		HeartbeatInterval: up.HeartbeatInterval,
 		Dial:              upDial,
-		Handler: func(conn net.Conn) {
-			// A forwarded inbound rendezvous arrived: serve it as our own broker so
-			// the next-hop CCB_REQUEST (for a local registrant) is dispatched here.
+		Handler: func(conn net.Conn, meta ccb.InboundMeta) {
+			// A forwarded inbound rendezvous arrived over our upstream registration.
+			// If it carries a route, the outer broker is asking us -- as a trusted
+			// downstream CCB -- to relay to the next hop directly (recursive inbound
+			// tunnel, §4.4); splice without re-authenticating the client. Otherwise
+			// serve it as our own broker so the client's next-hop CCB_REQUEST (for a
+			// local registrant) is dispatched here.
+			if meta.Route != "" {
+				s.startInboundRelay(ctx, conn, meta)
+				return
+			}
 			_ = s.srv.ServeConn(ctx, conn)
 		},
 	})

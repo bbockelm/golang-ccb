@@ -20,8 +20,10 @@ import (
 // pluggable carrier (TCP now).
 type outboundTransport interface {
 	// connect returns a pipe carrying opaque bytes to target (a Sinful), or an
-	// error whose message is safe to relay back to the requester.
-	connect(ctx context.Context, target string) (net.Conn, error)
+	// error whose message is safe to relay back to the requester. ttl is the
+	// remaining outbound hop budget: a forwarding transport refuses at <= 0 and
+	// forwards ttl-1; a direct transport ignores it (it dials, it does not forward).
+	connect(ctx context.Context, target string, ttl int) (net.Conn, error)
 	// describe names the transport for logging.
 	describe() string
 }
@@ -32,7 +34,7 @@ type tcpDirectTransport struct{ s *Server }
 
 func (t *tcpDirectTransport) describe() string { return "direct" }
 
-func (t *tcpDirectTransport) connect(ctx context.Context, target string) (net.Conn, error) {
+func (t *tcpDirectTransport) connect(ctx context.Context, target string, _ int) (net.Conn, error) {
 	dialAddr, err := t.s.outboundTargetAllowed(target)
 	if err != nil {
 		return nil, err
@@ -59,12 +61,18 @@ type nextHopTransport struct {
 
 func (t *nextHopTransport) describe() string { return "next-hop " + t.broker }
 
-func (t *nextHopTransport) connect(ctx context.Context, target string) (net.Conn, error) {
+func (t *nextHopTransport) connect(ctx context.Context, target string, ttl int) (net.Conn, error) {
+	// Decrementing TTL (like TCP): the originator set it; we only decrement and
+	// refuse -- so the chain length is bounded by the originator, not any broker.
+	if ttl <= 0 {
+		return nil, fmt.Errorf("outbound proxy TTL expired")
+	}
 	conn, err := ccb.OutboundConnect(ctx, t.broker, target, ccb.OutboundOptions{
 		Security: t.sec,
 		Name:     "ccb-inside-forwarder",
 		Timeout:  t.timeout,
 		Dial:     t.dial,
+		TTL:      ttl - 1, // next hop refuses once the originator's budget is spent
 	})
 	if err != nil {
 		return nil, fmt.Errorf("next-hop %s: %w", t.broker, err)
@@ -96,10 +104,21 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 		return s.replyFailure(ctx, c, "proxy-connect missing MyAddress or ClaimId")
 	}
 
+	// Decrementing TTL (like TCP): the originator set it; intermediate brokers only
+	// decrement. Fall back to our configured default when the request carries none.
+	ttl := s.cfg.OutboundTTL
+	if ttl <= 0 {
+		ttl = 8
+	}
+	if v, ok := ccb.AdInt(ad, ccb.AttrCCBTTL); ok {
+		ttl = int(v)
+	}
+
 	// Reach the target via the configured transport: an exit CCB dials directly
 	// (enforcing loopback refusal + allow-list), an inside CCB forwards one hop to
-	// its next-hop CCB (§4.3). Any failure is reported to the requester and closes.
-	targetConn, err := s.outbound.connect(ctx, target)
+	// its next-hop CCB with TTL-1 (§4.3). Any failure is reported to the requester
+	// and closes.
+	targetConn, err := s.outbound.connect(ctx, target, ttl)
 	if err != nil {
 		s.log.Warn("proxy-connect target unreachable", "remote", c.RemoteAddr, "target", target,
 			"via", s.outbound.describe(), "error", err)
@@ -152,14 +171,18 @@ func (s *Server) outboundTargetAllowed(target string) (string, error) {
 
 // matchAllowlist reports whether host matches any allow-list entry. An entry is a
 // CIDR ("10.0.0.0/8"), a glob ("*.example.com", "192.168.*"), or an exact
-// host/IP literal (case-insensitive). Empty list => no match (deny-by-default).
+// host/IP literal (case-insensitive). An empty list (all entries blank) permits
+// all targets except the loopback/link-local ones already refused by the caller --
+// set a narrower list to restrict the outbound proxy to a specific target set.
 func (s *Server) matchAllowlist(host string) bool {
 	ip := net.ParseIP(host)
+	hasEntry := false
 	for _, pat := range s.cfg.OutboundTargetAllowlist {
 		pat = strings.TrimSpace(pat)
 		if pat == "" {
 			continue
 		}
+		hasEntry = true
 		if _, cidr, err := net.ParseCIDR(pat); err == nil {
 			if ip != nil && cidr.Contains(ip) {
 				return true
@@ -176,5 +199,7 @@ func (s *Server) matchAllowlist(host string) bool {
 			return true
 		}
 	}
-	return false
+	// No non-blank entries configured: permit all (loopback/link-local already
+	// refused by the caller). A configured-but-unmatched host is denied.
+	return !hasEntry
 }
