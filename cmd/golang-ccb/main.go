@@ -42,7 +42,7 @@ func main() {
 }
 
 func run() error {
-	listen := flag.String("listen", ":9618", "fallback TCP listen address when not inheriting a shared-port endpoint")
+	listen := flag.String("listen", ":9618", "public TCP listen address for CCB contacts; when running under condor_master it is bound IN ADDITION to the inherited command socket, otherwise it is the sole command port")
 	public := flag.String("public", "", "public address advertised in CCB contacts (host:port); defaults to the TCP listen address")
 	// condor_master appends these standard DaemonCore flags when it launches a
 	// daemon that is not in its built-in list (see masterDaemon.cpp); accept them
@@ -51,6 +51,17 @@ func run() error {
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
 	flag.Parse()
+
+	// Did the operator explicitly set -listen? Only then do we bind it as an extra public
+	// port alongside an inherited command socket; left at its default we preserve the
+	// pre-existing behavior (advertise the shared-port sinful, bind no extra TCP port) so a
+	// pure shared-port deployment does not collide with the shared-port server's own port.
+	listenExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "listen" {
+			listenExplicit = true
+		}
+	})
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "CCB", LocalName: *localName})
 	if err != nil {
@@ -92,8 +103,9 @@ func run() error {
 		}
 	}
 
-	// Command-socket listener: the shared-port endpoint inherited from
-	// condor_master if present, otherwise a plain TCP bind.
+	// Command-socket listener: the shared-port endpoint (or pre-created command socket,
+	// issue #119) inherited from condor_master if present, otherwise a plain TCP bind of
+	// -listen.
 	ln, err := d.Listener(func() (net.Listener, error) {
 		return net.Listen("tcp", *listen)
 	})
@@ -101,12 +113,40 @@ func run() error {
 		return err
 	}
 	defer ln.Close()
+	lns := []net.Listener{ln}
+
+	// A CCB advertises a directly-dialable public address that external EPs and clients
+	// connect to (the "<public>#<id>" in CCB contacts). Under condor_master the inherited
+	// socket is the pool-managed command port -- typically a shared-port Unix socket with no
+	// routable address of its own -- so we ALSO bind the -listen TCP port and serve the
+	// broker on both: the inherited socket carries managed DC traffic, the public TCP port
+	// carries CCB contacts. Standalone, ln already IS the -listen bind, so we do not bind it
+	// twice (that would EADDRINUSE).
+	directLn := ln
+	if d.AdoptedInheritedListener() && listenExplicit {
+		pubLn, err := net.Listen("tcp", *listen)
+		if err != nil {
+			return fmt.Errorf("binding public CCB port %q: %w", *listen, err)
+		}
+		defer pubLn.Close()
+		lns = append(lns, pubLn)
+		directLn = pubLn
+		log.Info(logging.DestinationGeneral, "listening on both the inherited command socket and the public CCB port",
+			"inherited", ln.Addr().String(), "public", pubLn.Addr().String())
+	}
 
 	// Address advertised inside CCB contact strings ("<public>#<id>").
 	pub := *public
 	if pub == "" {
-		if tcp, ok := ln.Addr().(*net.TCPAddr); ok {
+		if tcp, ok := directLn.Addr().(*net.TCPAddr); ok {
 			pub = tcp.String()
+			// A wildcard bind (0.0.0.0 / ::) is not a routable contact address; EPs cannot
+			// dial it. Warn so the operator supplies -public (or TCP_FORWARDING_HOST).
+			if tcp.IP == nil || tcp.IP.IsUnspecified() {
+				log.Warn(logging.DestinationGeneral,
+					"advertising a wildcard CCB address; external peers cannot dial it -- pass -public <routable-host:port>",
+					"address", pub)
+			}
 		} else if sinful, ok := d.AdvertisedSinful(); ok {
 			// A shared-port (Unix socket) listener has no routable address of
 			// its own; advertise the broker's shared-port command sinful
@@ -239,9 +279,9 @@ func run() error {
 	}
 
 	log.Info(logging.DestinationGeneral, "golang-ccb starting",
-		"public", pub, "listen", ln.Addr().String(), "under_master", d.UnderMaster())
+		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
-	return d.Serve(context.Background(), ln, srv.Serve)
+	return d.ServeListeners(context.Background(), srv.Serve, lns...)
 }
 
 // buildSessionStore constructs the encrypted session-cache store when

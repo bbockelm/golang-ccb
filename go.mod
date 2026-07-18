@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/PelicanPlatform/classad v0.4.0
-	github.com/bbockelm/cedar v0.5.0
+	github.com/bbockelm/cedar v0.5.2
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/yamux v0.1.2
 )
@@ -35,3 +35,5 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 )
+
+replace github.com/bbockelm/golang-htcondor => ../golang-htcondor
