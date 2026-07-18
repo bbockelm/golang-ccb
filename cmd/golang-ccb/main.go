@@ -163,15 +163,23 @@ func run() error {
 	// this broker authenticates clients with the same policy and keys as the
 	// collector's CCB: GetServerSecurityConfig loads the server-side credentials
 	// (SSL server cert/key, token signing keys, trust domain) needed to *verify*
-	// presented authentications. CCB control messages are authenticated and
-	// integrity-protected but NOT encrypted: the proxy splices bytes, and the two
-	// real peers run their own end-to-end CEDAR security over the relay.
+	// presented authentications. CCB control messages are authenticated but run
+	// in the clear -- NEITHER encrypted NOR integrity-protected: the broker
+	// splices raw bytes, so the session carries no session key, and the two real
+	// peers run their own end-to-end CEDAR security over the relay.
 	//
+	// cedar's session crypto is AES-GCM, which couples integrity to encryption
+	// (there is no MAC-only mode), so a plaintext CCB session cannot provide
+	// integrity. Both Encryption and Integrity must therefore be relaxed from the
+	// DAEMON-level default (which requires integrity): leaving Integrity=REQUIRED
+	// while running plaintext makes the per-command security check
+	// (cedar >= v0.5.4) reject every command as not meeting its security level.
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
 	sec.Encryption = security.SecurityNever
+	sec.Integrity = security.SecurityNever
 	sec.RemoteVersion = streamingVersionString
 
 	// Reload the server's credentials (signing keys, SSL key/cert) on SIGHUP, the
@@ -232,6 +240,7 @@ func run() error {
 			return fmt.Errorf("building next-hop client security config: %w", err)
 		}
 		nextHopSec.Encryption = security.SecurityNever
+		nextHopSec.Integrity = security.SecurityNever // plaintext splice: no session key, so no integrity (see the inbound sec above)
 		nextHopSec.RemoteVersion = streamingVersionString
 		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
 		upstream = &ccbserver.UpstreamConfig{
