@@ -163,15 +163,25 @@ func run() error {
 	// this broker authenticates clients with the same policy and keys as the
 	// collector's CCB: GetServerSecurityConfig loads the server-side credentials
 	// (SSL server cert/key, token signing keys, trust domain) needed to *verify*
-	// presented authentications. CCB control messages are authenticated and
-	// integrity-protected but NOT encrypted: the proxy splices bytes, and the two
-	// real peers run their own end-to-end CEDAR security over the relay.
+	// presented authentications.
 	//
+	// The CCB control messages (CCB_REGISTER, CCB_REQUEST, ...) run under the
+	// normal negotiated CEDAR security -- authenticated, and encrypted +
+	// integrity-protected whenever the peer supports it -- exactly like the C++
+	// CCB, which keeps the negotiated session crypto for the control exchange and
+	// disables it only at the moment it begins raw byte-splicing
+	// (ccb_server.cpp StartRelay: set_crypto_key(false, NULL) on both sockets).
+	// The relay itself needs no session key on our side: it splices the raw
+	// net.Conn underneath the cedar Stream (see the proxy/reverse-connect
+	// handlers), and the two real peers run their own end-to-end CEDAR over the
+	// opaque relay. Protecting the control plane matters -- an on-path attacker
+	// must not be able to tamper with an authenticated registration or request
+	// ad -- so we do NOT force Encryption/Integrity off here.
 	sec, err := htcondor.GetServerSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
-	sec.Encryption = security.SecurityNever
+	requireEncryptionForIntegrity(sec)
 	sec.RemoteVersion = streamingVersionString
 
 	// Reload the server's credentials (signing keys, SSL key/cert) on SIGHUP, the
@@ -231,7 +241,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("building next-hop client security config: %w", err)
 		}
-		nextHopSec.Encryption = security.SecurityNever
+		requireEncryptionForIntegrity(nextHopSec) // protect the tunnel control exchange; the relay still splices raw (see the inbound sec above)
 		nextHopSec.RemoteVersion = streamingVersionString
 		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
 		upstream = &ccbserver.UpstreamConfig{
@@ -383,6 +393,23 @@ func loadCarrierClientTLS(caFile string) (*tls.Config, error) {
 
 // configBool reads an HTCondor-style boolean knob, returning def if unset or
 // unrecognized.
+// requireEncryptionForIntegrity upgrades an OPTIONAL encryption policy to
+// REQUIRED whenever the config requires integrity. cedar's only integrity
+// mechanism is AES-GCM authenticated encryption -- there is no MAC-only mode --
+// so a session that must be integrity-protected must also be encrypted.
+// Without this, an integrity=REQUIRED / encryption=OPTIONAL policy (HTCondor's
+// DAEMON default) negotiates down to a plaintext session that then fails cedar's
+// per-command security check (>= v0.5.4), refusing every command as not meeting
+// its security level. The CCB relay is unaffected: it splices the raw net.Conn
+// beneath the cedar Stream, so the opaque relayed bytes never carry this
+// session's crypto -- matching the C++ CCB, which keeps negotiated crypto on the
+// control exchange and disables it only at the byte-splice (StartRelay).
+func requireEncryptionForIntegrity(sec *security.SecurityConfig) {
+	if sec.Integrity == security.SecurityRequired && sec.Encryption != security.SecurityRequired {
+		sec.Encryption = security.SecurityRequired
+	}
+}
+
 func configBool(cfg interface{ Get(string) (string, bool) }, key string, def bool) bool {
 	v, ok := cfg.Get(key)
 	if !ok {
