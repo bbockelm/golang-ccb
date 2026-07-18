@@ -3,8 +3,8 @@ module github.com/bbockelm/golang-ccb
 go 1.25.7
 
 require (
-	github.com/PelicanPlatform/classad v0.4.0
-	github.com/bbockelm/cedar v0.5.2
+	github.com/PelicanPlatform/classad v0.8.0
+	github.com/bbockelm/cedar v0.5.5
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/yamux v0.1.2
 )
@@ -30,10 +30,8 @@ require (
 )
 
 require (
-	github.com/bbockelm/golang-htcondor v0.2.1
+	github.com/bbockelm/golang-htcondor v0.7.0
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 )
-
-replace github.com/bbockelm/golang-htcondor => ../golang-htcondor
