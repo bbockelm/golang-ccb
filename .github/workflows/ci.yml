@@ -12,9 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Track the minimum Go version named in go.mod (currently 1.25).
-        # Add new minor versions here when go.mod's `go` directive moves forward.
-        go-version: ['1.25']
+        # First entry is the floor named in go.mod (1.26, the oldest
+        # release upstream still supports); testing there is what keeps
+        # that floor honest. Last entry is the newest release, which is
+        # what builds and ships.
+        go-version: ['1.26', '1.27']
 
     steps:
     - name: Checkout code
@@ -54,7 +56,7 @@ jobs:
       run: gotestsum --junitfile=test-results.xml -- -race -timeout=15m -coverprofile=coverage.out -covermode=atomic ./...
 
     - name: Upload coverage to Codecov
-      if: matrix.go-version == '1.25'
+      if: matrix.go-version == '1.27'
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:
         files: ./coverage.out
@@ -72,7 +74,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.25'
+        go-version: '1.27'
         cache: true
 
     - name: Run golangci-lint
@@ -91,7 +93,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.25'
+        go-version: '1.27'
         cache: true
 
     - name: Build
