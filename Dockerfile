@@ -14,7 +14,7 @@
 #     golang-ccb -listen :9618 -public <public-host>:9618
 
 # ---- build stage ----
-FROM golang:1.25 AS build
+FROM golang:1.27 AS build
 
 WORKDIR /src
 
