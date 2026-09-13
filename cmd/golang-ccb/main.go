@@ -32,7 +32,16 @@ import (
 
 // streamingVersionString advertises a CondorVersion at or above the streaming
 // support threshold so streaming-capable requesters proceed.
-const streamingVersionString = "$CondorVersion: 25.12.0 2026-06-21 BuildID: golang-ccb GitSHA: dev $"
+//
+// Derived from cedar's own ccb.StreamingMinVersion rather than written out.
+// A hardcoded version silently falls below the gate the moment cedar raises
+// it, and the symptom is remote: nested routing fails with "entry broker does
+// not support streaming" even though this broker implements it. That is
+// exactly what a literal 25.12.0 did when cedar moved the minimum to 25.13.0.
+var streamingVersionString = fmt.Sprintf(
+	"$CondorVersion: %s 2026-06-21 BuildID: golang-ccb GitSHA: dev $",
+	ccb.StreamingMinVersion,
+)
 
 func main() {
 	if err := run(); err != nil {

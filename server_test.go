@@ -3,6 +3,7 @@ package ccbserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -14,7 +15,9 @@ import (
 )
 
 // At/above ccb.StreamingMinVersion so the test broker advertises streaming support.
-const testStreamingVersion = "$CondorVersion: 25.12.0 2026-06-21 BuildID: test $"
+// Track cedar's streaming threshold rather than naming a version: a literal
+// silently drops below the gate when cedar raises the minimum.
+var testStreamingVersion = fmt.Sprintf("$CondorVersion: %s 2026-06-21 BuildID: test $", ccb.StreamingMinVersion)
 
 // plaintextSec returns an un-authenticated, un-encrypted security config (for
 // in-process tests). encryptionNever keeps the CCB control channel plaintext.
