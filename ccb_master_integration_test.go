@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -256,4 +257,119 @@ func dumpLog(t *testing.T, path string) {
 	} else {
 		t.Logf("(could not read %s: %v)", path, err)
 	}
+}
+
+// TestGoCCBSharedPortUnderCondorMaster runs the Go CCB as a DaemonCore daemon
+// behind condor_master's shared port, with FS the only authentication method,
+// and sends it DC_RECONFIG with condor_reconfig through the shared port. An
+// HTCondor 25.14+ FS client binds the authentication to the shared-port id it
+// dialed (?sock=), so the command being decided at all proves the broker
+// accepts that binding. It is first refused, as ALLOW_ADMINISTRATOR_CCB
+// excludes the caller; after the configuration admits the caller and the pool
+// is reconfigured (condor_master signals the broker), it runs -- the policy
+// reloaded without a restart.
+func TestGoCCBSharedPortUnderCondorMaster(t *testing.T) {
+	for _, tool := range []string{"condor_master", "condor_reconfig"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not found in PATH, skipping integration test", tool)
+		}
+	}
+
+	tmp := t.TempDir()
+	ccbBin := filepath.Join(tmp, "golang-ccb")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", ccbBin, "./cmd/golang-ccb")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building golang-ccb: %v\n%s", err, out)
+	}
+
+	extra := fmt.Sprintf(`
+DAEMON_LIST = MASTER, COLLECTOR, CCB
+DC_DAEMON_LIST = + CCB
+ENABLE_CCB_SERVER = False
+CCB = %s
+CCB_LOG = $(LOG)/CcbLog
+CCB_DEBUG = D_FULLDEBUG D_SECURITY
+# cedar implements only AES-GCM; the master's family session must use it.
+SEC_DEFAULT_CRYPTO_METHODS = AES
+SEC_DEFAULT_AUTHENTICATION_METHODS = FS
+SEC_CLIENT_AUTHENTICATION_METHODS = FS
+ALLOW_ADMINISTRATOR_CCB = nobody@nowhere.invalid
+`, ccbBin)
+
+	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
+	defer h.Shutdown()
+	configFile := h.GetConfigFile()
+	logDir := h.GetLogDir()
+	ccbLog := filepath.Join(logDir, "CcbLog")
+	defer saveLogs(t, logDir)
+
+	addr := "<" + waitForCCBContact(t, ccbLog) + ">"
+	if !strings.Contains(addr, "sock=") {
+		t.Fatalf("Go CCB contact %s is not a shared-port address", addr)
+	}
+
+	reconfigCCB := func() (string, error) {
+		cmd := exec.Command("condor_reconfig", "-addr", addr)
+		cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+configFile)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := reconfigCCB(); err == nil {
+		dumpLog(t, ccbLog)
+		t.Fatalf("condor_reconfig of the Go CCB ran under ALLOW_ADMINISTRATOR_CCB = nobody, want refused:\n%s", out)
+	}
+	if data, _ := os.ReadFile(ccbLog); !strings.Contains(string(data), "PERMISSION DENIED") {
+		dumpLog(t, ccbLog)
+		t.Fatal("the Go CCB did not log the refused DC_RECONFIG as PERMISSION DENIED")
+	}
+
+	// Admit the caller, and reconfigure the pool: condor_master signals the
+	// broker, which rebuilds its policy.
+	f, err := os.OpenFile(configFile, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("\nALLOW_ADMINISTRATOR_CCB = *\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runCondor(t, configFile, 30*time.Second, "condor_reconfig")
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		out, err := reconfigCCB()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			dumpLog(t, ccbLog)
+			t.Fatalf("condor_reconfig of the Go CCB still refused after the pool reconfig admitted the caller: %v\n%s", err, out)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if data, _ := os.ReadFile(ccbLog); !strings.Contains(string(data), "DC_RECONFIG received") {
+		dumpLog(t, ccbLog)
+		t.Fatal("the Go CCB did not log running DC_RECONFIG")
+	}
+}
+
+// waitForCCBContact waits for the Go CCB to log the shared-port address it
+// advertises and returns it (host:port?sock=...).
+func waitForCCBContact(t *testing.T, ccbLog string) string {
+	t.Helper()
+	re := regexp.MustCompile(`advertising shared-port CCB contact.*address=([^ ]+)`)
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(ccbLog); err == nil {
+			if m := re.FindSubmatch(data); m != nil {
+				return strings.Trim(string(m[1]), `"<>`)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	dumpLog(t, ccbLog)
+	t.Fatal("Go CCB did not log a shared-port contact")
+	return ""
 }

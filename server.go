@@ -24,7 +24,6 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
-	"github.com/bbockelm/golang-htcondor/authz"
 )
 
 // Config configures a CCB Server.
@@ -51,11 +50,16 @@ type Config struct {
 	// (3x the 1200s heartbeat default); set negative to disable.
 	TargetIdleTimeout time.Duration
 
-	// Authz, if set, enforces HTCondor ALLOW_/DENY_ authorization per command
-	// (CCB_REGISTER -> DAEMON/ADVERTISE_*, CCB_REQUEST -> READ), matching the
-	// collector's CCB. If nil, all authenticated peers are authorized (the
-	// authentication policy in Security still applies).
-	Authz *authz.Policy
+	// Authorizer, if set, enforces HTCondor ALLOW_/DENY_ authorization per
+	// command (CCB_REGISTER -> DAEMON/ADVERTISE_*, CCB_REQUEST -> READ),
+	// matching the collector's CCB. It reports whether user (the peer's full
+	// user@domain identity, or "unauthenticated@unmapped" for a peer that did
+	// not authenticate), connecting from peerAddr, holds the authorization
+	// level perm. It is consulted for every command, so a policy that changes
+	// while the server runs (a reconfig, an authorization hole) applies to the
+	// next one; a daemon passes (*daemon.Authz).Authorize. If nil, all peers
+	// are authorized (the authentication policy in Security still applies).
+	Authorizer func(perm, peerAddr, user string) bool
 
 	// ReconnectStore, if set, persists reconnect records so a target keeps its
 	// CCBID (and advertised sinful) across connection drops and broker
@@ -200,6 +204,8 @@ type Server struct {
 	// outside CCB (see carrier.go); its dial hook backs both the upstream
 	// registration and the outbound next-hop forwarding.
 	carrier *carrierClient
+
+	bgOnce sync.Once // StartBackground
 }
 
 // target is a registered daemon holding a persistent connection.
@@ -303,9 +309,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s.srv = cedarserver.New(cfg.Security)
-	if cfg.Authz != nil {
-		s.srv.Authorizer = cfg.Authz.Authorize
-	}
+	s.srv.Authorizer = cfg.Authorizer
 	s.RegisterOn(s.srv)
 	return s, nil
 }
@@ -342,11 +346,24 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 	}
 }
 
+// CommandServer returns the cedar command server New registered the CCB
+// handlers on, for a caller that adds commands to it (e.g. the DaemonCore
+// defaults) or serves it with its own accept loop instead of Serve. Such a
+// caller calls StartBackground itself.
+func (s *Server) CommandServer() *cedarserver.Server {
+	return s.srv
+}
+
 // StartBackground starts the server's background maintenance (reconnect-record
-// sweeping) under ctx. A standalone server does this from Serve; an embedded
-// server whose host runs the Serve loop must call it explicitly. No-op without a
-// reconnect store.
+// sweeping, the carrier listener, upstream registration) under ctx. A standalone
+// server does this from Serve; an embedded server whose host runs the Serve loop
+// must call it explicitly. Only the first call has an effect, so Serve may run on
+// several listeners.
 func (s *Server) StartBackground(ctx context.Context) {
+	s.bgOnce.Do(func() { s.startBackground(ctx) })
+}
+
+func (s *Server) startBackground(ctx context.Context) {
 	if s.cfg.ReconnectStore != nil {
 		go s.sweepLoop(ctx)
 	}
@@ -430,20 +447,18 @@ func (s *Server) contactString(id uint64) string {
 }
 
 // authorize applies the configured ALLOW_/DENY_ policy for command, verifying
-// the peer's authenticated identity against the authorization levels the command
-// was registered with (the single source of truth also used to advertise
-// ValidCommands). It returns nil if authorized (or if no policy is configured),
-// and a descriptive error otherwise.
+// the identity the peer is authorized as (cedarserver.Conn.AuthorizationUser:
+// unauthenticated@unmapped for a peer that did not authenticate) against the
+// authorization levels the command was registered with (the single source of
+// truth also used to advertise ValidCommands). It returns nil if authorized (or
+// if no policy is configured), and a descriptive error otherwise.
 func (s *Server) authorize(c *cedarserver.Conn, command int) error {
-	if s.cfg.Authz == nil {
+	if s.cfg.Authorizer == nil {
 		return nil
 	}
-	user := ""
-	if c.Negotiation != nil {
-		user = c.Negotiation.User
-	}
+	user := c.AuthorizationUser()
 	for _, perm := range s.srv.CommandPerms(command) {
-		if s.cfg.Authz.Authorize(perm, c.RemoteAddr, user) {
+		if s.cfg.Authorizer(perm, c.RemoteAddr, user) {
 			return nil
 		}
 	}

@@ -20,7 +20,6 @@ import (
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
 	htcondor "github.com/bbockelm/golang-htcondor"
-	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
@@ -172,10 +171,12 @@ func run() error {
 	// this broker authenticates clients with the same policy and keys as the
 	// collector's CCB: GetServerSecurityConfig loads the server-side credentials
 	// (SSL server cert/key, token signing keys, trust domain) needed to *verify*
-	// presented authentications. CCB control messages are authenticated but run
-	// in the clear -- NEITHER encrypted NOR integrity-protected: the broker
-	// splices raw bytes, so the session carries no session key, and the two real
-	// peers run their own end-to-end CEDAR security over the relay.
+	// presented authentications; d.ServerSecurityConfig adds this daemon's
+	// shared-port id, which an HTCondor 25.14+ FS client's channel binding names.
+	// CCB control messages are authenticated but run in the clear -- NEITHER
+	// encrypted NOR integrity-protected: the broker splices raw bytes, so the
+	// session carries no session key, and the two real peers run their own
+	// end-to-end CEDAR security over the relay.
 	//
 	// cedar's session crypto is AES-GCM, which couples integrity to encryption
 	// (there is no MAC-only mode), so a plaintext CCB session cannot provide
@@ -183,7 +184,7 @@ func run() error {
 	// DAEMON-level default (which requires integrity): leaving Integrity=REQUIRED
 	// while running plaintext makes the per-command security check
 	// (cedar >= v0.5.4) reject every command as not meeting its security level.
-	sec, err := htcondor.GetServerSecurityConfig(d.Config(), ccb.CommandRegister, "DAEMON")
+	sec, err := d.ServerSecurityConfig(ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
@@ -196,14 +197,6 @@ func run() error {
 	// picked up without a restart.
 	if rl, ok := sec.Credentials.(htcondor.CredentialReloader); ok {
 		d.OnReconfig(func(*config.Config) { rl.Reload() })
-	}
-
-	// Per-command authorization from the HTCondor ALLOW_/DENY_ knobs, so a peer
-	// that authenticates must also be authorized for CCB_REGISTER (DAEMON) /
-	// CCB_REQUEST (READ), exactly like the collector's CCB.
-	policy, err := authz.NewPolicy(d.Config(), "CCB")
-	if err != nil {
-		return fmt.Errorf("building authorization policy: %w", err)
 	}
 
 	// Reconnect persistence lives in the *same* physical SQLite file as the
@@ -273,10 +266,9 @@ func run() error {
 		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
 	}
 
-	srv, err := ccbserver.New(ccbserver.Config{
+	srv, az, err := newBroker(d, ccbserver.Config{
 		PublicAddress:           pub,
 		Security:                sec,
-		Authz:                   policy,
 		ReconnectStore:          store,
 		ReconnectAllowAnyIP:     configBool(d.Config(), "CCB_RECONNECT_ALLOWED_FROM_ANY_IP", false),
 		OutboundProxy:           outboundProxy,
@@ -293,13 +285,43 @@ func run() error {
 		Logger:                  d.Slog(),
 	})
 	if err != nil {
-		return fmt.Errorf("creating CCB server: %w", err)
+		return err
 	}
 
 	log.Info(logging.DestinationGeneral, "golang-ccb starting",
 		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
-	return d.ServeListeners(context.Background(), srv.Serve, lns...)
+	return serveBroker(context.Background(), d, srv, az, lns...)
+}
+
+// newBroker creates the CCB server with the daemon's ALLOW_/DENY_ policy and
+// the DaemonCore commands (DC_NOP*, DC_RECONFIG, DC_OFF*) on its command
+// socket. A peer must be authorized for the command it sends -- CCB_REGISTER
+// (DAEMON or ADVERTISE_*) / CCB_REQUEST (READ), like the collector's CCB. The
+// policy is rebuilt on every reconfig and has the holes C++ DaemonCore punches
+// (condor_master's family session among them); the server consults it for
+// every command, so a reload applies to the next one.
+func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daemon.Authz, error) {
+	az, err := d.NewAuthz(daemon.AuthzOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("building authorization policy: %w", err)
+	}
+	cfg.Authorizer = az.Authorize
+	srv, err := ccbserver.New(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating CCB server: %w", err)
+	}
+	d.RegisterDefaultCommands(srv.CommandServer())
+	return srv, az, nil
+}
+
+// serveBroker starts srv's background work and serves its command socket on
+// every listener until d shuts down, logging each command the policy refuses.
+func serveBroker(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server, az *daemon.Authz, lns ...net.Listener) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	srv.StartBackground(ctx)
+	return d.ServeListeners(ctx, az.Serve(srv.CommandServer(), d.Slog()), lns...)
 }
 
 // buildSessionStore constructs the encrypted session-cache store when
