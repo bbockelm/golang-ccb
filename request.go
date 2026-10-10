@@ -14,17 +14,11 @@ import (
 // standard (direct reverse connect) and streaming/proxy mode, forwards the
 // request, and relays the result to the requester.
 // requesterIdentity renders an audit string for the peer that opened this request:
-// its authenticated identity (if any) at its network address. Inner tunnel hops
-// forward this unchanged so every broker can log who the connection is really for.
+// the identity it is authorized as (its full user@domain, or
+// unauthenticated@unmapped) at its network address. Inner tunnel hops forward
+// this unchanged so every broker can log who the connection is really for.
 func requesterIdentity(c *cedarserver.Conn) string {
-	user := ""
-	if c.Negotiation != nil {
-		user = c.Negotiation.User
-	}
-	if user == "" {
-		user = "unauthenticated"
-	}
-	return user + " at " + c.RemoteAddr
+	return c.AuthorizationUser() + " at " + c.RemoteAddr
 }
 
 func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {

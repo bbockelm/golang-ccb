@@ -292,7 +292,7 @@ func TestOutboundProxyUnauthorized(t *testing.T) {
 	srv, err := New(Config{
 		PublicAddress:           addr,
 		Security:                plaintextSec(),
-		Authz:                   policy,
+		Authorizer:              policy.Authorize,
 		OutboundProxy:           true,
 		OutboundTargetAllowlist: []string{"10.0.0.0/8"},
 		RequestTimeout:          5 * time.Second,
