@@ -33,10 +33,10 @@ type Config struct {
 	// ("<PublicAddress>#<id>") and as the proxy rendezvous address. Required.
 	PublicAddress string
 
-	// Security is the server-side security config for CCB sessions. CCB
-	// sessions are kept un-encrypted (so streaming can splice bytes and so
-	// end-to-end CEDAR security is preserved between the real peers); callers
-	// should leave Encryption at NEVER. Required.
+	// Security is the server-side security config for CCB sessions. The
+	// session may be encrypted: a relayed connection is spliced as raw sockets
+	// after the broker's reply, so its crypto never reaches the relayed bytes,
+	// and the real peers run their own end-to-end CEDAR security. Required.
 	Security *security.SecurityConfig
 
 	// RequestTimeout bounds how long a pending request waits for the target to
@@ -100,9 +100,7 @@ type Config struct {
 	OutboundNextHop string
 
 	// OutboundNextHopSecurity authenticates this broker (as a CCB client, at
-	// DAEMON) to OutboundNextHop. Required when OutboundNextHop is set. Keep
-	// Encryption at NEVER, like the inbound Security, so the upstream leg can be
-	// spliced.
+	// DAEMON) to OutboundNextHop. Required when OutboundNextHop is set.
 	OutboundNextHopSecurity *security.SecurityConfig
 
 	// OutboundTTL bounds the outbound-proxy hop count. It is the fallback applied
@@ -164,7 +162,7 @@ type UpstreamConfig struct {
 	// BrokerAddr is the upstream CCB's address ("host:port"). Required.
 	BrokerAddr string
 	// Security authenticates the registration (as a CCB client) to the upstream.
-	// Required. Keep Encryption at NEVER so forwarded sockets can be spliced.
+	// Required.
 	Security *security.SecurityConfig
 	// HeartbeatInterval is the upstream registration heartbeat (default 1200s).
 	HeartbeatInterval time.Duration

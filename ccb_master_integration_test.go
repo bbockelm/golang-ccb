@@ -17,13 +17,27 @@ import (
 
 // TestGoCCBUnderCondorMaster runs the Go CCB as the pool's CCB daemon under a
 // real condor_master, with the collector's built-in CCB disabled, a
-// non-trivial security policy (authentication REQUIRED via FS + IDTOKENS;
-// encryption/integrity optional, since the CCB path is plaintext and the real
-// peers secure themselves end to end), and a CCB-routed execute node. It then submits a real job and
-// waits for it to complete: the submit side is public but the startd is only
-// reachable through the Go CCB, so the shadow->startd connection is brokered by
-// the Go CCB. Job completion proves the Go CCB serves C++ daemons seamlessly.
+// non-trivial security policy (authentication REQUIRED via FS + IDTOKENS), and
+// a CCB-routed execute node. It then submits a real job and waits for it to
+// complete: the submit side is public but the startd is only reachable through
+// the Go CCB, so the shadow->startd connection is brokered by the Go CCB. Job
+// completion proves the Go CCB serves C++ daemons seamlessly.
+//
+// It runs under two policies the startd registers (CCB_REGISTER, at DAEMON)
+// under: integrity required with encryption optional, and encryption required
+// as `use security:recommended` sets it.
 func TestGoCCBUnderCondorMaster(t *testing.T) {
+	for _, tc := range []struct {
+		name, policy string
+	}{
+		{"integrity", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = OPTIONAL"},
+		{"encryption", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = REQUIRED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testGoCCBUnderCondorMaster(t, tc.policy) })
+	}
+}
+
+func testGoCCBUnderCondorMaster(t *testing.T, policy string) {
 	if _, err := exec.LookPath("condor_master"); err != nil {
 		t.Skip("condor_master not found in PATH, skipping integration test")
 	}
@@ -92,8 +106,7 @@ STARTD_DEBUG = D_FULLDEBUG D_NETWORK D_SECURITY D_HOSTNAME
 
 # --- Non-trivial security ---
 SEC_DEFAULT_AUTHENTICATION = REQUIRED
-SEC_DEFAULT_INTEGRITY = REQUIRED
-SEC_DEFAULT_ENCRYPTION = OPTIONAL
+%s
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS, IDTOKENS
 SEC_CLIENT_AUTHENTICATION_METHODS = FS, IDTOKENS
 SEC_PASSWORD_DIRECTORY = %s
@@ -107,7 +120,7 @@ CONTINUE = TRUE
 PREEMPT = FALSE
 KILL = FALSE
 RUNBENCHMARKS = FALSE
-`, collectorPort, ccbBin, ccbAddr, ccbAddr, ccbAddr, passwordDir, filepath.Join(passwordDir, "POOL"))
+`, collectorPort, ccbBin, ccbAddr, ccbAddr, ccbAddr, policy, passwordDir, filepath.Join(passwordDir, "POOL"))
 
 	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
 	defer h.Shutdown()
@@ -268,8 +281,13 @@ func dumpLog(t *testing.T, path string) {
 // excludes the caller; after the configuration admits the caller and the pool
 // is reconfigured (condor_master signals the broker), it runs -- the policy
 // reloaded without a restart.
+//
+// condor_ping -table ALL against the broker reports each level's decision
+// under that policy, and each level negotiated under its own SEC_<level>_*:
+// READ unauthenticated, DAEMON and the ADVERTISE_* levels (which fall back to
+// SEC_DAEMON_*) encrypted.
 func TestGoCCBSharedPortUnderCondorMaster(t *testing.T) {
-	for _, tool := range []string{"condor_master", "condor_reconfig"} {
+	for _, tool := range []string{"condor_master", "condor_reconfig", "condor_ping"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s not found in PATH, skipping integration test", tool)
 		}
@@ -294,6 +312,11 @@ SEC_DEFAULT_CRYPTO_METHODS = AES
 SEC_DEFAULT_AUTHENTICATION_METHODS = FS
 SEC_CLIENT_AUTHENTICATION_METHODS = FS
 ALLOW_ADMINISTRATOR_CCB = nobody@nowhere.invalid
+# Distinct per-level policies for condor_ping to report.
+SEC_READ_AUTHENTICATION = NEVER
+SEC_DAEMON_ENCRYPTION = REQUIRED
+SEC_CLIENT_AUTHENTICATION = OPTIONAL
+SEC_CLIENT_ENCRYPTION = OPTIONAL
 `, ccbBin)
 
 	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
@@ -321,6 +344,37 @@ ALLOW_ADMINISTRATOR_CCB = nobody@nowhere.invalid
 	if data, _ := os.ReadFile(ccbLog); !strings.Contains(string(data), "PERMISSION DENIED") {
 		dumpLog(t, ccbLog)
 		t.Fatal("the Go CCB did not log the refused DC_RECONFIG as PERMISSION DENIED")
+	}
+
+	table := pingTable(t, configFile, addr)
+	for _, lvl := range []string{"ALLOW", "READ", "WRITE", "NEGOTIATOR", "DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER"} {
+		if got := table[lvl].decision; got != "ALLOW" {
+			t.Errorf("condor_ping %s: decision %q, want ALLOW (table %v)", lvl, got, table)
+		}
+	}
+	// ADMINISTRATOR_CCB admits nobody; OWNER is checked at ADMINISTRATOR; no
+	// ALLOW_CONFIG is set.
+	for _, lvl := range []string{"ADMINISTRATOR", "OWNER", "CONFIG"} {
+		if got := table[lvl].decision; got != "FAIL" {
+			t.Errorf("condor_ping %s: decision %q, want FAIL (table %v)", lvl, got, table)
+		}
+	}
+	if got := table["READ"].auth; got != "none" {
+		t.Errorf("condor_ping READ authenticated with %q, want none (SEC_READ_AUTHENTICATION = NEVER)", got)
+	}
+	for _, lvl := range []string{"DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER"} {
+		if got := table[lvl].encryption; got == "none" || got == "" {
+			t.Errorf("condor_ping %s: encryption %q, want encrypted (SEC_DAEMON_ENCRYPTION = REQUIRED)", lvl, got)
+		}
+	}
+	// A refused level is the broker's answer, not a command it lacks; a
+	// permitted one reports the broker's own version.
+	verbose := pingOut(t, configFile, "-addr", addr, "-verbose", "ADMINISTRATOR", "CONFIG", "READ")
+	if strings.Count(verbose, `"DENIED"`) != 2 || strings.Contains(verbose, "CMD_NOT_FOUND") {
+		t.Errorf("condor_ping ADMINISTRATOR and CONFIG were not both refused as DENIED:\n%s", verbose)
+	}
+	if !strings.Contains(verbose, "BuildID: golang-ccb") {
+		t.Errorf("condor_ping READ did not report the Go CCB's version:\n%s", verbose)
 	}
 
 	// Admit the caller, and reconfigure the pool: condor_master signals the
@@ -353,6 +407,43 @@ ALLOW_ADMINISTRATOR_CCB = nobody@nowhere.invalid
 		dumpLog(t, ccbLog)
 		t.Fatal("the Go CCB did not log running DC_RECONFIG")
 	}
+	if got := pingTable(t, configFile, addr)["ADMINISTRATOR"].decision; got != "ALLOW" {
+		t.Errorf("condor_ping ADMINISTRATOR after admitting the caller: decision %q, want ALLOW", got)
+	}
+}
+
+// pingRow is one level's row of condor_ping -table.
+type pingRow struct {
+	auth, encryption, decision string
+}
+
+// pingTable runs condor_ping -table ALL against addr and returns its rows by
+// level.
+func pingTable(t *testing.T, configFile, addr string) map[string]pingRow {
+	t.Helper()
+	out := pingOut(t, configFile, "-addr", addr, "-table", "ALL")
+	rows := map[string]pingRow{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[0] == "Instruction" {
+			continue
+		}
+		rows[f[0]] = pingRow{auth: f[1], encryption: f[2], decision: f[4]}
+	}
+	if len(rows) == 0 {
+		t.Fatalf("condor_ping printed no table:\n%s", out)
+	}
+	return rows
+}
+
+// pingOut runs condor_ping with args and returns its output. condor_ping exits
+// non-zero when any level fails, so its exit status is not checked.
+func pingOut(t *testing.T, configFile string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("condor_ping", args...)
+	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+configFile)
+	out, _ := cmd.CombinedOutput()
+	return string(out)
 }
 
 // waitForCCBContact waits for the Go CCB to log the shared-port address it
