@@ -19,6 +19,7 @@ import (
 
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
+	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -173,23 +174,16 @@ func run() error {
 	// (SSL server cert/key, token signing keys, trust domain) needed to *verify*
 	// presented authentications; d.ServerSecurityConfig adds this daemon's
 	// shared-port id, which an HTCondor 25.14+ FS client's channel binding names.
-	// CCB control messages are authenticated but run in the clear -- NEITHER
-	// encrypted NOR integrity-protected: the broker splices raw bytes, so the
-	// session carries no session key, and the two real peers run their own
-	// end-to-end CEDAR security over the relay.
-	//
-	// cedar's session crypto is AES-GCM, which couples integrity to encryption
-	// (there is no MAC-only mode), so a plaintext CCB session cannot provide
-	// integrity. Both Encryption and Integrity must therefore be relaxed from the
-	// DAEMON-level default (which requires integrity): leaving Integrity=REQUIRED
-	// while running plaintext makes the per-command security check
-	// (cedar >= v0.5.4) reject every command as not meeting its security level.
+	// This is the policy of a command registered at no level; newBroker has
+	// every other command negotiate under its own level's SEC_<level>_*, as the
+	// collector's CCB does (CCB_REGISTER at DAEMON, CCB_REQUEST at READ). A
+	// relayed connection is spliced as raw sockets after the broker's reply, so
+	// the broker session's crypto never touches the relayed bytes; the two real
+	// peers run their own end-to-end CEDAR security over the relay.
 	sec, err := d.ServerSecurityConfig(ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building security config: %w", err)
 	}
-	sec.Encryption = security.SecurityNever
-	sec.Integrity = security.SecurityNever
 	sec.RemoteVersion = streamingVersionString
 
 	// Reload the server's credentials (signing keys, SSL key/cert) on SIGHUP, the
@@ -230,8 +224,8 @@ func run() error {
 	// Inside-CCB roles: when CCB_OUTBOUND_NEXT_HOP is set this broker forwards
 	// outbound proxy requests to that next hop AND registers upstream with it for
 	// inbound tunneling (§5). Both make this broker a CCB *client* of the next hop,
-	// so build a client-side security config (this daemon's own credentials),
-	// unencrypted like the inbound side so relayed bytes can be spliced.
+	// so build a client-side security config (this daemon's own credentials)
+	// under SEC_CLIENT_*, as an HTCondor daemon's CCB client does.
 	var outboundNextHop string
 	var nextHopSec *security.SecurityConfig
 	var upstream *ccbserver.UpstreamConfig
@@ -241,8 +235,6 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("building next-hop client security config: %w", err)
 		}
-		nextHopSec.Encryption = security.SecurityNever
-		nextHopSec.Integrity = security.SecurityNever // plaintext splice: no session key, so no integrity (see the inbound sec above)
 		nextHopSec.RemoteVersion = streamingVersionString
 		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
 		upstream = &ccbserver.UpstreamConfig{
@@ -301,6 +293,12 @@ func run() error {
 // policy is rebuilt on every reconfig and has the holes C++ DaemonCore punches
 // (condor_master's family session among them); the server consults it for
 // every command, so a reload applies to the next one.
+//
+// Each command negotiates under the security policy of the first level it is
+// registered at (d.InstallSecurityLevels), as DaemonCore does: CCB_REGISTER
+// under SEC_DAEMON_*, CCB_REQUEST under SEC_READ_*, DC_RECONFIG under
+// SEC_ADMINISTRATOR_*. Every level's policy advertises cfg.Security's
+// RemoteVersion, which requesters gate streaming and outbound mode on.
 func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daemon.Authz, error) {
 	az, err := d.NewAuthz(daemon.AuthzOptions{})
 	if err != nil {
@@ -311,8 +309,32 @@ func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daem
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating CCB server: %w", err)
 	}
-	d.RegisterDefaultCommands(srv.CommandServer())
+	cs := srv.CommandServer()
+	d.RegisterDefaultCommands(cs)
+	if err := d.InstallSecurityLevels(cs); err != nil {
+		return nil, nil, fmt.Errorf("building per-level security policy: %w", err)
+	}
+	advertiseVersion(cs, cfg.Security.RemoteVersion)
 	return srv, az, nil
+}
+
+// advertiseVersion makes every per-command policy cs selects advertise version
+// as its RemoteVersion. The per-level policies are built from the
+// configuration, which does not carry this broker's version.
+func advertiseVersion(cs *cedarserver.Server, version string) {
+	forCommand := cs.SecurityConfigForCommand
+	if forCommand == nil || version == "" {
+		return
+	}
+	cs.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
+		sc := forCommand(command)
+		if sc == nil {
+			return nil
+		}
+		c := *sc
+		c.RemoteVersion = version
+		return &c
+	}
 }
 
 // serveBroker starts srv's background work and serves its command socket on

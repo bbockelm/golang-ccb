@@ -7,10 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bbockelm/cedar/ccb"
+	"github.com/bbockelm/cedar/commands"
+	"github.com/bbockelm/cedar/security"
+	cedarserver "github.com/bbockelm/cedar/server"
 )
 
 func freePort(t *testing.T) int {
@@ -98,10 +102,7 @@ func TestBinaryTunnelChain(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-level CCB chain test skipped under -short")
 	}
-	bin := filepath.Join(t.TempDir(), "golang-ccb")
-	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "./cmd/golang-ccb").CombinedOutput(); err != nil {
-		t.Fatalf("building golang-ccb: %v\n%s", err, out)
-	}
+	bin := buildCCBBinary(t)
 	targetIP := nonLoopbackIPv4(t)
 
 	for _, n := range []int{1, 2, 3} {
@@ -131,4 +132,131 @@ func TestBinaryTunnelChain(t *testing.T) {
 			t.Logf("%d launched-CCB chain: %d MiB each way in %v", n, size>>20, time.Since(start).Round(time.Millisecond))
 		})
 	}
+}
+
+// buildCCBBinary compiles the golang-ccb command into a temporary directory.
+func buildCCBBinary(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "golang-ccb")
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "./cmd/golang-ccb").CombinedOutput(); err != nil {
+		t.Fatalf("building golang-ccb: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// encryptedPolicy requires encryption and integrity of every session, as
+// `use security:recommended` does.
+const encryptedPolicy = `SEC_DEFAULT_ENCRYPTION = REQUIRED
+SEC_DEFAULT_INTEGRITY = REQUIRED
+`
+
+// encryptedSec is a client policy requiring an encrypted (AES-GCM, so also
+// integrity-protected) session, without authenticating.
+func encryptedSec() *security.SecurityConfig {
+	s := plaintextSec()
+	s.CryptoMethods = []security.CryptoMethod{security.CryptoAES}
+	s.Encryption = security.SecurityRequired
+	s.Integrity = security.SecurityRequired
+	return s
+}
+
+// TestBinaryTunnelsEncrypted runs launched brokers under a policy requiring
+// encryption, so every broker session -- a requester's, a registrant's, and an
+// inside CCB's own sessions with its next hop -- is encrypted, while the
+// relayed bytes are spliced raw: an outbound 2-CCB chain relays bulk data, and
+// a client reaches an EP behind a 2-CCB inbound tunnel by its nested contact.
+func TestBinaryTunnelsEncrypted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level CCB test skipped under -short")
+	}
+	bin := buildCCBBinary(t)
+
+	t.Run("outbound", func(t *testing.T) {
+		targetIP := nonLoopbackIPv4(t)
+		size := int64(1 << 20)
+		tgtAddr, stopTgt := startBulkTarget(t, targetIP, size)
+		defer stopTgt()
+		exit := launchCCBBinary(t, bin, encryptedPolicy+"CCB_OUTBOUND_TARGET_ALLOWLIST = "+targetIP+"/32")
+		entry := launchCCBBinary(t, bin, encryptedPolicy+"CCB_OUTBOUND_NEXT_HOP = "+exit)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		conn, err := ccb.OutboundConnect(ctx, entry, "<"+tgtAddr+">", ccb.OutboundOptions{
+			Security: encryptedSec(),
+			Name:     "bin-encrypted",
+			Timeout:  15 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("OutboundConnect through 2 encrypted CCBs: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+		if err := blast(conn, size); err != nil {
+			t.Fatalf("bulk relay through 2 encrypted CCBs: %v", err)
+		}
+	})
+
+	t.Run("inbound", func(t *testing.T) {
+		outside := launchCCBBinary(t, bin, encryptedPolicy)
+		readyFile := filepath.Join(t.TempDir(), "ccb_tunnel_ready")
+		inside := launchCCBBinary(t, bin, encryptedPolicy+"CCB_OUTBOUND_NEXT_HOP = "+outside+"\nCCB_TUNNEL_READY_FILE = "+readyFile)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if data, err := os.ReadFile(readyFile); err == nil && strings.TrimSpace(string(data)) != "" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("inside CCB never registered with the outside CCB")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		served := make(chan struct{}, 1)
+		ep := cedarserver.New(plaintextSec())
+		ep.Handle(commands.DC_NOP, func(_ context.Context, _ *cedarserver.Conn) error {
+			select {
+			case served <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		lis := ccb.NewListener(ccb.ListenerConfig{
+			BrokerAddr:        inside,
+			Security:          encryptedSec(),
+			Name:              "encrypted-ep",
+			HeartbeatInterval: 30 * time.Second,
+			Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = ep.ServeConn(context.Background(), conn) },
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		go func() { _ = lis.Run(ctx) }()
+		var contact string
+		for contact == "" {
+			if ctx.Err() != nil {
+				t.Fatal("EP did not register with the inside CCB")
+			}
+			contact = lis.Contact()
+			time.Sleep(10 * time.Millisecond)
+		}
+		if strings.Count(contact, "#") < 2 {
+			t.Fatalf("EP contact %q is not nested", contact)
+		}
+
+		conn, err := ccb.Dial(ctx, contactsFor(t, contact), ccb.DialOptions{
+			Security:   encryptedSec(),
+			TargetDesc: "encrypted-ep",
+			Timeout:    15 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Dial nested contact %q through encrypted CCBs: %v", contact, err)
+		}
+		defer func() { _ = conn.Close() }()
+		if err := endToEndDCNop(ctx, conn, contact); err != nil {
+			t.Fatalf("end-to-end DC_NOP through the encrypted tunnel: %v", err)
+		}
+		select {
+		case <-served:
+		case <-ctx.Done():
+			t.Fatal("EP DC_NOP did not dispatch through the encrypted tunnel")
+		}
+	})
 }
