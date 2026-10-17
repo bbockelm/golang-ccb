@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -135,8 +136,8 @@ type Config struct {
 
 	// CarrierTokenVerify validates an inside CCB's bearer token for a WebSocket
 	// CarrierListen and returns an identity for logging. Required for ws/wss.
-	// Wire HTCondor token verification here (e.g. SciToken via
-	// cedar security.VerifySciToken, or a pool IDTOKEN check).
+	// BearerTokenVerifier, IDTokenVerifier and SciTokenVerifier build one from
+	// a SecurityConfig.
 	CarrierTokenVerify func(ctx context.Context, token string) (identity string, err error)
 
 	// CarrierClientTLS is the client TLS config used when THIS (inside) CCB dials
@@ -151,6 +152,15 @@ type Config struct {
 	// carrier and CarrierToken is empty (e.g. HTCondor token discovery, re-read
 	// per dial so a rotated credential is picked up).
 	CarrierTokenSource func(ctx context.Context) (token string, err error)
+
+	// DialControl, if set, is installed as net.Dialer.Control on the TCP dials
+	// this broker makes to addresses a remote party chose: the reverse connects
+	// an inside CCB makes for requests forwarded through its Upstream
+	// registration (the requester names the address), and an exit CCB's
+	// outbound proxy dials. It sees the resolved "ip:port"; returning an error
+	// fails that dial. RefuseLocalAddresses is a ready-made policy. The
+	// outbound proxy refuses local addresses whether or not this is set.
+	DialControl func(network, address string, c syscall.RawConn) error
 
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger

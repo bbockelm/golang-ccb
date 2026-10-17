@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bbockelm/cedar/ccb"
@@ -250,12 +251,23 @@ func run() error {
 	// this (outside) CCB accept inside CCBs over a filesystem ("fs:<dir>") or
 	// WebSocket ("ws://" / "wss://") carrier; a ws/wss Upstream/next-hop makes
 	// this (inside) CCB dial one.
-	cc, err := buildCarrierSettings(d.Config(), sec, outboundNextHop, upstream)
+	cc, err := buildCarrierSettings(d.Config(), sec, outboundNextHop, upstream, d.Slog())
 	if err != nil {
 		return err
 	}
+	if cc.sciTokens != nil {
+		d.OnReconfig(cc.sciTokens.load)
+	}
 	if isWSCarrier(cc.listen) {
 		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
+	}
+
+	// CCB_DIAL_REFUSE_LOCAL_ADDRESSES refuses loopback and link-local
+	// destinations in the reverse connects a requester's address directs (the
+	// outbound proxy refuses them regardless).
+	var dialControl func(network, address string, c syscall.RawConn) error
+	if configBool(d.Config(), "CCB_DIAL_REFUSE_LOCAL_ADDRESSES", false) {
+		dialControl = ccbserver.RefuseLocalAddresses
 	}
 
 	srv, az, err := newBroker(d, ccbserver.Config{
@@ -274,6 +286,7 @@ func run() error {
 		CarrierClientTLS:        cc.clientTLS,
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
+		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
 	if err != nil {
@@ -383,19 +396,26 @@ type carrierSettings struct {
 	clientTLS   *tls.Config
 	token       string
 	tokenSource func(context.Context) (string, error)
+	// sciTokens is the SciToken map file behind verify, reloaded on reconfig;
+	// nil when there is no ws/wss listener.
+	sciTokens *sciTokenMap
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
 // (CCB_CARRIER_LISTEN + TLS + token verification for a ws/wss listener) and the
 // client side (bearer token + CA for dialing a ws/wss upstream or next hop).
-func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig) (carrierSettings, error) {
+func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig, log *slog.Logger) (carrierSettings, error) {
 	var cc carrierSettings
 	cc.listen, _ = cfg.Get("CCB_CARRIER_LISTEN")
 
 	if isWSCarrier(cc.listen) {
 		// Verify inside CCBs' bearer tokens: an HTCondor IDTOKEN (against our pool
-		// signing key) or a SciToken (against its issuer's JWKS).
-		cc.verify = ccbserver.BearerTokenVerifier(sec)
+		// signing key) or a SciToken mapped by CERTIFICATE_MAPFILE's SCITOKENS
+		// lines. The SciToken settings go on a copy so the CEDAR command policy
+		// in sec is unchanged.
+		csec := *sec
+		cc.sciTokens = applySciTokensConfig(cfg, &csec, log)
+		cc.verify = ccbserver.BearerTokenVerifier(&csec)
 		if strings.HasPrefix(cc.listen, "wss://") {
 			certFile, _ := cfg.Get("CCB_CARRIER_TLS_CERT")
 			keyFile, _ := cfg.Get("CCB_CARRIER_TLS_KEY")

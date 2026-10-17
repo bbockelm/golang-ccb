@@ -19,6 +19,23 @@ Point HTCondor daemons at it with `CCB_ADDRESS = <public-host>:9618` (and a
 shared `SEC_*` configuration). They will register and become reachable through
 their advertised ccb contact (`<public-host>:9618#<id>`).
 
+### WebSocket carrier authentication
+
+With `CCB_CARRIER_LISTEN` set to a `ws://` or `wss://` URL, inside CCBs present
+a bearer token: an IDTOKEN signed by the pool key, or a SciToken. A SciToken is
+accepted only when the `SCITOKENS` lines of `CERTIFICATE_MAPFILE` map its
+`issuer,subject` (as for HTCondor's SCITOKENS authentication), its audience
+satisfies `SCITOKENS_SERVER_AUDIENCE`, and it is current and signed by a key its
+https issuer publishes. Without a map file, SciTokens are refused. See
+[docs/TRANSPORTS.md](docs/TRANSPORTS.md).
+
+### Dial policy
+
+The outbound proxy refuses loopback, link-local and unspecified targets, checked
+on the resolved address. `CCB_DIAL_REFUSE_LOCAL_ADDRESSES = true` (default
+false) applies the same refusal to the reverse connects an inside CCB makes to
+requester-supplied addresses (`Config.DialControl` in the library).
+
 ## Protocol
 
 Commands (`condor_commands.h`): `CCB_REGISTER=67`, `CCB_REQUEST=68`,
