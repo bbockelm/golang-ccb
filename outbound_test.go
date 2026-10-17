@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -271,6 +272,69 @@ func TestOutboundProxyRefusesLoopback(t *testing.T) {
 	case <-served:
 		t.Fatal("loopback target was dialed")
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestOutboundProxyRefusesNameResolvingToLoopback: a target named by a hostname
+// passes the literal-address check, so the refusal must come from the resolved
+// address. "localhost." resolves to loopback but is not the literal
+// "localhost".
+func TestOutboundProxyRefusesNameResolvingToLoopback(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var accepts atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			_ = c.Close()
+		}
+	}()
+	if addrs, err := net.LookupHost("localhost."); err != nil || len(addrs) == 0 {
+		t.Skipf("localhost. does not resolve: %v", err)
+	}
+
+	srv, err := New(Config{
+		PublicAddress:  "127.0.0.1:1",
+		Security:       plaintextSec(),
+		RequestTimeout: 2 * time.Second,
+		OutboundProxy:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	conn, err := srv.outbound.connect(context.Background(), "<localhost.:"+port+">", 1)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("target resolving to loopback was dialed")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := accepts.Load(); n != 0 {
+		t.Errorf("loopback listener accepted %d connections", n)
+	}
+}
+
+// TestRefuseLocalAddresses checks the dial policy on resolved addresses.
+func TestRefuseLocalAddresses(t *testing.T) {
+	for addr, refuse := range map[string]bool{
+		"127.0.0.1:9618":     true,
+		"[::1]:9618":         true,
+		"169.254.169.254:80": true,
+		"[fe80::1]:80":       true,
+		"0.0.0.0:9618":       true,
+		"192.0.2.10:9618":    false,
+		"[2001:db8::1]:9618": false,
+	} {
+		if err := RefuseLocalAddresses("tcp", addr, nil); (err != nil) != refuse {
+			t.Errorf("RefuseLocalAddresses(%s) = %v, want refused=%v", addr, err, refuse)
+		}
 	}
 }
 

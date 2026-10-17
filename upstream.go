@@ -60,6 +60,7 @@ func (s *Server) startUpstream(ctx context.Context) {
 		Name:              "ccb-inside " + s.cfg.PublicAddress,
 		HeartbeatInterval: up.HeartbeatInterval,
 		Dial:              upDial,
+		DialControl:       s.cfg.DialControl,
 		Handler: func(conn net.Conn, meta ccb.InboundMeta) {
 			// A forwarded inbound rendezvous arrived over our upstream registration.
 			// If it carries a route, the outer broker is asking us -- as a trusted
