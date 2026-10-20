@@ -3,8 +3,8 @@ module github.com/bbockelm/golang-ccb
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.29.14
-	github.com/bbockelm/cedar v0.7.10
+	github.com/PelicanPlatform/classad v0.31.5
+	github.com/bbockelm/cedar v0.7.11
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/yamux v0.1.2
 )
