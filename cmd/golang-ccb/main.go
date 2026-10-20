@@ -19,7 +19,6 @@ import (
 
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
-	cedarserver "github.com/bbockelm/cedar/server"
 	htcondor "github.com/bbockelm/golang-htcondor"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -298,7 +297,8 @@ func run() error {
 // registered at (d.InstallSecurityLevels), as DaemonCore does: CCB_REGISTER
 // under SEC_DAEMON_*, CCB_REQUEST under SEC_READ_*, DC_RECONFIG under
 // SEC_ADMINISTRATOR_*. Every level's policy advertises cfg.Security's
-// RemoteVersion, which requesters gate streaming and outbound mode on.
+// RemoteVersion (InstallSecurityLevels copies the base policy's), which
+// requesters gate streaming and outbound mode on.
 func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daemon.Authz, error) {
 	az, err := d.NewAuthz(daemon.AuthzOptions{})
 	if err != nil {
@@ -314,27 +314,7 @@ func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daem
 	if err := d.InstallSecurityLevels(cs); err != nil {
 		return nil, nil, fmt.Errorf("building per-level security policy: %w", err)
 	}
-	advertiseVersion(cs, cfg.Security.RemoteVersion)
 	return srv, az, nil
-}
-
-// advertiseVersion makes every per-command policy cs selects advertise version
-// as its RemoteVersion. The per-level policies are built from the
-// configuration, which does not carry this broker's version.
-func advertiseVersion(cs *cedarserver.Server, version string) {
-	forCommand := cs.SecurityConfigForCommand
-	if forCommand == nil || version == "" {
-		return
-	}
-	cs.SecurityConfigForCommand = func(command int) *security.SecurityConfig {
-		sc := forCommand(command)
-		if sc == nil {
-			return nil
-		}
-		c := *sc
-		c.RemoteVersion = version
-		return &c
-	}
 }
 
 // serveBroker starts srv's background work and serves its command socket on
