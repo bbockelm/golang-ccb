@@ -10,5 +10,12 @@ RUN apt-get update \
 COPY test/e2e-squid/squid.conf /etc/squid/squid.conf
 
 EXPOSE 3128
-# -N foreground, -d1 log to stderr as well, so `docker compose logs squid` is useful.
-CMD ["squid", "-N", "-d1", "-f", "/etc/squid/squid.conf"]
+
+# squid drops to the `proxy` user and would create its access log 0640, which the
+# harness -- running as a different non-root account in another container --
+# could not read. The log is this tier's independent witness, so prepare it
+# readable before squid starts. -N foreground, -d1 also to stderr so
+# `docker compose logs squid` is useful.
+COPY test/e2e-squid/squid-entrypoint.sh /usr/local/bin/squid-entrypoint.sh
+RUN chmod +x /usr/local/bin/squid-entrypoint.sh
+CMD ["/usr/local/bin/squid-entrypoint.sh"]
