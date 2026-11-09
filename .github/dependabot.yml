@@ -35,3 +35,12 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci(deps)"
+
+  # The CI tool pins (nfpm, built by the release workflow). Its own module, so
+  # it needs its own entry; it shares nothing with the repository's go.mod.
+  - package-ecosystem: "gomod"
+    directory: "/.github/tools"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"
