@@ -20,12 +20,21 @@ import (
 )
 
 // DefaultKeepalive is how often an idle carrier sends a yamux ping when no
-// interval is configured. It is yamux's own default, and it is chosen here for
-// a different reason than liveness: the ping is the only traffic a quiet
-// carrier produces, so it is also what stops a site proxy from reclaiming the
-// tunnel as idle. It must therefore be comfortably shorter than the shortest
-// idle timeout on the path.
-const DefaultKeepalive = 30 * time.Second
+// interval is configured. The ping is the only traffic a quiet carrier
+// produces, so on this transport it is not a liveness feature -- it is what
+// stops something on the path reclaiming the tunnel as idle.
+//
+// 20s rather than yamux's 30s default, for margin. squid itself is rarely the
+// binding constraint (read_timeout defaults to 15 minutes and restarts on every
+// read); what closes an idle tunnel is usually a NAT table or a load balancer in
+// between, commonly at 60s. 20s leaves two pings inside a 60s window, so one
+// delayed ping does not lose the tunnel, and the cost is a few bytes a minute.
+//
+// This does NOT make an aggressive 30s idle timeout safe: at 20s a single
+// delayed ping already exhausts it. Size the interval at no more than a third
+// of the shortest idle timeout on the path and set CCB_CARRIER_KEEPALIVE
+// explicitly when something on it is tighter than about a minute.
+const DefaultKeepalive = 20 * time.Second
 
 // yamuxConfig returns a yamux config with logging silenced and the keepalive
 // interval set. keepalive <= 0 uses DefaultKeepalive.
