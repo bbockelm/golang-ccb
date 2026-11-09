@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -272,9 +273,14 @@ func insideBroker(t *testing.T) (addr string, logDir string) {
 // connections reach an offsite target. Both directions, through real squid, over
 // one connection.
 func TestTunneledEPThroughSquid(t *testing.T) {
-	before := countTunnels(t)
-
 	brokerAddr, _ := insideBroker(t)
+
+	// Baseline AFTER the carrier is up. Two things make an absolute count the
+	// wrong measure: the startup health check deliberately opens its own
+	// short-lived connection to probe the upgrade, and squid logs a tunnel only
+	// when it CLOSES, so the live one is not in the log yet. What matters is
+	// that nothing opens another once the node is working.
+	established := countTunnels(t)
 
 	// Inbound side: an EP registering with the local broker must be given a
 	// nested contact naming the outside broker.
@@ -300,11 +306,55 @@ func TestTunneledEPThroughSquid(t *testing.T) {
 	}
 
 	// The node's entire footprint, inbound and outbound, is one proxied
-	// connection: that is what a site throttling socket counts is buying.
-	added := countTunnels(t) - before
-	if added != 1 {
-		t.Errorf("squid opened %d tunnels for the whole session, want exactly 1", added)
+	// connection: that is what a site throttling socket counts is buying. Measure
+	// it where a site would -- the live sockets leaving the node -- which is also
+	// what the administrator's guide tells them to check with ss(1).
+	if live := establishedToProxy(t); live != 1 {
+		t.Errorf("the node holds %d connections to the proxy while working, want exactly 1", live)
 	}
+
+	// And nothing re-dialled: no further tunnel completed while the node worked.
+	if opened := countTunnels(t) - established; opened != 0 {
+		t.Errorf("squid completed %d more tunnels while the node was working; "+
+			"the carrier should have carried everything over the one it had", opened)
+	}
+}
+
+// establishedToProxy counts this container's ESTABLISHED TCP connections to the
+// proxy. /proc/net/tcp is per network namespace, so it covers every process on
+// the "node", which is the footprint a site actually cares about -- and the
+// measurement an administrator makes with `ss -tn state established`.
+func establishedToProxy(t *testing.T) int {
+	t.Helper()
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(proxyURL(), "http://"))
+	if err != nil {
+		t.Fatalf("parsing %q: %v", proxyURL(), err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("proxy port %q: %v", portStr, err)
+	}
+	// /proc/net/tcp renders the remote endpoint as HEXADDR:HEXPORT, and state 01
+	// is ESTABLISHED.
+	wantPort := fmt.Sprintf("%04X", port)
+
+	total := 0
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // tcp6 may be absent
+		}
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) < 4 || f[3] != "01" {
+				continue
+			}
+			if i := strings.LastIndex(f[2], ":"); i >= 0 && f[2][i+1:] == wantPort {
+				total++
+			}
+		}
+	}
+	return total
 }
 
 // registerEP registers a CEDAR listener with the local broker and returns the
