@@ -109,10 +109,31 @@ not a requirement.
   holds the socket open, and `carrier.MuxDialer` runs a yamux client over it;
   `Open()` per `dialBroker`. Selected by a `ws://`/`wss://` scheme on
   `Upstream.BrokerAddr` / `OutboundNextHop`.
-- **Auth**: bearer token in the `Authorization` header of the upgrade request.
-  The transport is credential-agnostic — a `TokenVerifier` (server) and token
-  string / `TokenSource` (client) are supplied by the CCB layer. `ccbserver`
-  ships:
+- **Auth**: selected by `CCB_CARRIER_AUTH` (`token`, the default, or `none`).
+  See [CARRIER_AUTH.md](CARRIER_AUTH.md) for the threat model and the evidence
+  behind the two modes.
+
+  With `none` the upgrade carries no credential in either direction, and the
+  peer's identity comes from the CEDAR handshake on its first command — which
+  never puts a credential on the wire, because CEDAR's TOKEN method transmits
+  only `header.payload` and keeps the JWT signature as the AKEP2 shared secret.
+  That is the identity every authorization decision already used: the identity
+  the upgrade verified was computed and discarded. The mode exists because a
+  TLS-intercepting proxy reads the `Authorization` header in plaintext, and an
+  IDTOKEN there is a reusable pool credential in the proxy's hands.
+
+  Two consequences of removing the upgrade check, both covered by §6 and §8.4
+  of CARRIER_AUTH.md: the endpoint is open, so the accept path carries explicit
+  limits (`CCB_CARRIER_MAX_SESSIONS`, `CCB_CARRIER_MAX_PER_SOURCE`,
+  `CCB_CARRIER_PIPE_PROBATION`, plus HTTP read timeouts that apply in both
+  modes); and a credential that is wrong now fails at `CCB_REGISTER` rather
+  than at the dial, so the symptom of a misconfiguration moves from a 401 to a
+  carrier that comes up but never registers.
+
+  With `token` (the default — existing deployments are unaffected) a bearer
+  token rides the `Authorization` header of the upgrade request. The transport
+  is credential-agnostic — a `TokenVerifier` (server) and token string /
+  `TokenSource` (client) are supplied by the CCB layer. `ccbserver` ships:
   - `DiscoverBearerToken` (client): WLCG discovery — `BEARER_TOKEN`,
     `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>` — then an
     HTCondor IDTOKEN from the token directory.
@@ -135,13 +156,22 @@ not a requirement.
   accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
   ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
-  (authenticated peer; yamux bounds its own windows).
+  when a token is required (authenticated peer; yamux bounds its own windows) and
+  bounded at 1 MiB when it is not — yamux's default stream window is 256 KiB, so
+  that is ample headroom while still bounding per-connection buffers.
 - **TLS**: `wss://` requires a server `CarrierTLS` and (client) `CarrierClientTLS`
   for CA roots; `ws://` is plaintext, for test/dev only.
 
 Config knobs on the CCB `Config`: `CarrierListen` (`wss://…`), `CarrierTLS`,
-`CarrierTokenVerify` (server); `CarrierClientTLS`, `CarrierToken` /
-`CarrierTokenSource` (client).
+`CarrierTokenVerify`, `CarrierUnauthenticated`, `CarrierMaxSessions`,
+`CarrierMaxPerSource`, `CarrierPipeProbation` (server); `CarrierClientTLS`,
+`CarrierToken` / `CarrierTokenSource`, `CarrierUnauthenticated` (client).
+
+A WebSocket peer has no network address of its own — `websocket.NetConn`
+reports a placeholder — so host and netblock terms in `ALLOW_DAEMON` match no
+carrier peer and fail closed. Carrier registrants must be admitted by an
+identity term, and `peerIP` is nil for them, so reconnect IP pinning does not
+apply. This is true of both auth modes.
 
 ---
 

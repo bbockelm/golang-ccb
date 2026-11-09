@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
@@ -26,14 +27,31 @@ func yamuxConfig() *yamux.Config {
 	return c
 }
 
+// DefaultFirstStreamTimeout bounds how long a newly accepted pipe may sit
+// without opening a logical connection. A real inside broker registers the
+// moment its pipe is up -- the pipe is established lazily, on the first dial --
+// so this is invisible to legitimate traffic while bounding what an anonymous
+// peer can park on the broker.
+const DefaultFirstStreamTimeout = 60 * time.Second
+
+// MuxOption adjusts a MuxListener.
+type MuxOption func(*MuxListener)
+
+// WithFirstStreamTimeout closes a pipe that opens no stream within d. Zero or
+// negative disables the check; unset means DefaultFirstStreamTimeout.
+func WithFirstStreamTimeout(d time.Duration) MuxOption {
+	return func(l *MuxListener) { l.firstStream = d }
+}
+
 // MuxListener accepts pipes from an inner carrier listener, runs a yamux server
 // over each, and presents every accepted stream (from any pipe) as a net.Conn.
 // It implements net.Listener.
 type MuxListener struct {
-	inner   net.Listener
-	streams chan net.Conn
-	ctx     context.Context
-	cancel  context.CancelFunc
+	inner       net.Listener
+	streams     chan net.Conn
+	ctx         context.Context
+	cancel      context.CancelFunc
+	firstStream time.Duration
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -41,13 +59,17 @@ type MuxListener struct {
 
 // NewMuxListener starts serving yamux sessions over inner. It takes ownership of
 // inner and closes it on Close.
-func NewMuxListener(inner net.Listener) *MuxListener {
+func NewMuxListener(inner net.Listener, opts ...MuxOption) *MuxListener {
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &MuxListener{
-		inner:   inner,
-		streams: make(chan net.Conn),
-		ctx:     ctx,
-		cancel:  cancel,
+		inner:       inner,
+		streams:     make(chan net.Conn),
+		ctx:         ctx,
+		cancel:      cancel,
+		firstStream: DefaultFirstStreamTimeout,
+	}
+	for _, o := range opts {
+		o(l)
 	}
 	l.wg.Add(1)
 	go l.acceptPipes()
@@ -74,10 +96,21 @@ func (l *MuxListener) acceptPipes() {
 func (l *MuxListener) acceptStreams(sess *yamux.Session) {
 	defer l.wg.Done()
 	defer sess.Close()
+	// Probation: a pipe that never opens a stream is dropped. Stopping the
+	// timer on the first stream leaves an established carrier untouched.
+	var probation *time.Timer
+	if l.firstStream > 0 {
+		probation = time.AfterFunc(l.firstStream, func() { _ = sess.Close() })
+		defer probation.Stop()
+	}
 	for {
 		st, err := sess.AcceptStream()
 		if err != nil {
 			return // session died
+		}
+		if probation != nil {
+			probation.Stop()
+			probation = nil
 		}
 		select {
 		case l.streams <- st:
