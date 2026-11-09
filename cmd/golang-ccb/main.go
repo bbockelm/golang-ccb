@@ -260,6 +260,12 @@ func run() error {
 	if isWSCarrier(cc.listen) {
 		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
 	}
+	if cc.proxySource != "" {
+		// Say where the proxy setting came from, not just what it is: an operator
+		// reading the log otherwise cannot tell a configured override from the
+		// site environment leaking in, and those are fixed in different files.
+		log.Info(logging.DestinationGeneral, "CCB carrier proxy configuration", "source", cc.proxySource)
+	}
 
 	srv, az, err := newBroker(d, ccbserver.Config{
 		PublicAddress:           pub,
@@ -420,6 +426,7 @@ type carrierSettings struct {
 	token       string
 	tokenSource func(context.Context) (string, error)
 	proxy       func(*http.Request) (*url.URL, error)
+	proxySource string
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -461,11 +468,12 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 			}
 			cc.clientTLS = tlsc
 		}
-		proxyFn, err := buildCarrierProxy(cfg)
+		proxyFn, proxySource, err := buildCarrierProxy(cfg)
 		if err != nil {
 			return cc, err
 		}
 		cc.proxy = proxyFn
+		cc.proxySource = proxySource
 	}
 	return cc, nil
 }
@@ -484,7 +492,7 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 // proxy that requires authentication. It is a file rather than a config value
 // because the configuration is world-readable, and it is re-read per dial so a
 // rotated credential is picked up without a restart.
-func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error), error) {
+func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error), string, error) {
 	raw := ""
 	if v, ok := cfg.Get("CCB_CARRIER_PROXY"); ok {
 		raw = strings.TrimSpace(v)
@@ -495,36 +503,47 @@ func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error
 	}
 
 	var base func(*http.Request) (*url.URL, error)
+	var source string
 	switch {
 	case raw == "":
-		base = http.ProxyFromEnvironment
+		// Nothing in the configuration: fall back to the site's environment. Use
+		// the carrier's own resolver, not net/http's, which caches the environment
+		// for the life of the process.
+		base = wscarrier.ProxyFromEnvironment
+		source = "environment (HTTPS_PROXY/NO_PROXY); set CCB_CARRIER_PROXY to override"
 	case strings.EqualFold(raw, "none"):
 		base = wscarrier.NoProxy
+		source = "CCB_CARRIER_PROXY=none (direct, overriding any environment proxy)"
 	default:
 		u, err := url.Parse(raw)
-		if err != nil {
-			return nil, fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
-		}
-		if u.Scheme == "" {
-			// "squid.example:3128" parses with no scheme and an empty Host; retry
-			// as an authority so the common shorthand works.
-			if u, err = url.Parse("http://" + raw); err != nil {
-				return nil, fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
+		// A bare "squid.example:3128" is the shorthand an administrator is most
+		// likely to write, and url.Parse reads it as scheme "squid.example" with
+		// opaque "3128" -- no error, but no host either. Key the retry off the
+		// missing host rather than a missing scheme, which that spelling has.
+		if err != nil || u.Hostname() == "" {
+			if retried, rerr := url.Parse("http://" + raw); rerr == nil && retried.Hostname() != "" {
+				u, err = retried, nil
 			}
 		}
-		if u.Host == "" {
-			return nil, fmt.Errorf("CCB_CARRIER_PROXY %q names no host (want e.g. http://squid.example:3128)", raw)
+		if err != nil {
+			return nil, "", fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
+		}
+		// Hostname(), not Host: "http://://nonsense" parses cleanly with Host ":",
+		// which is not a proxy anyone meant to configure.
+		if u.Hostname() == "" {
+			return nil, "", fmt.Errorf("CCB_CARRIER_PROXY %q names no host (want e.g. http://squid.example:3128)", raw)
 		}
 		base = func(*http.Request) (*url.URL, error) { return u, nil }
+		source = "CCB_CARRIER_PROXY (overriding any environment proxy)"
 	}
 
 	if credFile == "" {
-		return base, nil
+		return base, source, nil
 	}
 	// Validate once at startup so a missing or malformed credential file fails the
 	// daemon rather than every carrier dial.
 	if _, err := readProxyCredential(credFile); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	return func(r *http.Request) (*url.URL, error) {
 		u, err := base(r)
@@ -538,7 +557,7 @@ func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error
 		withAuth := *u
 		withAuth.User = cred
 		return &withAuth, nil
-	}, nil
+	}, source + " + CCB_CARRIER_PROXY_CREDENTIAL_FILE", nil
 }
 
 // readProxyCredential reads "user:password" from a credential file, refusing one

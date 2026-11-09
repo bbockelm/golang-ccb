@@ -295,9 +295,18 @@ func (cfg DialConfig) proxyFunc() func(*http.Request) (*url.URL, error) {
 	if cfg.Proxy != nil {
 		return cfg.Proxy
 	}
-	return func(req *http.Request) (*url.URL, error) {
-		return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
-	}
+	return ProxyFromEnvironment
+}
+
+// ProxyFromEnvironment resolves HTTPS_PROXY / HTTP_PROXY / NO_PROXY for each
+// request, with the same matching rules (and localhost exemption) as net/http's
+// function of the same name -- but without its caching: net/http resolves the
+// environment once per process and keeps that answer forever, so a daemon
+// reconfigured afterwards, or a pilot that sets the proxy once something else
+// has already consulted the environment, would keep a stale route with nothing
+// in the log to show for it.
+func ProxyFromEnvironment(req *http.Request) (*url.URL, error) {
+	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
 }
 
 // ResolvedProxy reports the proxy this config would dial cfg.URL through: the

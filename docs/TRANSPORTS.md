@@ -144,8 +144,23 @@ declines to relay the `Upgrade`.
 
 | Knob | Meaning |
 |---|---|
-| `CCB_CARRIER_PROXY` | Proxy URL (`http://squid.site:3128`). Unset honours `HTTPS_PROXY` / `NO_PROXY`; the literal `none` forces a direct dial. |
+| `CCB_CARRIER_PROXY` | Proxy URL (`http://squid.site:3128`, or the bare `squid.site:3128`). Unset honours `HTTPS_PROXY` / `NO_PROXY`; the literal `none` forces a direct dial. |
 | `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | File holding one `user:password` line, for a proxy with `proxy_auth REQUIRED`. Re-read per dial so a rotated credential is picked up; refused if world-readable. |
+
+**The configuration wins over the environment.** A set `CCB_CARRIER_PROXY`
+overrides a site `https_proxy`, and `CCB_CARRIER_PROXY = none` overrides it with
+a direct dial — which is the only way to opt out of a site proxy without editing
+the daemon's environment. The environment is consulted only when the knob is
+unset, and is re-read per dial rather than cached for the life of the process.
+Both knobs take the usual `CCB.` / `<local-name>.` prefixes.
+
+Note that every other `*PROXY*` setting in HTCondor names an X.509 credential.
+These two are an HTTP forward proxy, and nothing else in the pool reads them.
+
+Startup logs which of the two the setting came from
+(`"CCB carrier proxy configuration" source=...`), because an operator reading a
+log otherwise cannot tell a deliberate override from a site environment leaking
+in, and those are corrected in different files.
 
 Two deployment constraints are worth knowing before the first attempt, because
 both present as an unexplained dial failure:
