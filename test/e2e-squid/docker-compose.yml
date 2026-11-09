@@ -33,7 +33,7 @@ services:
       context: ../..
       dockerfile: test/e2e-squid/Dockerfile
     command: ["offsite"]
-    # Not root: golang-ccb refuses to run privileged. The sysctl is what lets a
+    # Not root: htc-ccb refuses to run privileged. The sysctl is what lets a
     # non-root process bind 443, which a stock squid requires of the carrier.
     user: "10000:10000"
     sysctls:
@@ -66,7 +66,7 @@ services:
       context: ../..
       dockerfile: test/e2e-squid/Dockerfile
     command: ["harness"]
-    # Same account: the harness execs golang-ccb, which would refuse as root.
+    # Same account: the harness execs htc-ccb, which would refuse as root.
     user: "10000:10000"
     environment:
       CARRIER_URL: wss://ccb.offsite.test/ccb/tunnel

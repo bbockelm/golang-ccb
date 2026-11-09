@@ -1,5 +1,5 @@
-# Package definition for golang-ccb, built by packaging/build-rpm.sh.
-name: golang-ccb
+# Package definition for htc-ccb, built by packaging/build-rpm.sh.
+name: htc-ccb
 arch: ${PKG_ARCH}
 platform: linux
 version: ${PKG_VERSION}
@@ -19,9 +19,12 @@ vendor: ${PKG_VENDOR}
 homepage: https://github.com/bbockelm/golang-ccb
 license: Apache-2.0
 
-depends:
-  # Started by condor_master and reads the pool configuration and credentials;
-  # with no HTCondor installed the package has nothing to attach to.
+# No hard dependency on HTCondor. This is a self-contained static binary: it
+# reads the pool's configuration and credentials as files and invokes no
+# HTCondor tool, and it runs standalone from -listen/-public. HTCondor is only
+# recommended because the usual deployment has condor_master supervise it, and
+# because the pool it brokers for is made of HTCondor daemons.
+recommends:
   - condor
 
 contents:
@@ -29,25 +32,25 @@ contents:
   # variable: nfpm expands environment variables in its scalar fields but
   # globs contents.src literally, so a ${...} here silently matches no files.
   # This path and PKG_STAGE are one fact written twice; keep them together.
-  - src: packaging/staging/golang-ccb
-    dst: /usr/sbin/golang-ccb
+  - src: packaging/staging/htc-ccb
+    dst: /usr/sbin/htc-ccb
     file_info:
       mode: 0755
 
-  - src: packaging/golang-ccb.conf
-    dst: /etc/condor/config.d/50-golang-ccb.conf
+  - src: packaging/htc-ccb.conf
+    dst: /etc/condor/config.d/50-htc-ccb.conf
     type: config|noreplace
     file_info:
       mode: 0644
 
   - src: README.md
-    dst: /usr/share/doc/golang-ccb/README.md
+    dst: /usr/share/doc/htc-ccb/README.md
     type: doc
     file_info:
       mode: 0644
 
   - src: docs/ADMIN_TUNNELING.md
-    dst: /usr/share/doc/golang-ccb/ADMIN_TUNNELING.md
+    dst: /usr/share/doc/htc-ccb/ADMIN_TUNNELING.md
     type: doc
     file_info:
       mode: 0644

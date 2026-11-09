@@ -1,4 +1,4 @@
-# Developing golang-ccb
+# Developing htc-ccb
 
 For people changing the code. Administrators want the [README](../README.md)
 and [ADMIN_TUNNELING.md](ADMIN_TUNNELING.md) instead.
@@ -17,7 +17,7 @@ reads HTCondor configuration and wires it up.
 | `proxy.go`, `outbound.go`, `upstream.go` | the proxy/splice data path, outbound-proxy (exit) mode, registering upstream with a next hop |
 | `carrier.go`, `carrier_check.go`, `wscarrier_auth.go` | carrier wiring, the `-carrier-check` diagnostic, bearer-token verification |
 | `sqlitestore.go` | reconnect + session persistence (`modernc.org/sqlite`, cgo-free) |
-| `cmd/golang-ccb/` | the daemon: flags, config, `condor_master` integration |
+| `cmd/htc-ccb/` | the daemon: flags, config, `condor_master` integration |
 | `transport/carrier/` | yamux multiplexing over one byte pipe — what turns a single tunnel into many connections |
 | `transport/wscarrier/` | the WebSocket carrier, including HTTP `CONNECT` through a site proxy |
 | `transport/fstun/` | the filesystem carrier |
@@ -36,8 +36,8 @@ configuration, logging and the DaemonCore conventions.
 
 ```sh
 go build ./...
-CGO_ENABLED=0 go build -trimpath -o golang-ccb ./cmd/golang-ccb
-./packaging/check-static.sh golang-ccb
+CGO_ENABLED=0 go build -trimpath -o htc-ccb ./cmd/htc-ccb
+./packaging/check-static.sh htc-ccb
 ```
 
 **Everything that ships is cgo-free and static.** `modernc.org/sqlite` is the
@@ -116,7 +116,7 @@ sequenceDiagram
     participant C as requester (public)
 
     T->>B: CCB_REGISTER (authenticated)
-    B-->>T: ccbid; CCBStreaming=true. Socket stays open.
+    B-->>T: ccbid, CCBStreaming=true. Socket stays open.
     C->>B: CCB_REQUEST {CCBID, ClaimId, MyAddress}
     B->>T: forwarded over the persistent socket
     T->>C: dial MyAddress, raw CCB_REVERSE_CONNECT hello
@@ -210,8 +210,8 @@ Build an RPM locally:
 
 ```sh
 (cd .github/tools && GOWORK=off go build -o "$HOME/go/bin/nfpm" github.com/goreleaser/nfpm/v2/cmd/nfpm)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o build/golang-ccb-amd64 ./cmd/golang-ccb
-packaging/build-rpm.sh build/golang-ccb-amd64 amd64 v0.0.0-dev
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o build/htc-ccb-amd64 ./cmd/htc-ccb
+packaging/build-rpm.sh build/htc-ccb-amd64 amd64 v0.0.0-dev
 ```
 
 - `packaging/nfpm.yaml` — what goes where. `nfpm` expands environment variables
@@ -221,7 +221,7 @@ packaging/build-rpm.sh build/golang-ccb-amd64 amd64 v0.0.0-dev
 - `packaging/rpm-version.sh` — turns a tag or `git describe` into an RPM
   Version and Release. An untagged build gets a `0.`-prefixed release so it
   sorts *below* the release it is heading for, instead of shadowing it.
-- `packaging/golang-ccb.conf` — installed as `%config(noreplace)`, everything
+- `packaging/htc-ccb.conf` — installed as `%config(noreplace)`, everything
   commented out. A package that started a daemon on install would change the
   behaviour of the pool it was added to.
 - `.github/tools/` — a module of its own whose only purpose is to pin `nfpm`

@@ -58,10 +58,10 @@ func testGoCCBUnderCondorMaster(t *testing.T, policy string, privateSchedd bool)
 	tmp := t.TempDir()
 
 	// Build the Go CCB binary the master will launch as the CCB daemon.
-	ccbBin := filepath.Join(tmp, "golang-ccb")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", ccbBin, "./cmd/golang-ccb")
+	ccbBin := filepath.Join(tmp, "htc-ccb")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", ccbBin, "./cmd/htc-ccb")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building golang-ccb: %v\n%s", err, out)
+		t.Fatalf("building htc-ccb: %v\n%s", err, out)
 	}
 
 	// A non-trivial security policy: authentication REQUIRED (FS + IDTOKENS), with
@@ -351,10 +351,10 @@ func TestGoCCBSharedPortUnderCondorMaster(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	ccbBin := filepath.Join(tmp, "golang-ccb")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", ccbBin, "./cmd/golang-ccb")
+	ccbBin := filepath.Join(tmp, "htc-ccb")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", ccbBin, "./cmd/htc-ccb")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building golang-ccb: %v\n%s", err, out)
+		t.Fatalf("building htc-ccb: %v\n%s", err, out)
 	}
 
 	extra := fmt.Sprintf(`
@@ -439,7 +439,7 @@ SEC_CLIENT_ENCRYPTION = OPTIONAL
 	if strings.Count(verbose, `"DENIED"`) != 2 || strings.Contains(verbose, "CMD_NOT_FOUND") {
 		t.Errorf("condor_ping ADMINISTRATOR and CONFIG were not both refused as DENIED:\n%s", verbose)
 	}
-	if !strings.Contains(verbose, "BuildID: golang-ccb") {
+	if !strings.Contains(verbose, "BuildID: htc-ccb") {
 		t.Errorf("condor_ping READ did not report the Go CCB's version:\n%s", verbose)
 	}
 

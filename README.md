@@ -1,4 +1,4 @@
-# golang-ccb
+# htc-ccb
 
 A connection broker (CCB) for [HTCondor](https://htcondor.org): it makes
 daemons behind NAT or a private network reachable from the rest of the pool. It
@@ -22,7 +22,7 @@ someone wants to reach it the broker tells it to dial *back*.
 |---|---|
 | Execute nodes behind NAT, submit hosts public | a CCB — the collector's built-in one is fine |
 | The same, but you want the broker off the collector's host, or scaled separately | **this** |
-| Both ends private (an EP and a submit host that cannot reach each other) | **this** — it proxies the connection rather than requiring one end to be dialable |
+| Both ends private (an EP and a submit host that cannot reach each other) | the collector's CCB does this from HTCondor 26.0.0; **this** if you also want the broker off the collector's host |
 | Worker nodes that may open only one or two sockets, or reach only an HTTP proxy | **this** — see [§7](#7-execution-points-with-no-outbound-network) |
 | Worker nodes with no network path at all, but a shared filesystem | **this** — see [docs/TRANSPORTS.md](docs/TRANSPORTS.md) |
 
@@ -42,17 +42,17 @@ Download the one for your architecture and install it:
 
 ```sh
 VERSION=0.4.1    # the release you want; the releases page lists them
-curl -LO "https://github.com/bbockelm/golang-ccb/releases/download/v${VERSION}/golang-ccb-${VERSION}-1.x86_64.rpm"
-sudo dnf install ./golang-ccb-${VERSION}-1.x86_64.rpm
+curl -LO "https://github.com/bbockelm/golang-ccb/releases/download/v${VERSION}/htc-ccb-${VERSION}-1.x86_64.rpm"
+sudo dnf install ./htc-ccb-${VERSION}-1.x86_64.rpm
 ```
 
 It requires the `condor` package, installs
 
 | File | |
 |---|---|
-| `/usr/sbin/golang-ccb` | the daemon |
-| `/etc/condor/config.d/50-golang-ccb.conf` | a sample configuration, every line commented out |
-| `/usr/share/doc/golang-ccb/` | this file and the tunneling guide |
+| `/usr/sbin/htc-ccb` | the daemon |
+| `/etc/condor/config.d/50-htc-ccb.conf` | a sample configuration, every line commented out |
+| `/usr/share/doc/htc-ccb/` | this file and the tunneling guide |
 
 and starts nothing. Installing it changes no behaviour until you edit that
 configuration file and reconfigure — a package that started a broker on install
@@ -75,25 +75,25 @@ tarball per platform (`linux` and `darwin`, `amd64` and `arm64`):
 
 ```sh
 VERSION=0.4.1
-curl -LO "https://github.com/bbockelm/golang-ccb/releases/download/v${VERSION}/golang-ccb_v${VERSION}_linux_amd64.tar.gz"
-tar xzf golang-ccb_v${VERSION}_linux_amd64.tar.gz
-sudo install -m 0755 golang-ccb_v${VERSION}_linux_amd64/golang-ccb /usr/sbin/golang-ccb
+curl -LO "https://github.com/bbockelm/golang-ccb/releases/download/v${VERSION}/htc-ccb_v${VERSION}_linux_amd64.tar.gz"
+tar xzf htc-ccb_v${VERSION}_linux_amd64.tar.gz
+sudo install -m 0755 htc-ccb_v${VERSION}_linux_amd64/htc-ccb /usr/sbin/htc-ccb
 ```
 
-The binary is static and cgo-free, so it runs on anything with a compatible
+The binary is static, so it runs on anything with a compatible
 kernel regardless of the host's libc — which is the point, since the inside
 broker in [§7](#7-execution-points-with-no-outbound-network) lands on worker
 nodes you do not control. Each tarball also carries the sample configuration as
-`golang-ccb.conf.example`.
+`htc-ccb.conf.example`.
 
 ### Container
 
 ```sh
-docker build -t golang-ccb .
+docker build -t htc-ccb .
 docker run --rm -p 9618:9618 \
   -e CONDOR_CONFIG=/etc/condor/condor_config \
   -v /etc/condor:/etc/condor:ro \
-  golang-ccb -listen :9618 -public ccb.example.org:9618
+  htc-ccb -listen :9618 -public ccb.example.org:9618
 ```
 
 ### From source
@@ -111,10 +111,10 @@ second place to configure this daemon.
 ### 3.1 On the broker host
 
 A public address and an open port — 9618 by default. Put this in
-`/etc/condor/config.d/50-golang-ccb.conf`:
+`/etc/condor/config.d/50-htc-ccb.conf`:
 
 ```
-CCB            = /usr/sbin/golang-ccb
+CCB            = /usr/sbin/htc-ccb
 DAEMON_LIST    = $(DAEMON_LIST), CCB
 DC_DAEMON_LIST = $(DC_DAEMON_LIST) +CCB
 
@@ -128,8 +128,8 @@ MAX_CCB_LOG = 10000000
 # Registered targets keep their ccbid, and clients keep their security
 # sessions, across a restart of this daemon. Without it every EP re-registers
 # under a new contact after a restart.
-CCB_SESSION_CACHE_FILE = $(SPOOL)/golang-ccb-sessions.db
-VALID_SPOOL_FILES      = $(VALID_SPOOL_FILES) golang-ccb-sessions.db*
+CCB_SESSION_CACHE_FILE = $(SPOOL)/htc-ccb-sessions.db
+VALID_SPOOL_FILES      = $(VALID_SPOOL_FILES) htc-ccb-sessions.db*
 ```
 
 `DC_DAEMON_LIST` is what makes it a DaemonCore daemon to the master, so
@@ -186,7 +186,7 @@ configuration at all. They learn each machine's contact from its ad.
 **The daemon is up.** `CcbLog` opens with:
 
 ```
-golang-ccb starting  public=ccb.example.org:9618 listen=[::]:9618 listeners=2 under_master=true
+htc-ccb starting  public=ccb.example.org:9618 listen=[::]:9618 listeners=2 under_master=true
 CCB server started  address=ccb.example.org:9618 listen=[::]:9618
 ```
 
@@ -256,7 +256,7 @@ and `<local-name>.CCB_SESSION_CACHE_FILE` beat the bare name.
 |---|---|---|
 | `CCB_SESSION_CACHE_FILE` | unset | SQLite file holding registrations and security sessions, encrypted at rest under the pool signing key. Without it both are lost on restart |
 | `CCB_DIAL_REFUSE_LOCAL_ADDRESSES` | `false` | refuse reverse connects to loopback and link-local addresses. The address comes from the requester, so this is worth setting wherever the brokered daemons are not all trusted |
-| `CCB_RECONNECT_ALLOWED_FROM_ANY_IP` | `false` | let a target reconnect from an address other than the one it registered from. Needed only where targets legitimately move |
+| `CCB_RECONNECT_ALLOWED_FROM_ANY_IP` | `false` | let a target reconnect from an address other than the one it registered from. Needed where targets legitimately move — and where they only appear to: behind a load-balanced NAT a host's source address can change between connections without the host going anywhere |
 
 ### Authorization
 
@@ -294,13 +294,13 @@ will do.
 
 **Start here: [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md)** — what to ask
 the site for, the configuration for both brokers and the execution point, how to
-verify it with `golang-ccb -carrier-check`, and what each failure means.
+verify it with `htc-ccb -carrier-check`, and what each failure means.
 
 That diagnostic is worth knowing about before you need it. It walks the path one
 layer at a time and names the layer that broke:
 
 ```sh
-golang-ccb -listen 127.0.0.1:0 -carrier-check
+htc-ccb -listen 127.0.0.1:0 -carrier-check
 ```
 
 ```

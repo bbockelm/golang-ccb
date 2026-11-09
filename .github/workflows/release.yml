@@ -1,6 +1,6 @@
 name: Release
 
-# Builds golang-ccb for linux and darwin (amd64 + arm64), packages an RPM per
+# Builds htc-ccb for linux and darwin (amd64 + arm64), packages an RPM per
 # Linux architecture, and attaches everything to the GitHub release when a v*
 # tag is pushed.
 #
@@ -64,28 +64,28 @@ jobs:
           mkdir -p dist
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             os="${target%/*}"; arch="${target#*/}"
-            name="golang-ccb_${VERSION}_${os}_${arch}"
+            name="htc-ccb_${VERSION}_${os}_${arch}"
             echo "==> building ${name}"
             stage="dist/${name}"
             mkdir -p "${stage}"
             GOOS="${os}" GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
-              -o "${stage}/golang-ccb" ./cmd/golang-ccb
+              -o "${stage}/htc-ccb" ./cmd/htc-ccb
             cp README.md docs/ADMIN_TUNNELING.md "${stage}/"
-            cp packaging/golang-ccb.conf "${stage}/golang-ccb.conf.example"
+            cp packaging/htc-ccb.conf "${stage}/htc-ccb.conf.example"
           done
           ls -l dist
 
       # Reads the build settings recorded in each binary, so a step that lost
       # CGO_ENABLED fails here instead of on an administrator's worker node.
       - name: Check every binary is static and cgo-free
-        run: packaging/check-static.sh dist/golang-ccb_*/golang-ccb
+        run: packaging/check-static.sh dist/htc-ccb_*/htc-ccb
 
       - name: Package tarballs
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          for d in dist/golang-ccb_*/; do
+          for d in dist/htc-ccb_*/; do
             name="$(basename "${d}")"
             tar -czf "dist/${name}.tar.gz" -C dist "${name}"
             rm -rf "${d}"
@@ -110,9 +110,9 @@ jobs:
           mkdir -p build
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags "-s -w" \
-              -o "build/golang-ccb-${arch}" ./cmd/golang-ccb
+              -o "build/htc-ccb-${arch}" ./cmd/htc-ccb
             NFPM="$RUNNER_TEMP/bin/nfpm" \
-              packaging/build-rpm.sh "build/golang-ccb-${arch}" "${arch}" "${VERSION}" dist
+              packaging/build-rpm.sh "build/htc-ccb-${arch}" "${arch}" "${VERSION}" dist
           done
           (cd dist && sha256sum *.rpm >> SHA256SUMS.txt)
           ls -l dist/*.rpm
@@ -120,7 +120,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: golang-ccb-release
+          name: htc-ccb-release
           path: dist/*
           if-no-files-found: error
 
