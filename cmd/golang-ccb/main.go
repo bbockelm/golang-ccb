@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -29,6 +31,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
+	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
 
 // streamingVersionString advertises a CondorVersion at or above the streaming
@@ -60,6 +63,7 @@ func run() error {
 	// config lookups (CCB.<key> / <local-name>.<key> beat the bare key).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
+	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; a diagnostic to run by hand when a node cannot reach its broker.")
 	flag.Parse()
 
 	// Did the operator explicitly set -listen? Only then do we bind it as an extra public
@@ -258,7 +262,7 @@ func run() error {
 	if cc.sciTokens != nil {
 		d.OnReconfig(cc.sciTokens.load)
 	}
-	logCarrierMode(log, cc)
+	logCarrierSettings(log, cc)
 
 	// CCB_DIAL_REFUSE_LOCAL_ADDRESSES refuses loopback and link-local
 	// destinations in the reverse connects a requester's address directs (the
@@ -289,6 +293,8 @@ func run() error {
 		CarrierClientTLS:        cc.clientTLS,
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
+		CarrierProxy:            cc.proxy,
+		CarrierKeepalive:        cc.keepalive,
 		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
@@ -296,10 +302,87 @@ func run() error {
 		return err
 	}
 
+	if *carrierCheck {
+		return runCarrierCheck(srv)
+	}
+
 	log.Info(logging.DestinationGeneral, "golang-ccb starting",
 		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
 	return serveBroker(context.Background(), d, srv, az, lns...)
+}
+
+// logCarrierSettings records what the carrier was configured with, before
+// anything tries to use it.
+//
+// The proxy's SOURCE matters as much as its value: an operator reading a log
+// otherwise cannot tell a deliberate CCB_CARRIER_PROXY override from the site
+// environment leaking in, and those are corrected in different files.
+func logCarrierSettings(log *logging.Logger, cc carrierSettings) {
+	if isWSCarrier(cc.listen) {
+		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled",
+			"carrier", cc.listen, "upgrade_auth", carrierAuthName(cc.unauthenticated))
+		if cc.unauthenticated {
+			// The upgrade is open, so the broker is only as safe as its ALLOW_
+			// policy -- which over a carrier cannot use host terms at all: a
+			// WebSocket peer reports no network address, so host-only rules match
+			// nothing and refuse every registration.
+			log.Info(logging.DestinationGeneral,
+				"carrier upgrades accept no bearer token; peers are authenticated by the CEDAR handshake on their first command",
+				"note", "carrier peers have no network address, so host-based ALLOW_DAEMON entries never match them -- an identity-based entry is required")
+		}
+	}
+	// Not inside the check above: an inside broker dials a carrier without
+	// serving one, and the proxy it dials through is what it most needs logged.
+	if cc.proxySource != "" {
+		log.Info(logging.DestinationGeneral, "CCB carrier proxy configuration", "source", cc.proxySource)
+	}
+}
+
+// carrierCheckTimeout bounds the startup health check. It is generous because
+// every stage it walks is one a slow site proxy can legitimately take seconds on,
+// and the check is diagnostic -- a slow pass is still a pass.
+const carrierCheckTimeout = 60 * time.Second
+
+// logCarrierCheck walks the carrier's stages at startup, before anything depends
+// on it, so a site-policy problem (unreachable proxy, refused CONNECT,
+// intercepted TLS, rejected token, mismatched credentials) is named once, up
+// front, instead of appearing as a retry loop against an opaque dial failure.
+//
+// Never fatal: the proxy may be transiently down and the broker's own loops keep
+// retrying; a node whose tunnel is down refuses registrations rather than
+// handing out an address the pool cannot reach. Run -carrier-check by hand to
+// see the same report without starting a daemon.
+func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server, ctx context.Context) {
+	if !srv.HasCarrier() {
+		return
+	}
+	res := srv.CheckCarrier(ctx)
+	if err := res.Err(); err != nil {
+		log.Warn(logging.DestinationGeneral, "carrier health check failed; the broker will keep retrying",
+			"carrier", res.URL, "route", res.Route, "error", err)
+	} else {
+		log.Info(logging.DestinationGeneral, "carrier health check passed",
+			"carrier", res.URL, "route", res.Route)
+	}
+	for _, line := range strings.Split(strings.TrimRight(res.String(), "\n"), "\n") {
+		log.Info(logging.DestinationGeneral, "carrier check: "+line)
+	}
+}
+
+// runCarrierCheck implements -carrier-check: print the per-stage report to
+// stdout and exit non-zero on the first failure. This is a diagnostic an
+// administrator runs on a node that cannot reach its broker, so the failure it
+// reports is the one a human reads.
+func runCarrierCheck(srv *ccbserver.Server) error {
+	if !srv.HasCarrier() {
+		return fmt.Errorf("-carrier-check: no carrier is configured (set CCB_OUTBOUND_NEXT_HOP or the upstream broker to a ws://, wss:// or fs: address)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), carrierCheckTimeout)
+	defer cancel()
+	res := srv.CheckCarrier(ctx)
+	fmt.Print(res.String())
+	return res.Err()
 }
 
 // newBroker creates the CCB server with the daemon's ALLOW_/DENY_ policy and
@@ -336,11 +419,89 @@ func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daem
 
 // serveBroker starts srv's background work and serves its command socket on
 // every listener until d shuts down, logging each command the policy refuses.
+//
+// A tunneling broker verifies its carrier BEFORE serving, because
+// ServeListeners reports the daemon ready to condor_master (DC_SET_READY) as
+// soon as the accept loops are up, and the master starts this node's remaining
+// daemons on that signal. Readiness should mean the broker can do its job: if
+// it cannot reach its outside CCB, an EP started behind it has nowhere to go.
 func serveBroker(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server, az *daemon.Authz, lns ...net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	srv.StartBackground(ctx)
+	awaitCarrierReady(ctx, d, srv)
 	return d.ServeListeners(ctx, az.Serve(srv.CommandServer(), d.Slog()), lns...)
+}
+
+// awaitCarrierReady verifies the carrier and waits for the tunnel before the
+// daemon reports itself ready.
+//
+// It is deliberately not fatal. A broker that refused to start would be
+// restarted by condor_master in a loop, destroying the very diagnosis the staged
+// report just produced, and the proxy it could not reach a moment ago may be
+// back a moment later -- the broker's own loops keep retrying either way. So a
+// failure here is loud and the daemon carries on; what protects correctness is
+// that an inside CCB refuses to hand out a contact until it is tunnel-ready, so
+// an EP cannot be given an unroutable address in the meantime.
+func awaitCarrierReady(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server) {
+	if !srv.HasCarrier() {
+		return
+	}
+	log := d.Logger()
+	timeout := carrierReadyTimeout(d.Config())
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	logCarrierCheck(log, srv, cctx)
+
+	// The authoritative signal for an inside CCB: upstream registration has
+	// completed, so the contacts it hands out will nest. Returns at once for a
+	// broker with no upstream, where the check above was the whole story.
+	if err := srv.WaitTunnelReady(cctx); err != nil {
+		log.Warn(logging.DestinationGeneral,
+			"reporting ready without a tunnel: this broker has not registered with its outside CCB, so it cannot hand out routable contacts yet",
+			"waited", timeout, "error", err)
+		return
+	}
+	log.Info(logging.DestinationGeneral, "carrier ready", "tunnel_contact", srv.TunnelContact())
+}
+
+// carrierKeepalive is how often an idle carrier sends a keepalive.
+// CCB_CARRIER_KEEPALIVE is in seconds; unset uses carrier.DefaultKeepalive.
+//
+// This is a network-policy setting, not a liveness one. A quiet carrier produces
+// no other traffic, so the keepalive is the only thing stopping a site proxy
+// from reclaiming the tunnel as idle -- and when it is too slow the failure is
+// silent: the carrier is dropped and transparently rebuilt, so everything still
+// works while the node churns a new connection through the proxy each time. Set
+// it comfortably below the shortest idle timeout on the path (squid's
+// read_timeout, and any load balancer in front of the broker).
+func carrierKeepalive(cfg *config.Config) time.Duration {
+	v, ok := cfg.Get("CCB_CARRIER_KEEPALIVE")
+	if !ok {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// carrierReadyTimeout bounds the wait before the daemon reports ready.
+// CCB_CARRIER_READY_TIMEOUT is in seconds.
+func carrierReadyTimeout(cfg *config.Config) time.Duration {
+	const def = 120 * time.Second
+	v, ok := cfg.Get("CCB_CARRIER_READY_TIMEOUT")
+	if !ok {
+		return def
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return def
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // buildSessionStore constructs the encrypted session-cache store when
@@ -380,6 +541,9 @@ type carrierSettings struct {
 	clientTLS   *tls.Config
 	token       string
 	tokenSource func(context.Context) (string, error)
+	proxy       func(*http.Request) (*url.URL, error)
+	proxySource string
+	keepalive   time.Duration
 	// sciTokens is the SciToken map file behind verify, reloaded on reconfig;
 	// nil when there is no ws/wss listener or the carrier is unauthenticated.
 	sciTokens *sciTokenMap
@@ -465,8 +629,125 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 			}
 			cc.clientTLS = tlsc
 		}
+		proxyFn, proxySource, err := buildCarrierProxy(cfg)
+		if err != nil {
+			return cc, err
+		}
+		cc.proxy = proxyFn
+		cc.proxySource = proxySource
+		cc.keepalive = carrierKeepalive(cfg)
 	}
 	return cc, nil
+}
+
+// buildCarrierProxy resolves how this (inside) CCB reaches a WebSocket carrier:
+// directly, or through an HTTP proxy. A site that permits no outbound TCP except
+// through a squid-style proxy is the reason the WebSocket carrier exists, so the
+// proxy is first-class configuration rather than something inherited by accident
+// from the environment.
+//
+//	CCB_CARRIER_PROXY unset   honour HTTPS_PROXY / NO_PROXY from the environment
+//	CCB_CARRIER_PROXY = none  dial directly, overriding any environment proxy
+//	CCB_CARRIER_PROXY = <url> always dial through that proxy (http://squid:3128)
+//
+// CCB_CARRIER_PROXY_CREDENTIAL_FILE names a file holding "user:password" for a
+// proxy that requires authentication. It is a file rather than a config value
+// because the configuration is world-readable, and it is re-read per dial so a
+// rotated credential is picked up without a restart.
+func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error), string, error) {
+	raw := ""
+	if v, ok := cfg.Get("CCB_CARRIER_PROXY"); ok {
+		raw = strings.TrimSpace(v)
+	}
+	credFile := ""
+	if v, ok := cfg.Get("CCB_CARRIER_PROXY_CREDENTIAL_FILE"); ok {
+		credFile = strings.TrimSpace(v)
+	}
+
+	var base func(*http.Request) (*url.URL, error)
+	var source string
+	switch {
+	case raw == "":
+		// Nothing in the configuration: fall back to the site's environment. Use
+		// the carrier's own resolver, not net/http's, which caches the environment
+		// for the life of the process.
+		base = wscarrier.ProxyFromEnvironment
+		source = "environment (HTTPS_PROXY/NO_PROXY); set CCB_CARRIER_PROXY to override"
+	case strings.EqualFold(raw, "none"):
+		base = wscarrier.NoProxy
+		source = "CCB_CARRIER_PROXY=none (direct, overriding any environment proxy)"
+	default:
+		u, err := url.Parse(raw)
+		// A bare "squid.example:3128" is the shorthand an administrator is most
+		// likely to write, and url.Parse reads it as scheme "squid.example" with
+		// opaque "3128" -- no error, but no host either. Key the retry off the
+		// missing host rather than a missing scheme, which that spelling has.
+		if err != nil || u.Hostname() == "" {
+			if retried, rerr := url.Parse("http://" + raw); rerr == nil && retried.Hostname() != "" {
+				u, err = retried, nil
+			}
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
+		}
+		// Hostname(), not Host: "http://://nonsense" parses cleanly with Host ":",
+		// which is not a proxy anyone meant to configure.
+		if u.Hostname() == "" {
+			return nil, "", fmt.Errorf("CCB_CARRIER_PROXY %q names no host (want e.g. http://squid.example:3128)", raw)
+		}
+		base = func(*http.Request) (*url.URL, error) { return u, nil }
+		source = "CCB_CARRIER_PROXY (overriding any environment proxy)"
+	}
+
+	if credFile == "" {
+		return base, source, nil
+	}
+	// Validate once at startup so a missing or malformed credential file fails the
+	// daemon rather than every carrier dial.
+	if _, err := readProxyCredential(credFile); err != nil {
+		return nil, "", err
+	}
+	return func(r *http.Request) (*url.URL, error) {
+		u, err := base(r)
+		if err != nil || u == nil {
+			return u, err
+		}
+		cred, err := readProxyCredential(credFile)
+		if err != nil {
+			return nil, err
+		}
+		withAuth := *u
+		withAuth.User = cred
+		return &withAuth, nil
+	}, source + " + CCB_CARRIER_PROXY_CREDENTIAL_FILE", nil
+}
+
+// readProxyCredential reads "user:password" from a credential file, refusing one
+// that is world-readable (as HTCondor does for its own credential files).
+func readProxyCredential(path string) (*url.Userinfo, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE: %w", err)
+	}
+	if st.Mode().Perm()&0o004 != 0 {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE %s is world-readable (mode %#o); it holds a password", path, st.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE: %w", err)
+	}
+	line := ""
+	for _, l := range strings.Split(string(data), "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			line = t
+			break
+		}
+	}
+	user, pass, ok := strings.Cut(line, ":")
+	if !ok || user == "" {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE %s: want one line of the form user:password", path)
+	}
+	return url.UserPassword(user, pass), nil
 }
 
 // loadCarrierClientTLS builds a client TLS config trusting the CA bundle in
@@ -520,26 +801,6 @@ func configInt(cfg interface{ Get(string) (string, bool) }, key string, def int)
 		return def
 	}
 	return n
-}
-
-// logCarrierMode records which credential the carrier's upgrade expects, and
-// what an operator must check when it expects none.
-func logCarrierMode(log *logging.Logger, cc carrierSettings) {
-	if !isWSCarrier(cc.listen) {
-		return
-	}
-	log.Info(logging.DestinationGeneral, "CCB carrier listener enabled",
-		"carrier", cc.listen, "upgrade_auth", carrierAuthName(cc.unauthenticated))
-	if !cc.unauthenticated {
-		return
-	}
-	// The upgrade is open, so the broker is only as safe as its ALLOW_ policy
-	// -- which over a carrier cannot use host terms at all: a WebSocket peer
-	// reports no network address, so host-only rules match nothing and refuse
-	// every registration.
-	log.Info(logging.DestinationGeneral,
-		"carrier upgrades accept no bearer token; peers are authenticated by the CEDAR handshake on their first command",
-		"note", "carrier peers have no network address, so host-based ALLOW_DAEMON entries never match them -- an identity-based entry is required")
 }
 
 // carrierAuthName renders the resolved CCB_CARRIER_AUTH value for logging.

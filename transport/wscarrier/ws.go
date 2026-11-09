@@ -18,11 +18,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/net/http/httpproxy"
 )
 
 // DefaultPath is the HTTP path the WebSocket upgrade is served on.
@@ -275,6 +277,12 @@ type DialConfig struct {
 	Unauthenticated bool
 	// TLS configures the client TLS (CA roots, etc.) for wss.
 	TLS *tls.Config
+	// Proxy selects the HTTP proxy to reach the endpoint through, in the form
+	// http.Transport.Proxy takes. Nil means http.ProxyFromEnvironment, so
+	// HTTPS_PROXY / NO_PROXY are honoured; NoProxy disables proxying outright.
+	// A proxy is reached with CONNECT, which requires a wss:// endpoint (see
+	// ResolvedProxy).
+	Proxy func(*http.Request) (*url.URL, error)
 	// HandshakeTimeout bounds the WebSocket upgrade (default 30s).
 	HandshakeTimeout time.Duration
 	// ReadLimit caps a single inbound message (default unlimited).
@@ -303,10 +311,20 @@ func Dial(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 	if token != "" {
 		hdr.Set("Authorization", "Bearer "+token)
 	}
-	httpClient := &http.Client{}
-	if cfg.TLS != nil {
-		httpClient.Transport = &http.Transport{TLSClientConfig: cfg.TLS}
+	// Resolve the proxy up front: it decides the route AND rejects the
+	// unsupported ws://-through-a-proxy combination before we spend a dial.
+	proxyURL, err := cfg.ResolvedProxy()
+	if err != nil {
+		return nil, err
 	}
+	// Always build our own Transport (never http.DefaultTransport): the proxy and
+	// the TLS roots must both be honoured, and a Transport carrying an explicit
+	// TLSClientConfig does not negotiate HTTP/2, which the handshake needs
+	// (RFC 8441 is not implemented here).
+	httpClient := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: cfg.TLS,
+		Proxy:           cfg.proxyFunc(),
+	}}
 
 	hsTimeout := cfg.HandshakeTimeout
 	if hsTimeout <= 0 {
@@ -323,10 +341,13 @@ func Dial(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 		_ = resp.Body.Close() // handshake response body is unused; close to satisfy the linter/net
 	}
 	if err != nil {
+		// Name the route taken: a dial that silently went direct because a proxy
+		// was not configured is otherwise indistinguishable from one the proxy
+		// refused, and on a node with no route out the difference is the diagnosis.
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			return nil, fmt.Errorf("wscarrier: dial %s: unauthorized (bad or missing token)", cfg.URL)
+			return nil, fmt.Errorf("wscarrier: dial %s (%s): unauthorized (bad or missing token)", cfg.URL, RouteDescription(proxyURL))
 		}
-		return nil, fmt.Errorf("wscarrier: dial %s: %w", cfg.URL, err)
+		return nil, fmt.Errorf("wscarrier: dial %s (%s): %w", cfg.URL, RouteDescription(proxyURL), err)
 	}
 	if cfg.ReadLimit != 0 {
 		c.SetReadLimit(cfg.ReadLimit)
@@ -419,4 +440,84 @@ func orDuration(v, def time.Duration) time.Duration {
 		return def
 	}
 	return v
+}
+
+// NoProxy is a DialConfig.Proxy that disables proxying outright, overriding the
+// HTTPS_PROXY environment that a nil Proxy would otherwise honour.
+func NoProxy(*http.Request) (*url.URL, error) { return nil, nil }
+
+// proxyFunc is the http.Transport.Proxy to use: the configured one, or the
+// environment when unset.
+//
+// The environment is read per dial rather than through
+// http.ProxyFromEnvironment, which resolves HTTPS_PROXY / NO_PROXY once per
+// process and caches the answer forever. A daemon that is reconfigured, or a
+// pilot that sets the proxy after something else has already consulted the
+// environment, would otherwise keep using a stale route with nothing to show for
+// it. The matching rules (including the localhost exemption) are the same.
+func (cfg DialConfig) proxyFunc() func(*http.Request) (*url.URL, error) {
+	if cfg.Proxy != nil {
+		return cfg.Proxy
+	}
+	return ProxyFromEnvironment
+}
+
+// ProxyFromEnvironment resolves HTTPS_PROXY / HTTP_PROXY / NO_PROXY for each
+// request, with the same matching rules (and localhost exemption) as net/http's
+// function of the same name -- but without its caching: net/http resolves the
+// environment once per process and keeps that answer forever, so a daemon
+// reconfigured afterwards, or a pilot that sets the proxy once something else
+// has already consulted the environment, would keep a stale route with nothing
+// in the log to show for it.
+func ProxyFromEnvironment(req *http.Request) (*url.URL, error) {
+	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+}
+
+// ResolvedProxy reports the proxy this config would dial cfg.URL through: the
+// result of DialConfig.Proxy (or the environment) for the equivalent HTTP
+// request, or nil for a direct dial. Callers use it to log the route a carrier
+// actually took, because a dial that silently went direct looks exactly like a
+// proxied one in every other respect.
+//
+// It also enforces the one combination that cannot work: a proxy is reached
+// with CONNECT, which http.Transport issues only for an https target, so a
+// plaintext ws:// endpoint through a proxy would be sent as an absolute-URI GET
+// that proxies do not relay as an Upgrade. That is rejected here rather than
+// failing obscurely mid-handshake.
+func (cfg DialConfig) ResolvedProxy() (*url.URL, error) {
+	u, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("wscarrier: bad URL %q: %w", cfg.URL, err)
+	}
+	// http.Transport.Proxy is consulted with the http/https equivalent of the
+	// endpoint, which is also what NO_PROXY matching sees.
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	case "http", "https":
+		// already in request form
+	default:
+		return nil, fmt.Errorf("wscarrier: unsupported URL scheme %q in %q", u.Scheme, cfg.URL)
+	}
+	proxyURL, err := cfg.proxyFunc()(&http.Request{URL: u, Header: http.Header{}})
+	if err != nil {
+		return nil, fmt.Errorf("wscarrier: resolving proxy for %s: %w", cfg.URL, err)
+	}
+	if proxyURL != nil && u.Scheme == "http" {
+		return nil, fmt.Errorf("wscarrier: %s cannot be reached through proxy %s: "+
+			"a proxied carrier requires wss:// (the proxy is traversed with CONNECT, which is issued only for TLS endpoints)",
+			cfg.URL, proxyURL.Redacted())
+	}
+	return proxyURL, nil
+}
+
+// RouteDescription renders a resolved proxy for a log or an error message:
+// "direct" when nil, otherwise the proxy URL with any password redacted.
+func RouteDescription(proxyURL *url.URL) string {
+	if proxyURL == nil {
+		return "direct"
+	}
+	return "via " + proxyURL.Redacted()
 }

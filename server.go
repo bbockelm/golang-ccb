@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,6 +185,18 @@ type Config struct {
 	// per dial so a rotated credential is picked up).
 	CarrierTokenSource func(ctx context.Context) (token string, err error)
 
+	// CarrierKeepalive is how often an idle carrier sends a keepalive. It is
+	// what stops a site proxy reclaiming a quiet tunnel as idle, so it must be
+	// shorter than the shortest idle timeout on the path. 0 uses
+	// carrier.DefaultKeepalive. Mirrors config CCB_CARRIER_KEEPALIVE.
+	CarrierKeepalive time.Duration
+
+	// CarrierProxy selects the HTTP proxy this (inside) CCB reaches a WebSocket
+	// carrier through, in the form http.Transport.Proxy takes. Nil honours
+	// HTTPS_PROXY / NO_PROXY from the environment; wscarrier.NoProxy forces a
+	// direct dial. A proxied carrier must be wss:// (CONNECT). Mirrors config
+	// CCB_CARRIER_PROXY.
+	CarrierProxy func(*http.Request) (*url.URL, error)
 	// DialControl, if set, is installed as net.Dialer.Control on the TCP dials
 	// this broker makes to addresses a remote party chose: the reverse connects
 	// an inside CCB makes for requests forwarded through its Upstream
@@ -525,6 +539,26 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 		return fmt.Errorf("register: reading ad: %w", err)
 	}
 	name := ccb.AdString(ad, ccb.AttrName)
+
+	// An inside CCB must not hand out a contact before it knows its own tunnel
+	// address: contactString would fall back to this broker's PublicAddress,
+	// which on a restricted node is private, and the registrant would advertise
+	// that to the pool as its permanent, unroutable contact. Upstream
+	// registration takes real time over a carrier (seconds through an HTTP
+	// proxy), so an EP starting alongside this broker loses that race routinely.
+	// Wait, bounded; refuse rather than answer with a flat contact, since the
+	// registrant's CCBListener retries but never re-registers a contact it
+	// already accepted.
+	if s.cfg.Upstream != nil {
+		wctx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
+		err := s.WaitTunnelReady(wctx)
+		cancel()
+		if err != nil {
+			s.log.Warn("register refused: this inside CCB is not tunnel-ready, so the contact would not nest",
+				"name", name, "remote", c.RemoteAddr, "waited", s.cfg.RequestTimeout, "error", err)
+			return fmt.Errorf("register: inside CCB not tunnel-ready after %s: %w", s.cfg.RequestTimeout, err)
+		}
+	}
 
 	t := &target{
 		name:   name,

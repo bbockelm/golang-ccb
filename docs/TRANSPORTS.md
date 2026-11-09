@@ -155,23 +155,103 @@ not a requirement.
   `SEC_SCITOKENS_FOREIGN_TOKEN_ISSUERS`. Without a map file only IDTOKENs are
   accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
-  ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
-  when a token is required (authenticated peer; yamux bounds its own windows) and
-  bounded at 1 MiB when it is not — yamux's default stream window is 256 KiB, so
-  that is ample headroom while still bounding per-connection buffers.
+  ping/pong + yamux keepalive detect a dead peer. The keepalive interval
+  (`CCB_CARRIER_KEEPALIVE`, default `carrier.DefaultKeepalive` = 30s) does
+  double duty: on a carrier it is also the only traffic a quiet tunnel
+  produces, so it is what keeps a site proxy from reclaiming it as idle. Too
+  slow fails silently -- the pipe is dropped and re-established on next use, so
+  every connection still succeeds while the node spends a fresh proxy
+  connection each time it goes quiet. The message read limit is lifted when a
+  token is required (authenticated peer; yamux bounds its own windows) and
+  bounded at 1 MiB when it is not — yamux's default stream window is 256 KiB,
+  so that is ample headroom while still bounding per-connection buffers.
 - **TLS**: `wss://` requires a server `CarrierTLS` and (client) `CarrierClientTLS`
   for CA roots; `ws://` is plaintext, for test/dev only.
 
 Config knobs on the CCB `Config`: `CarrierListen` (`wss://…`), `CarrierTLS`,
 `CarrierTokenVerify`, `CarrierUnauthenticated`, `CarrierMaxSessions`,
 `CarrierMaxPerSource`, `CarrierPipeProbation` (server); `CarrierClientTLS`,
-`CarrierToken` / `CarrierTokenSource`, `CarrierUnauthenticated` (client).
+`CarrierToken` / `CarrierTokenSource`, `CarrierUnauthenticated`,
+`CarrierProxy` (client).
 
 A WebSocket peer has no network address of its own — `websocket.NetConn`
 reports a placeholder — so host and netblock terms in `ALLOW_DAEMON` match no
 carrier peer and fail closed. Carrier registrants must be admitted by an
 identity term, and `peerIP` is nil for them, so reconnect IP pinning does not
 apply. This is true of both auth modes.
+
+### 3.1 Through an HTTP proxy
+
+Many of the sites this carrier exists for permit no outbound TCP at all except
+through a squid-style HTTP proxy, and only to approved destinations. The carrier
+reaches such a proxy with `CONNECT`, which `http.Transport` issues only for a TLS
+target -- so **a proxied carrier must be `wss://`**. A `ws://` endpoint with a
+proxy configured is rejected up front rather than left to fail when the proxy
+declines to relay the `Upgrade`.
+
+| Knob | Meaning |
+|---|---|
+| `CCB_CARRIER_PROXY` | Proxy URL (`http://squid.site:3128`, or the bare `squid.site:3128`). Unset honours `HTTPS_PROXY` / `NO_PROXY`; the literal `none` forces a direct dial. |
+| `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | File holding one `user:password` line, for a proxy with `proxy_auth REQUIRED`. Re-read per dial so a rotated credential is picked up; refused if world-readable. |
+
+**The configuration wins over the environment.** A set `CCB_CARRIER_PROXY`
+overrides a site `https_proxy`, and `CCB_CARRIER_PROXY = none` overrides it with
+a direct dial — which is the only way to opt out of a site proxy without editing
+the daemon's environment. The environment is consulted only when the knob is
+unset, and is re-read per dial rather than cached for the life of the process.
+Both knobs take the usual `CCB.` / `<local-name>.` prefixes.
+
+Note that every other `*PROXY*` setting in HTCondor names an X.509 credential.
+These two are an HTTP forward proxy, and nothing else in the pool reads them.
+
+Startup logs which of the two the setting came from
+(`"CCB carrier proxy configuration" source=...`), because an operator reading a
+log otherwise cannot tell a deliberate override from a site environment leaking
+in, and those are corrected in different files.
+
+Two deployment constraints are worth knowing before the first attempt, because
+both present as an unexplained dial failure:
+
+- A stock `squid.conf` carries `http_access deny CONNECT !SSL_ports` with
+  `acl SSL_ports port 443`, so **the outside CCB's carrier must listen on 443**
+  (its CEDAR port for the pool is separate and unaffected).
+- A proxy that intercepts TLS replaces the carrier's server certificate with one
+  from the site CA, so `CCB_CARRIER_CA_FILE` must carry that CA. Note that an
+  intercepting proxy also sees the bearer token in the upgrade request, so such a
+  deployment wants a short-lived, audience-scoped token rather than a long-lived
+  pool IDTOKEN.
+
+The route taken is logged with the carrier session (`route="via
+http://squid.site:3128"` or `route=direct`) and repeated in any dial error. A
+carrier that silently ignored a configured proxy and went direct is otherwise
+indistinguishable from a working one -- until it runs on a node that really has
+no route out.
+
+### 3.2 Health check
+
+A carrier dial crosses four things a site's network policy can break
+independently, and "dial failed" distinguishes none of them. `Server.CheckCarrier`
+walks them in order and reports each separately:
+
+| Stage | What a failure means |
+|---|---|
+| `tcp-reachable` | the proxy (or, direct, the endpoint) cannot be reached at all |
+| `proxy-connect` | the proxy refuses to tunnel here: destination ACL, port policy (403), or required authentication (407) |
+| `tls` | the handshake failed; the reported issuer tells an intercepting proxy apart from a misconfiguration |
+| `websocket-upgrade` | the far broker rejected the bearer token |
+| `far-broker-cedar` | the far end answered but is not the expected broker, or the two disagree on credentials |
+
+The last stage is the one no amount of WebSocket success implies: it runs a CEDAR
+handshake to the broker at the far end. A peer that completes the handshake and
+then reports it has no `DC_NOP` handler counts as a pass -- identity and policy
+are what the stage checks.
+
+The broker runs the check at startup, before reporting itself ready, and logs
+the report; it is never fatal, since the proxy may be transiently down and the
+broker retries anyway. What protects an EP meanwhile is that an inside CCB
+refuses to register one until it is tunnel-ready, rather than handing out an
+address the pool cannot reach. `golang-ccb -carrier-check` prints the same
+per-stage report and exits non-zero, as a diagnostic to run by hand.
 
 ---
 

@@ -1,0 +1,83 @@
+# The worker node's isolation is structural, not configured: `hpc` is declared
+# internal, so the `ep` service has no gateway and no DNS for anything off it.
+# The proxy is the only container on both networks, and therefore the only way
+# out. A test that merely set a proxy variable while a direct route still worked
+# would pass without proving anything, which is why this is expressed in the
+# topology rather than in configuration.
+
+name: ccb-squid-e2e
+
+networks:
+  # The pool's side: the broker, its carrier endpoint, and the proxy's exit.
+  pub:
+    ipam:
+      config:
+        - subnet: 172.31.200.0/24
+  # The HPC site's node network. No gateway.
+  hpc:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.201.0/24
+
+volumes:
+  # TLS and token material, published by `offsite` and read by `ep`.
+  shared:
+  # squid's access log: the independent witness that traffic went THROUGH the
+  # proxy rather than around it.
+  squidlogs:
+
+services:
+  offsite:
+    build:
+      context: ../..
+      dockerfile: test/e2e-squid/Dockerfile
+    command: ["offsite"]
+    # Not root: golang-ccb refuses to run privileged. The sysctl is what lets a
+    # non-root process bind 443, which a stock squid requires of the carrier.
+    user: "10000:10000"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    environment:
+      OFFSITE_SUBNET: 172.31.200.0/24
+    networks:
+      pub:
+        aliases:
+          # The name the carrier is reached by, and the name on its certificate.
+          # Resolvable here and at the proxy; deliberately NOT on the hpc side.
+          - ccb.offsite.test
+    volumes:
+      - shared:/shared
+
+  squid:
+    build:
+      context: ../..
+      dockerfile: test/e2e-squid/Dockerfile.squid
+    networks:
+      - pub
+      - hpc
+    volumes:
+      - squidlogs:/var/log/squid
+    depends_on:
+      - offsite
+
+  ep:
+    build:
+      context: ../..
+      dockerfile: test/e2e-squid/Dockerfile
+    command: ["harness"]
+    # Same account: the harness execs golang-ccb, which would refuse as root.
+    user: "10000:10000"
+    environment:
+      CARRIER_URL: wss://ccb.offsite.test/ccb/tunnel
+      PROXY_URL: http://squid:3128
+      OUTSIDE_PUBLIC: ccb.offsite.test:9618
+      TARGET_ADDR: ccb.offsite.test:9700
+      SQUID_LOG: /squidlogs/access.log
+    networks:
+      - hpc
+    volumes:
+      - shared:/shared
+      - squidlogs:/squidlogs:ro
+    depends_on:
+      - squid
