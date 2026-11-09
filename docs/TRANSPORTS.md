@@ -131,7 +131,64 @@ not a requirement.
 
 Config knobs on the CCB `Config`: `CarrierListen` (`wss://…`), `CarrierTLS`,
 `CarrierTokenVerify` (server); `CarrierClientTLS`, `CarrierToken` /
-`CarrierTokenSource` (client).
+`CarrierTokenSource`, `CarrierProxy` (client).
+
+### 3.1 Through an HTTP proxy
+
+Many of the sites this carrier exists for permit no outbound TCP at all except
+through a squid-style HTTP proxy, and only to approved destinations. The carrier
+reaches such a proxy with `CONNECT`, which `http.Transport` issues only for a TLS
+target -- so **a proxied carrier must be `wss://`**. A `ws://` endpoint with a
+proxy configured is rejected up front rather than left to fail when the proxy
+declines to relay the `Upgrade`.
+
+| Knob | Meaning |
+|---|---|
+| `CCB_CARRIER_PROXY` | Proxy URL (`http://squid.site:3128`). Unset honours `HTTPS_PROXY` / `NO_PROXY`; the literal `none` forces a direct dial. |
+| `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | File holding one `user:password` line, for a proxy with `proxy_auth REQUIRED`. Re-read per dial so a rotated credential is picked up; refused if world-readable. |
+
+Two deployment constraints are worth knowing before the first attempt, because
+both present as an unexplained dial failure:
+
+- A stock `squid.conf` carries `http_access deny CONNECT !SSL_ports` with
+  `acl SSL_ports port 443`, so **the outside CCB's carrier must listen on 443**
+  (its CEDAR port for the pool is separate and unaffected).
+- A proxy that intercepts TLS replaces the carrier's server certificate with one
+  from the site CA, so `CCB_CARRIER_CA_FILE` must carry that CA. Note that an
+  intercepting proxy also sees the bearer token in the upgrade request, so such a
+  deployment wants a short-lived, audience-scoped token rather than a long-lived
+  pool IDTOKEN.
+
+The route taken is logged with the carrier session (`route="via
+http://squid.site:3128"` or `route=direct`) and repeated in any dial error. A
+carrier that silently ignored a configured proxy and went direct is otherwise
+indistinguishable from a working one -- until it runs on a node that really has
+no route out.
+
+### 3.2 Health check
+
+A carrier dial crosses four things a site's network policy can break
+independently, and "dial failed" distinguishes none of them. `Server.CheckCarrier`
+walks them in order and reports each separately:
+
+| Stage | What a failure means |
+|---|---|
+| `tcp-reachable` | the proxy (or, direct, the endpoint) cannot be reached at all |
+| `proxy-connect` | the proxy refuses to tunnel here: destination ACL, port policy (403), or required authentication (407) |
+| `tls` | the handshake failed; the reported issuer tells an intercepting proxy apart from a misconfiguration |
+| `websocket-upgrade` | the far broker rejected the bearer token |
+| `far-broker-cedar` | the far end answered but is not the expected broker, or the two disagree on credentials |
+
+The last stage is the one no amount of WebSocket success implies: it runs a CEDAR
+handshake to the broker at the far end. A peer that completes the handshake and
+then reports it has no `DC_NOP` handler counts as a pass -- identity and policy
+are what the stage checks.
+
+The daemon runs the check at startup and logs the report; it is never fatal,
+since the proxy may be transiently down and the broker retries anyway. A pilot
+that wants a hard gate before starting `condor_master` runs
+`golang-ccb -carrier-check`, which prints the per-stage report and exits non-zero
+on the first failure.
 
 ---
 
