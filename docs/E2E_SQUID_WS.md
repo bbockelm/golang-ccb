@@ -338,8 +338,9 @@ developer's machine the direct dial simply works.
 
 This tier proves the protocol; it cannot prove the deployment.
 
-**Tier 2 — real squid, real pool (`test/e2e-squid/`, docker compose), minutes,
-nightly or on a label. Not yet built.** The §3 topology with an unmodified squid package, a
+**Tier 2 — real squid (`test/e2e-squid/`, docker compose), minutes, nightly or
+on the `squid-e2e` label. Built; see that directory's README.** The pool and the
+job are not in it yet, so it covers the network story and not §5.F. The §3 topology with an unmodified squid package, a
 real HTCondor pool offsite, a real job, and §6's controls. This is the tier that
 catches `SSL_ports`, idle timeouts, proxy auth and DNS — the things that
 actually decide whether a site deployment works, and none of which tier 1 can
@@ -377,15 +378,21 @@ token. The only new information is their squid's ACLs and whether it bumps TLS.
 
 §2 and tiers 0-1 are done. What is left:
 
-1. Tier 2 — the compose topology, starting with §6.1 (prove the isolation)
-   before anything else, then §5.A-C, then the job. Nothing below it is
-   meaningful until the EP container demonstrably has no route out.
-2. §5.G/H — idle survival past squid's timeout, and recovery after the proxy
-   restarts. These are the two that decide whether a pilot survives a night, and
-   neither can be tested without a real proxy.
-3. §6.3-§6.4 against a real `squid.conf` — the port and destination ACLs. The
-   health check already classifies both refusals (§2.6); tier 2 is what proves
-   the classification matches what squid actually sends.
+1. §5.F — a real HTCondor pool and a real job inside the compose topology. The
+   network story is covered; what is not is a shadow and a starter talking
+   through the tunnel under `SEC_DEFAULT_ENCRYPTION = REQUIRED`, which is the
+   assertion a site will actually ask for.
+2. §5.G/H — idle survival past squid's `read_timeout`, and recovery after the
+   proxy restarts. These are the two that decide whether a pilot survives a
+   night, and neither can be tested without a real proxy. The topology now has
+   one, so both are reachable; `read_timeout` is already set to one minute in
+   `test/e2e-squid/squid.conf` so an idle test has something to survive.
+3. A `proxy_auth` variant and a TLS-intercepting (`ssl_bump`) variant. The
+   health check classifies both refusals already (§2.6); only a real squid can
+   confirm the classification matches what it sends.
+
+Done: §6.1-§6.4 against a real `squid.conf`, including that the advice names the
+`SSL_ports` rule when a carrier is put on 9618.
 
 ### A defect found on the way, not fixed here
 
