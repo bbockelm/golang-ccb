@@ -35,6 +35,22 @@ The outbound proxy refuses loopback, link-local and unspecified targets, checked
 on the resolved address. `CCB_DIAL_REFUSE_LOCAL_ADDRESSES = true` (default
 false) applies the same refusal to the reverse connects an inside CCB makes to
 requester-supplied addresses (`Config.DialControl` in the library).
+## Execution points with no outbound network
+
+Worker nodes that cannot open outbound TCP — or may open only one or two sockets
+— can still join a pool, by pairing a broker on the node with a broker beside
+the pool and tunneling everything between them over a single connection. Where
+the site runs an HTTP proxy, that connection is a `wss://` tunnel through it;
+where it runs no network path at all, a shared filesystem will do.
+
+**Administrators start here: [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md)**
+— what to ask the site for, the configuration for both brokers and the execution
+point, how to verify it with `golang-ccb -carrier-check`, and what each failure
+means.
+
+- [docs/TRANSPORTS.md](docs/TRANSPORTS.md) — how the carriers work, and the
+  filesystem carrier.
+- [docs/E2E_SQUID_WS.md](docs/E2E_SQUID_WS.md) — how it is tested (developers).
 
 ## Protocol
 

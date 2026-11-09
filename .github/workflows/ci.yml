@@ -4,7 +4,14 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+    # No base-branch filter: a PR stacked on another branch needs CI as much as
+    # one targeting main, and filtering on main silently gave stacked PRs no
+    # checks at all.
+  schedule:
+    # Nightly, for the container tier: it needs a real proxy and real
+    # containers, which is too slow to put in front of every push.
+    - cron: '27 5 * * *'
+  workflow_dispatch:
 
 jobs:
   test:
@@ -104,3 +111,50 @@ jobs:
 
     - name: Build the golang-ccb binary
       run: go build -v -o golang-ccb ./cmd/golang-ccb
+
+  squid-e2e:
+    name: Squid end-to-end
+    runs-on: ubuntu-latest
+    # The fast tiers run on every push and cover the protocol. This one stands up
+    # containers and a real proxy, so it runs where it earns its minutes: when the
+    # carrier or its tests change, nightly, and on request.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.labels.*.name, 'squid-e2e')
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Run the tunneled-EP suite against a real squid
+      working-directory: test/e2e-squid
+      # --exit-code-from makes the harness container's status the job's status,
+      # and tears the rest down when it finishes either way.
+      run: |
+        docker compose up --build \
+          --abort-on-container-exit \
+          --exit-code-from ep
+
+    - name: Proxy and broker logs
+      if: always()
+      working-directory: test/e2e-squid
+      # On a failure the harness's own output says which assertion went, but not
+      # why; squid's access log and the brokers' logs are where the answer is.
+      run: |
+        echo "::group::squid"
+        docker compose logs --no-color squid || true
+        echo "::endgroup::"
+        echo "::group::offsite broker"
+        docker compose logs --no-color offsite || true
+        echo "::endgroup::"
+        echo "::group::squid access.log"
+        docker compose run --rm --no-deps --entrypoint cat ep /squidlogs/access.log || true
+        echo "::endgroup::"
+
+    - name: Tear down
+      if: always()
+      working-directory: test/e2e-squid
+      run: docker compose down -v --remove-orphans || true

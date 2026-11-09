@@ -3,20 +3,15 @@ package wscarrier
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/bbockelm/golang-ccb/internal/proxytest"
 	"github.com/bbockelm/golang-ccb/transport/carrier"
 )
 
@@ -209,30 +204,5 @@ func TestWSCarrierMux(t *testing.T) {
 // 127.0.0.1) and a client tls.Config that trusts it.
 func selfSignedTLS(t *testing.T) (server, client *tls.Config) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "127.0.0.1"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IsCA:         true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	pool.AddCert(leaf)
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, &tls.Config{RootCAs: pool}
+	return proxytest.SelfSignedTLS(t)
 }
