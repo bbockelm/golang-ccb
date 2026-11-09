@@ -1,0 +1,14 @@
+# A stock Debian squid with our configuration. Built here rather than pulled so
+# the proxy under test is a known, reproducible package rather than whatever a
+# third-party image tag points at this week.
+FROM debian:12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends squid \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY test/e2e-squid/squid.conf /etc/squid/squid.conf
+
+EXPOSE 3128
+# -N foreground, -d1 log to stderr as well, so `docker compose logs squid` is useful.
+CMD ["squid", "-N", "-d1", "-f", "/etc/squid/squid.conf"]
