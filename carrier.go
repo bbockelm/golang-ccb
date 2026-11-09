@@ -69,11 +69,12 @@ type carrierClient struct {
 	log *slog.Logger
 
 	// WebSocket dial parameters (scheme "ws"); unused for "fs".
-	token       string
-	tokenSource func(ctx context.Context) (string, error)
-	clientTLS   *tls.Config
-	proxy       func(*http.Request) (*url.URL, error)
-	keepalive   time.Duration
+	token           string
+	tokenSource     func(ctx context.Context) (string, error)
+	clientTLS       *tls.Config
+	unauthenticated bool
+	proxy           func(*http.Request) (*url.URL, error)
+	keepalive       time.Duration
 
 	mu   sync.Mutex
 	md   *carrier.MuxDialer
@@ -82,13 +83,14 @@ type carrierClient struct {
 
 func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) *carrierClient {
 	return &carrierClient{
-		ref:         ref,
-		log:         log,
-		token:       cfg.CarrierToken,
-		tokenSource: cfg.CarrierTokenSource,
-		clientTLS:   cfg.CarrierClientTLS,
-		proxy:       cfg.CarrierProxy,
-		keepalive:   cfg.CarrierKeepalive,
+		ref:             ref,
+		log:             log,
+		token:           cfg.CarrierToken,
+		tokenSource:     cfg.CarrierTokenSource,
+		clientTLS:       cfg.CarrierClientTLS,
+		unauthenticated: cfg.CarrierUnauthenticated,
+		proxy:           cfg.CarrierProxy,
+		keepalive:       cfg.CarrierKeepalive,
 	}
 }
 
@@ -108,11 +110,12 @@ func (c *carrierClient) dialPipe(ctx context.Context) (net.Conn, error) {
 // so the dial and the route reported in logs cannot drift apart.
 func (c *carrierClient) wsDialConfig() wscarrier.DialConfig {
 	return wscarrier.DialConfig{
-		URL:         c.ref.url,
-		Token:       c.token,
-		TokenSource: c.tokenSource,
-		TLS:         c.clientTLS,
-		Proxy:       c.proxy,
+		URL:             c.ref.url,
+		Token:           c.token,
+		TokenSource:     c.tokenSource,
+		TLS:             c.clientTLS,
+		Proxy:           c.proxy,
+		Unauthenticated: c.unauthenticated,
 	}
 }
 
@@ -234,7 +237,7 @@ func (s *Server) startCarrierListener(ctx context.Context) {
 		s.log.Error("failed to start carrier listener", "carrier", s.cfg.CarrierListen, "error", err)
 		return
 	}
-	ml := carrier.NewMuxListener(inner)
+	ml := carrier.NewMuxListener(inner, carrier.WithFirstStreamTimeout(s.pipeProbation()))
 	go func() {
 		<-ctx.Done()
 		_ = ml.Close()
@@ -253,8 +256,8 @@ func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
 	case "fs":
 		return fstun.Listen(ref.fstunConfig())
 	case "ws":
-		if s.cfg.CarrierTokenVerify == nil {
-			return nil, fmt.Errorf("ccbserver: a WebSocket CarrierListen requires CarrierTokenVerify")
+		if s.cfg.CarrierTokenVerify == nil && !s.cfg.CarrierUnauthenticated {
+			return nil, fmt.Errorf("ccbserver: a WebSocket CarrierListen requires CarrierTokenVerify (or CarrierUnauthenticated)")
 		}
 		u, err := url.Parse(ref.url)
 		if err != nil {
@@ -263,13 +266,32 @@ func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
 		if ref.tls && s.cfg.CarrierTLS == nil {
 			return nil, fmt.Errorf("ccbserver: a wss:// CarrierListen requires CarrierTLS")
 		}
+		verify := s.cfg.CarrierTokenVerify
+		if s.cfg.CarrierUnauthenticated {
+			verify = nil // the knob wins over a verifier the daemon also built
+		}
 		return wscarrier.Listen(wscarrier.ListenConfig{
-			Addr:   u.Host,
-			Path:   u.Path,
-			TLS:    s.cfg.CarrierTLS,
-			Verify: s.cfg.CarrierTokenVerify,
+			Addr:                 u.Host,
+			Path:                 u.Path,
+			TLS:                  s.cfg.CarrierTLS,
+			Verify:               verify,
+			AllowUnauthenticated: s.cfg.CarrierUnauthenticated,
+			MaxSessions:          s.cfg.CarrierMaxSessions,
+			MaxPerSource:         s.cfg.CarrierMaxPerSource,
 		})
 	default:
 		return nil, fmt.Errorf("ccbserver: unknown carrier scheme %q", ref.scheme)
 	}
+}
+
+// pipeProbation resolves how long an accepted carrier pipe may sit without
+// opening a logical connection. A negative value disables the check.
+func (s *Server) pipeProbation() time.Duration {
+	if s.cfg.CarrierPipeProbationOff {
+		return -1
+	}
+	if s.cfg.CarrierPipeProbation > 0 {
+		return s.cfg.CarrierPipeProbation
+	}
+	return carrier.DefaultFirstStreamTimeout
 }

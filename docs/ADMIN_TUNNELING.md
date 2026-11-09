@@ -365,14 +365,51 @@ it.
 hostname and an encrypted stream. Nothing else.
 
 **If the proxy intercepts TLS.** The connection terminates at the proxy and is
-re-encrypted, so the proxy sees the WebSocket handshake — including the bearer
-token presented there. CEDAR traffic inside remains unreadable, but the token is
-exposed. Where a site bumps TLS:
+re-encrypted, so the proxy sees the WebSocket handshake. If that handshake
+carries a bearer token, the proxy now holds a reusable pool credential. Where a
+site bumps TLS:
 
 - add the site CA to `CCB_CARRIER_CA_FILE`, or the broker will correctly refuse
   to connect, and
-- issue the glidein a short-lived, audience-scoped SciToken rather than a
-  long-lived pool IDTOKEN.
+- set `CCB_CARRIER_AUTH = none` on the outside broker and on every inside
+  broker, so the upgrade carries no credential at all.
+
+With `CCB_CARRIER_AUTH = none` the glidein's broker is still authenticated —
+just later, and without exposing anything. CEDAR authenticates it on its first
+command (`CCB_REGISTER`, at `DAEMON`) by proof of possession: the handshake puts
+only the token's header and payload on the wire and keeps its signature as a
+shared secret, so a proxy that reads the whole exchange cannot replay it. That
+was always the identity your `ALLOW_DAEMON` policy acted on; the token on the
+upgrade was never consulted for authorization.
+
+Two things to check when you turn it on:
+
+- **`ALLOW_DAEMON` must admit the glidein by identity.** A carrier peer has no
+  network address, so host and netblock entries never match it — if your policy
+  is purely host-based, carrier registrations were already failing. Add the pool
+  identity, e.g. `ALLOW_DAEMON = $(ALLOW_DAEMON), condor_pool@$(UID_DOMAIN)`.
+- **`CCB_OUTBOUND_TARGET_ALLOWLIST` is now the only gate on where a tunnel can
+  reach.** It always was the one that mattered. Set it to your pool and nothing
+  more.
+
+The upgrade endpoint is open in this mode, so it carries its own limits:
+`CCB_CARRIER_MAX_SESSIONS` (default 1024 — one per glidein broker, so raise it
+if you tunnel more nodes than that through one broker),
+`CCB_CARRIER_PIPE_PROBATION` (default 60s — drops a connection that never
+registers; `0` disables it), and `CCB_CARRIER_MAX_PER_SOURCE` (default off:
+behind an intercepting proxy every glidein arrives from the proxy's address, so
+this limit would fall on the one source that must not be limited).
+
+Expect a different symptom from a bad credential. It used to fail the dial with
+`unauthorized`; now the carrier comes up and registration never completes, so
+`CCB_TUNNEL_READY_FILE` never appears and the startup barrier waits out
+`CCB_CARRIER_READY_TIMEOUT`. Look for the authentication or authorization
+failure in the **outside** broker's log.
+
+What this does not change is what an intercepting proxy can do *to* the
+connection: it sits in the path and can slow, drop or deny the tunnel whenever
+it likes. No credential arrangement prevents that — the broker's reconnect
+handling is what limits the damage.
 
 **The outbound allow-list.** `CCB_OUTBOUND_TARGET_ALLOWLIST` on the outside
 broker is what stops a tunnel being a general-purpose route into your network.
@@ -390,6 +427,10 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_TLS_CERT` / `CCB_CARRIER_TLS_KEY` | the certificate for that endpoint |
 | `CCB_OUTBOUND_PROXY` | enable relaying tunneled nodes' outbound connections |
 | `CCB_OUTBOUND_TARGET_ALLOWLIST` | what those connections may reach — deny by default |
+| `CCB_CARRIER_AUTH` | `token` (default) or `none` — whether the upgrade carries a bearer token. Must match on both ends |
+| `CCB_CARRIER_MAX_SESSIONS` | concurrent tunnels, one per glidein broker (1024) |
+| `CCB_CARRIER_MAX_PER_SOURCE` | concurrent tunnels from one address (0 = off; leave off behind a proxy) |
+| `CCB_CARRIER_PIPE_PROBATION` | seconds a tunnel may sit without registering (60; `0` disables) |
 
 ### Inside broker
 
@@ -400,6 +441,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | `user:password`, mode 600 |
 | `CCB_CARRIER_CA_FILE` | CA for the broker's certificate |
 | `CCB_CARRIER_TOKEN` | bearer token, if not discovered automatically |
+| `CCB_CARRIER_AUTH` | `token` (default) or `none` — whether the upgrade carries a bearer token. Must match on both ends |
 | `CCB_CARRIER_KEEPALIVE` | seconds between keepalives on an idle carrier (30). Must be below the proxy's idle timeout |
 | `CCB_CARRIER_READY_TIMEOUT` | seconds to wait for the tunnel before reporting ready (120) |
 | `CCB_TUNNEL_READY_FILE` | written once registered; a barrier for wrappers outside the master |

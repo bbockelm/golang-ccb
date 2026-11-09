@@ -137,10 +137,40 @@ type Config struct {
 	CarrierTLS *tls.Config
 
 	// CarrierTokenVerify validates an inside CCB's bearer token for a WebSocket
-	// CarrierListen and returns an identity for logging. Required for ws/wss.
-	// BearerTokenVerifier, IDTokenVerifier and SciTokenVerifier build one from
-	// a SecurityConfig.
+	// CarrierListen and returns an identity for logging. Required for ws/wss
+	// unless CarrierUnauthenticated is set. BearerTokenVerifier, IDTokenVerifier
+	// and SciTokenVerifier build one from a SecurityConfig.
 	CarrierTokenVerify func(ctx context.Context, token string) (identity string, err error)
+
+	// CarrierUnauthenticated serves (and dials) a WebSocket carrier with no
+	// bearer token.
+	//
+	// A token in the upgrade header is read by any TLS-intercepting proxy on
+	// the path, handing it a reusable pool credential. It buys nothing in
+	// return: the identity it proves is discarded, and the CEDAR handshake on
+	// the first command proves the same identity by possession -- without
+	// putting the credential on the wire -- and is what every authorization
+	// decision actually consults. Default false, so existing deployments are
+	// unaffected.
+	CarrierUnauthenticated bool
+
+	// CarrierMaxSessions caps concurrently-held WebSocket carrier pipes (one per
+	// inside CCB). <= 0 ⇒ wscarrier.DefaultMaxSessions.
+	CarrierMaxSessions int
+
+	// CarrierMaxPerSource caps concurrent carrier pipes from one peer address.
+	// 0 disables it, the default: where a site intercepts TLS every node
+	// arrives from the proxy's one address, so this limit would fall on the
+	// source that must not be limited.
+	CarrierMaxPerSource int
+
+	// CarrierPipeProbation closes a carrier pipe that opens no logical
+	// connection within the interval. <= 0 ⇒ carrier.DefaultFirstStreamTimeout;
+	// negative via CarrierPipeProbationOff disables it.
+	CarrierPipeProbation time.Duration
+
+	// CarrierPipeProbationOff disables the probation timer outright.
+	CarrierPipeProbationOff bool
 
 	// CarrierClientTLS is the client TLS config used when THIS (inside) CCB dials
 	// a wss:// upstream/next-hop (CA roots, etc.).

@@ -285,6 +285,11 @@ func run() error {
 		CarrierListen:           cc.listen,
 		CarrierTLS:              cc.tls,
 		CarrierTokenVerify:      cc.verify,
+		CarrierUnauthenticated:  cc.unauthenticated,
+		CarrierMaxSessions:      cc.maxSessions,
+		CarrierMaxPerSource:     cc.maxPerSource,
+		CarrierPipeProbation:    cc.probation,
+		CarrierPipeProbationOff: cc.probationOff,
 		CarrierClientTLS:        cc.clientTLS,
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
@@ -315,8 +320,20 @@ func run() error {
 // environment leaking in, and those are corrected in different files.
 func logCarrierSettings(log *logging.Logger, cc carrierSettings) {
 	if isWSCarrier(cc.listen) {
-		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
+		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled",
+			"carrier", cc.listen, "upgrade_auth", carrierAuthName(cc.unauthenticated))
+		if cc.unauthenticated {
+			// The upgrade is open, so the broker is only as safe as its ALLOW_
+			// policy -- which over a carrier cannot use host terms at all: a
+			// WebSocket peer reports no network address, so host-only rules match
+			// nothing and refuse every registration.
+			log.Info(logging.DestinationGeneral,
+				"carrier upgrades accept no bearer token; peers are authenticated by the CEDAR handshake on their first command",
+				"note", "carrier peers have no network address, so host-based ALLOW_DAEMON entries never match them -- an identity-based entry is required")
+		}
 	}
+	// Not inside the check above: an inside broker dials a carrier without
+	// serving one, and the proxy it dials through is what it most needs logged.
 	if cc.proxySource != "" {
 		log.Info(logging.DestinationGeneral, "CCB carrier proxy configuration", "source", cc.proxySource)
 	}
@@ -528,8 +545,15 @@ type carrierSettings struct {
 	proxySource string
 	keepalive   time.Duration
 	// sciTokens is the SciToken map file behind verify, reloaded on reconfig;
-	// nil when there is no ws/wss listener.
+	// nil when there is no ws/wss listener or the carrier is unauthenticated.
 	sciTokens *sciTokenMap
+	// unauthenticated is CCB_CARRIER_AUTH = none: no bearer credential on the
+	// upgrade, in either direction.
+	unauthenticated bool
+	maxSessions     int
+	maxPerSource    int
+	probation       time.Duration
+	probationOff    bool
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -538,8 +562,33 @@ type carrierSettings struct {
 func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig, log *slog.Logger) (carrierSettings, error) {
 	var cc carrierSettings
 	cc.listen, _ = cfg.Get("CCB_CARRIER_LISTEN")
+	cc.maxSessions = configInt(cfg, "CCB_CARRIER_MAX_SESSIONS", 0)
+	cc.maxPerSource = configInt(cfg, "CCB_CARRIER_MAX_PER_SOURCE", 0)
+	// An explicit 0 turns probation off; leaving the knob unset keeps the
+	// default. The two have to be told apart, so read presence as well as value.
+	if v, ok := cfg.Get("CCB_CARRIER_PIPE_PROBATION"); ok && strings.TrimSpace(v) != "" {
+		secs := configInt(cfg, "CCB_CARRIER_PIPE_PROBATION", -1)
+		if secs <= 0 {
+			cc.probationOff = true
+		} else {
+			cc.probation = time.Duration(secs) * time.Second
+		}
+	}
 
-	if isWSCarrier(cc.listen) {
+	// CCB_CARRIER_AUTH selects the carrier's upgrade credential. "none" sends
+	// and expects none: a token in the upgrade header is plaintext to any
+	// TLS-intercepting proxy on the path, and the CEDAR handshake that follows
+	// establishes the same identity without exposing a credential. Default
+	// "token" keeps existing deployments as they are.
+	switch v := strings.ToLower(strings.TrimSpace(configString(cfg, "CCB_CARRIER_AUTH", "token"))); v {
+	case "token":
+	case "none":
+		cc.unauthenticated = true
+	default:
+		return cc, fmt.Errorf("CCB_CARRIER_AUTH must be \"token\" or \"none\", not %q", v)
+	}
+
+	if isWSCarrier(cc.listen) && !cc.unauthenticated {
 		// Verify inside CCBs' bearer tokens: an HTCondor IDTOKEN (against our pool
 		// signing key) or a SciToken mapped by CERTIFICATE_MAPFILE's SCITOKENS
 		// lines. The SciToken settings go on a copy so the CEDAR command policy
@@ -547,6 +596,8 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 		csec := *sec
 		cc.sciTokens = applySciTokensConfig(cfg, &csec, log)
 		cc.verify = ccbserver.BearerTokenVerifier(&csec)
+	}
+	if isWSCarrier(cc.listen) {
 		if strings.HasPrefix(cc.listen, "wss://") {
 			certFile, _ := cfg.Get("CCB_CARRIER_TLS_CERT")
 			keyFile, _ := cfg.Get("CCB_CARRIER_TLS_KEY")
@@ -563,7 +614,10 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 
 	// Client side: token + CA for dialing a ws/wss upstream or next hop.
 	if isWSCarrier(outboundNextHop) || (upstream != nil && isWSCarrier(upstream.BrokerAddr)) {
-		if tok, ok := cfg.Get("CCB_CARRIER_TOKEN"); ok && tok != "" {
+		if cc.unauthenticated {
+			// Deliberately no discovery: a node with no token still dials, and
+			// nothing reaches a proxy on the path.
+		} else if tok, ok := cfg.Get("CCB_CARRIER_TOKEN"); ok && tok != "" {
 			cc.token = tok
 		} else {
 			cc.tokenSource = ccbserver.DiscoverBearerToken
@@ -725,4 +779,34 @@ func configBool(cfg interface{ Get(string) (string, bool) }, key string, def boo
 		return false
 	}
 	return def
+}
+
+// configString reads a string knob, returning def if unset or empty.
+func configString(cfg interface{ Get(string) (string, bool) }, key, def string) string {
+	v, ok := cfg.Get(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def
+	}
+	return strings.TrimSpace(v)
+}
+
+// configInt reads an integer knob, returning def if unset or unparseable.
+func configInt(cfg interface{ Get(string) (string, bool) }, key string, def int) int {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// carrierAuthName renders the resolved CCB_CARRIER_AUTH value for logging.
+func carrierAuthName(unauthenticated bool) string {
+	if unauthenticated {
+		return "none"
+	}
+	return "token"
 }
