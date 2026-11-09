@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,6 +91,10 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The authorizer runs on the broker's accept goroutine while the test body
+	// reads the result, so this needs a lock -- the race detector catches it in
+	// CI even though a local run without -race does not.
+	var askedMu sync.Mutex
 	var asked []string
 	outsideSrv, err := New(Config{
 		PublicAddress:          outLn.Addr().String(),
@@ -99,7 +104,9 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 		CarrierUnauthenticated: true,
 		// Refuse everything, as a policy with no matching entry does.
 		Authorizer: func(perm, peerAddr, _ string) bool {
+			askedMu.Lock()
 			asked = append(asked, perm+" from "+peerAddr)
+			askedMu.Unlock()
 			return false
 		},
 	})
@@ -139,7 +146,10 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 	if err := insideSrv.WaitTunnelReady(rctx); err == nil {
 		t.Fatal("registration succeeded through a deny-all authorizer; the carrier bypassed authorization")
 	}
-	if len(asked) == 0 {
+	askedMu.Lock()
+	consulted := len(asked)
+	askedMu.Unlock()
+	if consulted == 0 {
 		t.Fatal("the authorizer was never consulted for a carrier connection")
 	}
 }
