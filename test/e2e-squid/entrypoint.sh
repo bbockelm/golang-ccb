@@ -29,7 +29,10 @@ SEC_TOKEN_POOL_SIGNING_KEY_FILE = /shared/passwords.d/POOL
 
 # Exit for tunneled nodes' outbound connections, bounded to the offsite network.
 CCB_OUTBOUND_PROXY = TRUE
-CCB_OUTBOUND_TARGET_ALLOWLIST = ${OFFSITE_SUBNET:-172.31.200.0/24}
+# Both forms, because the allow-list matches the target host AS WRITTEN: a
+# CIDR entry cannot cover a target named by hostname, and the tunneled node
+# dials ccb.offsite.test by name.
+CCB_OUTBOUND_TARGET_ALLOWLIST = ${OFFSITE_SUBNET:-172.31.200.0/24}, ccb.offsite.test
 CFG
 
     # A CEDAR target the tunneled node reaches through the outbound chain.

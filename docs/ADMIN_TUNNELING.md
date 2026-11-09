@@ -147,6 +147,12 @@ CCB_OUTBOUND_TARGET_ALLOWLIST = 192.0.2.0/24
 `CCB_OUTBOUND_TARGET_ALLOWLIST` is deny-by-default and should name only your
 pool. Without it the tunnel would be an open proxy into your network.
 
+It matches the target **as the daemon wrote it**, and does not resolve names: a
+CIDR entry covers targets named by IP, and a target named by hostname needs a
+hostname entry (an exact name or a glob such as `*.example.org`). If your
+daemons advertise themselves by name, list both forms — a CIDR-only allow-list
+will refuse them, with `target host "…" not permitted` in `CcbLog`.
+
 Arriving tunnels are authenticated by bearer token: an HTCondor IDTOKEN verified
 against your pool signing key, or a SciToken verified against its issuer. No
 configuration is needed to enable this — it follows the pool's existing
