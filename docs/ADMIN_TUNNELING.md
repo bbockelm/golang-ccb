@@ -313,16 +313,23 @@ If you see more than one per inside broker, something is bypassing the tunnel.
 
 **Idle periods, and the one knob to get right.** A glidein can sit idle for
 hours, and a quiet carrier sends nothing of its own except a keepalive. That
-keepalive is therefore the only thing stopping the site proxy from reclaiming
-the tunnel as idle, so it has to be shorter than the shortest idle timeout on
-the path — squid's `read_timeout`, plus any load balancer in front of the
-broker. Ask the site for both numbers.
+keepalive is the only thing stopping something on the path from reclaiming the
+tunnel as idle.
 
 ```condor
-CCB_CARRIER_KEEPALIVE = 30
+CCB_CARRIER_KEEPALIVE = 20
 ```
 
-Seconds; 30 is the default. Lower it if the site's timeout is shorter.
+Seconds; 20 is the default. **Set it to no more than a third of the shortest
+idle timeout on the path**, so that one delayed ping does not lose the tunnel.
+
+squid itself is usually not the constraint — `read_timeout` defaults to 15
+minutes and its timer restarts on every read. What closes an idle tunnel is
+more often a NAT table, a firewall or a load balancer between the node and the
+broker, commonly at 60 seconds. Ask the site for every idle timeout on the path,
+not just the proxy's, and size the interval against the smallest. If anything on
+it is tighter than about a minute, set this explicitly: the default leaves no
+margin below roughly 60 seconds.
 
 **Set it too slow and nothing appears to break.** The proxy drops the tunnel,
 the broker rebuilds it on next use, and every connection still succeeds — so a
@@ -400,7 +407,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | `user:password`, mode 600 |
 | `CCB_CARRIER_CA_FILE` | CA for the broker's certificate |
 | `CCB_CARRIER_TOKEN` | bearer token, if not discovered automatically |
-| `CCB_CARRIER_KEEPALIVE` | seconds between keepalives on an idle carrier (30). Must be below the proxy's idle timeout |
+| `CCB_CARRIER_KEEPALIVE` | seconds between keepalives on an idle carrier (20). At most a third of the shortest idle timeout on the path |
 | `CCB_CARRIER_READY_TIMEOUT` | seconds to wait for the tunnel before reporting ready (120) |
 | `CCB_TUNNEL_READY_FILE` | written once registered; a barrier for wrappers outside the master |
 | `CCB_OUTBOUND_PROXY` | enable relaying the local daemons' outbound connections |
