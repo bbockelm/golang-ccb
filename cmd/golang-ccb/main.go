@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bbockelm/cedar/ccb"
@@ -62,7 +63,7 @@ func run() error {
 	// config lookups (CCB.<key> / <local-name>.<key> beat the bare key).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
-	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; intended as a pilot's startup gate.")
+	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; a diagnostic to run by hand when a node cannot reach its broker.")
 	flag.Parse()
 
 	// Did the operator explicitly set -listen? Only then do we bind it as an extra public
@@ -254,18 +255,21 @@ func run() error {
 	// this (outside) CCB accept inside CCBs over a filesystem ("fs:<dir>") or
 	// WebSocket ("ws://" / "wss://") carrier; a ws/wss Upstream/next-hop makes
 	// this (inside) CCB dial one.
-	cc, err := buildCarrierSettings(d.Config(), sec, outboundNextHop, upstream)
+	cc, err := buildCarrierSettings(d.Config(), sec, outboundNextHop, upstream, d.Slog())
 	if err != nil {
 		return err
 	}
-	if isWSCarrier(cc.listen) {
-		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
+	if cc.sciTokens != nil {
+		d.OnReconfig(cc.sciTokens.load)
 	}
-	if cc.proxySource != "" {
-		// Say where the proxy setting came from, not just what it is: an operator
-		// reading the log otherwise cannot tell a configured override from the
-		// site environment leaking in, and those are fixed in different files.
-		log.Info(logging.DestinationGeneral, "CCB carrier proxy configuration", "source", cc.proxySource)
+	logCarrierSettings(log, cc)
+
+	// CCB_DIAL_REFUSE_LOCAL_ADDRESSES refuses loopback and link-local
+	// destinations in the reverse connects a requester's address directs (the
+	// outbound proxy refuses them regardless).
+	var dialControl func(network, address string, c syscall.RawConn) error
+	if configBool(d.Config(), "CCB_DIAL_REFUSE_LOCAL_ADDRESSES", false) {
+		dialControl = ccbserver.RefuseLocalAddresses
 	}
 
 	srv, az, err := newBroker(d, ccbserver.Config{
@@ -285,6 +289,7 @@ func run() error {
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
 		CarrierProxy:            cc.proxy,
+		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
 	if err != nil {
@@ -301,6 +306,21 @@ func run() error {
 	return serveBroker(context.Background(), d, srv, az, lns...)
 }
 
+// logCarrierSettings records what the carrier was configured with, before
+// anything tries to use it.
+//
+// The proxy's SOURCE matters as much as its value: an operator reading a log
+// otherwise cannot tell a deliberate CCB_CARRIER_PROXY override from the site
+// environment leaking in, and those are corrected in different files.
+func logCarrierSettings(log *logging.Logger, cc carrierSettings) {
+	if isWSCarrier(cc.listen) {
+		log.Info(logging.DestinationGeneral, "CCB carrier listener enabled", "carrier", cc.listen)
+	}
+	if cc.proxySource != "" {
+		log.Info(logging.DestinationGeneral, "CCB carrier proxy configuration", "source", cc.proxySource)
+	}
+}
+
 // carrierCheckTimeout bounds the startup health check. It is generous because
 // every stage it walks is one a slow site proxy can legitimately take seconds on,
 // and the check is diagnostic -- a slow pass is still a pass.
@@ -312,7 +332,9 @@ const carrierCheckTimeout = 60 * time.Second
 // front, instead of appearing as a retry loop against an opaque dial failure.
 //
 // Never fatal: the proxy may be transiently down and the broker's own loops keep
-// retrying. A pilot that wants a hard gate runs -carrier-check instead.
+// retrying; a node whose tunnel is down refuses registrations rather than
+// handing out an address the pool cannot reach. Run -carrier-check by hand to
+// see the same report without starting a daemon.
 func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server, ctx context.Context) {
 	if !srv.HasCarrier() {
 		return
@@ -331,8 +353,9 @@ func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server, ctx context.Con
 }
 
 // runCarrierCheck implements -carrier-check: print the per-stage report to
-// stdout and exit non-zero on the first failure. A pilot gates on this before
-// starting condor_master, so the failure it reports is the one a human reads.
+// stdout and exit non-zero on the first failure. This is a diagnostic an
+// administrator runs on a node that cannot reach its broker, so the failure it
+// reports is the one a human reads.
 func runCarrierCheck(srv *ccbserver.Server) error {
 	if !srv.HasCarrier() {
 		return fmt.Errorf("-carrier-check: no carrier is configured (set CCB_OUTBOUND_NEXT_HOP or the upstream broker to a ws://, wss:// or fs: address)")
@@ -480,19 +503,26 @@ type carrierSettings struct {
 	tokenSource func(context.Context) (string, error)
 	proxy       func(*http.Request) (*url.URL, error)
 	proxySource string
+	// sciTokens is the SciToken map file behind verify, reloaded on reconfig;
+	// nil when there is no ws/wss listener.
+	sciTokens *sciTokenMap
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
 // (CCB_CARRIER_LISTEN + TLS + token verification for a ws/wss listener) and the
 // client side (bearer token + CA for dialing a ws/wss upstream or next hop).
-func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig) (carrierSettings, error) {
+func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig, log *slog.Logger) (carrierSettings, error) {
 	var cc carrierSettings
 	cc.listen, _ = cfg.Get("CCB_CARRIER_LISTEN")
 
 	if isWSCarrier(cc.listen) {
 		// Verify inside CCBs' bearer tokens: an HTCondor IDTOKEN (against our pool
-		// signing key) or a SciToken (against its issuer's JWKS).
-		cc.verify = ccbserver.BearerTokenVerifier(sec)
+		// signing key) or a SciToken mapped by CERTIFICATE_MAPFILE's SCITOKENS
+		// lines. The SciToken settings go on a copy so the CEDAR command policy
+		// in sec is unchanged.
+		csec := *sec
+		cc.sciTokens = applySciTokensConfig(cfg, &csec, log)
+		cc.verify = ccbserver.BearerTokenVerifier(&csec)
 		if strings.HasPrefix(cc.listen, "wss://") {
 			certFile, _ := cfg.Get("CCB_CARRIER_TLS_CERT")
 			keyFile, _ := cfg.Get("CCB_CARRIER_TLS_KEY")

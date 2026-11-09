@@ -118,11 +118,21 @@ not a requirement.
     HTCondor IDTOKEN from the token directory.
   - `BearerTokenVerifier(sec)` (server): accepts **either** an HTCondor IDTOKEN
     (verified against the pool signing key via cedar `security.VerifyIDToken` —
-    HKDF+HMAC over `header.payload`) **or** a SciToken (cedar
-    `security.VerifySciToken` against the issuer JWKS), dispatching on the token.
-    `IDTokenVerifier(sec)` / `SciTokenVerifier` are the single-type variants.
-  The daemon wires `BearerTokenVerifier(Config.Security)` automatically for a
-  `ws(s)://` `CarrierListen`.
+    HKDF+HMAC over `header.payload`) **or** a SciToken, dispatching on the token.
+    `IDTokenVerifier(sec)` / `SciTokenVerifier(sec)` are the single-type variants.
+  - A SciToken is accepted only as an HTCondor server accepts SCITOKENS
+    authentication: `sec.SciTokensMapper` must map its `issuer,subject`, its
+    audience must satisfy `sec.SciTokensServerAudience`, it must be current, and
+    its https issuer must publish the signing key. An issuer no mapping names is
+    never contacted. With no mapper, every SciToken is refused. The identity is
+    the mapped user, with the UID domain appended when it has no `@`.
+  The daemon wires `BearerTokenVerifier` for a `ws(s)://` `CarrierListen`,
+  reading the SciToken settings as HTCondor does: the `SCITOKENS` lines of
+  `CERTIFICATE_MAPFILE` (principals are regular expressions unless
+  `CERTIFICATE_MAPFILE_ASSUME_HASH_KEYS` is true; reloaded on reconfig),
+  `SCITOKENS_SERVER_AUDIENCE`, `SEC_SCITOKENS_ALLOW_FOREIGN_TOKEN_TYPES` and
+  `SEC_SCITOKENS_FOREIGN_TOKEN_ISSUERS`. Without a map file only IDTOKENs are
+  accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
   ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
   (authenticated peer; yamux bounds its own windows).
@@ -199,11 +209,12 @@ handshake to the broker at the far end. A peer that completes the handshake and
 then reports it has no `DC_NOP` handler counts as a pass -- identity and policy
 are what the stage checks.
 
-The daemon runs the check at startup and logs the report; it is never fatal,
-since the proxy may be transiently down and the broker retries anyway. A pilot
-that wants a hard gate before starting `condor_master` runs
-`golang-ccb -carrier-check`, which prints the per-stage report and exits non-zero
-on the first failure.
+The broker runs the check at startup, before reporting itself ready, and logs
+the report; it is never fatal, since the proxy may be transiently down and the
+broker retries anyway. What protects an EP meanwhile is that an inside CCB
+refuses to register one until it is tunnel-ready, rather than handing out an
+address the pool cannot reach. `golang-ccb -carrier-check` prints the same
+per-stage report and exits non-zero, as a diagnostic to run by hand.
 
 ---
 

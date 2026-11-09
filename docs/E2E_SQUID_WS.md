@@ -16,7 +16,7 @@ deployment regressing to a direct dial.
 
 ## 1. The claim being demonstrated
 
-> A pilot launched on a worker node brings its own `golang-ccb`. That broker
+> A glidein launched on a worker node brings its own `golang-ccb`. That broker
 > opens **one** `wss://` connection, outbound, through the site squid, to an
 > approved host on port 443. Every connection the EP makes or receives
 > thereafter — collector updates, the schedd's claim, shadow↔starter file
@@ -60,7 +60,7 @@ response body as an `io.ReadWriteCloser`, which is exactly what
 
 One wrinkle found while testing: the default is **not**
 `http.ProxyFromEnvironment`, which resolves `HTTPS_PROXY` / `NO_PROXY` once per
-process and caches the answer forever. A pilot that sets the proxy after
+process and caches the answer forever. A glidein that sets the proxy after
 something else has already consulted the environment would keep a stale route
 with nothing in the logs to show for it. The environment is read per dial
 instead, through `x/net/http/httpproxy`, with the same matching rules.
@@ -100,7 +100,7 @@ by deferring each registration reply until it is tunnel-ready.
 Done: `handleRegister` waits on `tunnelReady` (bounded by `RequestTimeout`) when
 `Config.Upstream` is set, and refuses the registration rather than answering with
 a flat contact. Refusing matters more than it looks: a registrant's CCBListener
-retries, but it never re-registers a contact it has already accepted. The pilot should *also*
+retries, but it never re-registers a contact it has already accepted. A wrapper may *also*
 gate `condor_master` on `CCB_TUNNEL_READY_FILE`, but belt-and-braces: the
 deferral is what makes a restarting EP safe.
 
@@ -124,8 +124,7 @@ think it is, or whether the two agree on credentials.
 advice naming the site policy that usually causes it (see
 [TRANSPORTS.md](TRANSPORTS.md) §3.2 for the stage table). The daemon runs it at
 startup and logs the report, never fatally; `golang-ccb -carrier-check` runs it
-and exits non-zero, which is the hard gate a pilot wants before it starts
-`condor_master`.
+and exits non-zero, for an administrator diagnosing a node by hand.
 
 The final stage is the one the transport cannot imply: a CEDAR handshake to the
 far broker. A peer that completes the handshake and then reports it has no
@@ -189,48 +188,52 @@ access_log /var/log/squid/access.log
 
 ---
 
-## 4. The EP side: what the pilot does
+## 4. The EP side: what the glidein does
 
-This is the shape a glidein would take, and the part the site will read most
-closely.
+This is the shape a glidein takes, and the part the site will read most closely.
 
-1. Write a node-local `condor_config` and start `golang-ccb` as the inside CCB:
+A glidein runs `condor_master`, so there is no hand-rolled startup sequence: the
+broker is one of the master's daemons, listed first, and the ordering problem is
+solved inside the broker rather than by a wrapper script.
 
-   ```
-   CCB_OUTBOUND_PROXY = TRUE
-   CCB_OUTBOUND_NEXT_HOP = wss://ccb.offsite.test/ccb/tunnel
-   CCB_CARRIER_PROXY = http://squid.site:3128
-   CCB_CARRIER_CA_FILE = $(LOCAL_DIR)/ca.pem
-   CCB_CARRIER_TOKEN = <IDTOKEN or SciToken>   # or discovery, see below
-   CCB_TUNNEL_READY_FILE = $(LOCAL_DIR)/ccb_tunnel_ready
-   CCB_OUTBOUND_TARGET_ALLOWLIST = <pool CIDRs>
-   ```
+```condor
+DAEMON_LIST = MASTER, CCB, STARTD
+CCB = /usr/sbin/golang-ccb
+CCB_ARGS = -listen 127.0.0.1:9700 -public 127.0.0.1:9700
+USE_SHARED_PORT = FALSE
 
-   The bearer token authenticating the carrier is discovered the way a pilot
-   already carries credentials: `DiscoverBearerToken` reads `BEARER_TOKEN`,
-   `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, then an HTCondor IDTOKEN
-   from the token directory. The offsite CCB verifies either kind
-   (`BearerTokenVerifier`). Nothing new is needed here — the test should use a
-   SciToken in one variant and an IDTOKEN in another, because sites differ.
+CCB_OUTBOUND_PROXY = TRUE
+CCB_OUTBOUND_NEXT_HOP = wss://ccb.offsite.test/ccb/tunnel
+CCB_CARRIER_PROXY = http://squid.site:3128
+CCB_CARRIER_CA_FILE = $(LOCAL_DIR)/ca.pem
+CCB_CARRIER_TOKEN = <IDTOKEN or SciToken>   # or discovery, see below
+CCB_TUNNEL_READY_FILE = $(LOCAL_DIR)/ccb_tunnel_ready
+CCB_OUTBOUND_TARGET_ALLOWLIST = <pool CIDRs>
 
-2. Gate on the carrier before going further:
+# The startd reaches the pool through the local broker, and is reached through it.
+CCB_ADDRESS = 127.0.0.1:9700
+OUTBOUND_CCB_ADDRESS = 127.0.0.1:9700
+```
 
-   ```sh
-   golang-ccb -carrier-check || exit 1   # per-stage report, non-zero on failure
-   ```
+The broker verifies its carrier and waits for upstream registration before
+reporting ready (§2.6), so readiness means it can do its job. A startd that
+starts first is handled by §2.4 rather than by ordering: the broker refuses to
+register it instead of handing out an address the pool cannot reach, and its
+`CCBListener` retries. `-carrier-check` is a diagnostic an administrator runs by
+hand, not a gate in a script — what turns "the glidein did nothing" into a line
+naming the proxy, the ACL, the certificate or the token.
 
-   Then block until `CCB_TUNNEL_READY_FILE` appears, with a timeout that fails
-   the pilot loudly rather than starting an EP that will advertise a dead
-   address. The check is what turns "the glidein did nothing" into a line naming
-   the proxy, the ACL, the certificate or the token.
-
-3. Start `condor_master` with `DAEMON_LIST = MASTER STARTD`,
-   `CCB_ADDRESS` and `OUTBOUND_CCB_ADDRESS` both pointing at the local inside
-   CCB, and `USE_SHARED_PORT = FALSE`.
+The bearer token authenticating the carrier is discovered the way a glidein
+already carries credentials: `DiscoverBearerToken` reads `BEARER_TOKEN`,
+`BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, then an HTCondor IDTOKEN from
+the token directory. The offsite CCB verifies either kind
+(`BearerTokenVerifier`); a SciToken additionally requires a `SCITOKENS` mapping.
+The test should use a SciToken in one variant and an IDTOKEN in another, because
+sites differ.
 
 `USE_OUTBOUND_CCB` is deliberately not used: it auto-injects the *collector* as
 the local inside CCB, and here the inside CCB is a standalone `golang-ccb` with
-no collector role. Setting the two knobs explicitly is what a pilot does anyway.
+no collector role. Setting the two knobs explicitly is what a glidein does anyway.
 
 ---
 
@@ -347,7 +350,7 @@ actually decide whether a site deployment works, and none of which tier 1 can
 see. It is also the artifact to hand to the site: a compose file they can read
 and compare against their own squid.
 
-**Tier 3 — the site itself, manual.** Same pilot script, their squid, their
+**Tier 3 — the site itself, manual.** Same glidein configuration, their squid, their
 token. The only new information is their squid's ACLs and whether it bumps TLS.
 
 ---
@@ -383,7 +386,7 @@ token. The only new information is their squid's ACLs and whether it bumps TLS.
    through the tunnel under `SEC_DEFAULT_ENCRYPTION = REQUIRED`, which is the
    assertion a site will actually ask for.
 2. §5.G/H — idle survival past squid's `read_timeout`, and recovery after the
-   proxy restarts. These are the two that decide whether a pilot survives a
+   proxy restarts. These are the two that decide whether a glidein survives a
    night, and neither can be tested without a real proxy. The topology now has
    one, so both are reachable; `read_timeout` is already set to one minute in
    `test/e2e-squid/squid.conf` so an idle test has something to survive.

@@ -160,7 +160,7 @@ credentials.
 
 ### 4.2 The inside broker, on the worker node
 
-This is what a pilot or glidein starts before `condor_master`:
+This is the configuration a glidein gives its broker:
 
 ```condor
 CCB_OUTBOUND_PROXY = TRUE
@@ -173,7 +173,7 @@ CCB_TUNNEL_READY_FILE = $(LOCAL_DIR)/ccb_tunnel_ready
 CCB_OUTBOUND_TARGET_ALLOWLIST = 192.0.2.0/24
 ```
 
-The credential is found the way a pilot already carries one: `BEARER_TOKEN`,
+The credential is found the way a glidein already carries one: `BEARER_TOKEN`,
 `BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>`, then an
 HTCondor IDTOKEN from the token directory. Set `CCB_CARRIER_TOKEN` only to
 override that.
@@ -196,22 +196,31 @@ about the tunnel.
 
 ### 4.4 Startup order
 
-The pilot should verify the tunnel before starting `condor_master`:
+There is nothing to sequence by hand. The glidein runs `condor_master`, and the
+broker is one of its daemons — list it first so the master starts it first:
 
-```sh
-golang-ccb -listen 127.0.0.1:0 -carrier-check || exit 1
-golang-ccb -listen 127.0.0.1:9700 -public 127.0.0.1:9700 &
-# wait for $(LOCAL_DIR)/ccb_tunnel_ready to appear, then:
-condor_master
+```condor
+DAEMON_LIST = MASTER, CCB, STARTD
+CCB = /usr/sbin/golang-ccb
+CCB_ARGS = -listen 127.0.0.1:9700 -public 127.0.0.1:9700
+CCB_LOG = $(LOG)/CcbLog
 ```
 
-Under `condor_master`, the broker does this itself: it verifies the carrier and
-waits for the tunnel before reporting ready, so daemons the master starts on
-that signal find a working tunnel. `CCB_CARRIER_READY_TIMEOUT` (seconds,
-default 120) bounds that wait. If it expires the broker starts anyway and logs
-loudly — a broker that refused to start would be restarted in a loop and you
-would lose the diagnosis. It will not hand out an unroutable address in the
-meantime; it refuses registrations until the tunnel is up.
+The broker verifies its carrier and waits for upstream registration **before**
+it reports itself ready, so it is not ready until it can do its job.
+`CCB_CARRIER_READY_TIMEOUT` (seconds, default 120) bounds that wait. If it
+expires the broker starts anyway and logs the staged report loudly — a broker
+that refused to start would be restarted in a loop and you would lose the
+diagnosis that report just produced.
+
+A startd that starts before the tunnel is up is not a problem either: the broker
+refuses to register it rather than hand it an address the pool cannot reach, and
+its `CCBListener` retries until the tunnel is ready. That refusal is the thing
+protecting you, not the ordering.
+
+`CCB_TUNNEL_READY_FILE` remains useful for anything outside the master's control
+that needs to wait for a working tunnel — a wrapper that reports the glidein's
+state back to a factory, say.
 
 ---
 
@@ -339,7 +348,7 @@ exposed. Where a site bumps TLS:
 
 - add the site CA to `CCB_CARRIER_CA_FILE`, or the broker will correctly refuse
   to connect, and
-- issue the pilot a short-lived, audience-scoped SciToken rather than a
+- issue the glidein a short-lived, audience-scoped SciToken rather than a
   long-lived pool IDTOKEN.
 
 **The outbound allow-list.** `CCB_OUTBOUND_TARGET_ALLOWLIST` on the outside
@@ -369,7 +378,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_CA_FILE` | CA for the broker's certificate |
 | `CCB_CARRIER_TOKEN` | bearer token, if not discovered automatically |
 | `CCB_CARRIER_READY_TIMEOUT` | seconds to wait for the tunnel before reporting ready (120) |
-| `CCB_TUNNEL_READY_FILE` | written once registered; a pilot's startup barrier |
+| `CCB_TUNNEL_READY_FILE` | written once registered; a barrier for wrappers outside the master |
 | `CCB_OUTBOUND_PROXY` | enable relaying the local daemons' outbound connections |
 
 ### Execution point daemons
