@@ -225,18 +225,59 @@ func (s *Server) handleReverseConnect(ctx context.Context, c *cedarserver.Conn) 
 	return cedarserver.KeepOpen()
 }
 
-// spliceConns copies bytes bidirectionally between two connections until either
-// side closes, then closes both.
+// spliceDrainGrace bounds how long the relay waits for the second direction
+// once the first has ended. It exists so a peer that stops reading without ever
+// closing cannot hold a relay goroutine and two sockets open forever; it is
+// generous, because the only thing it should ever cut short is a peer that has
+// already gone away.
+const spliceDrainGrace = 30 * time.Second
+
+// closeWriter is a connection that can end its sending side while still
+// receiving. *net.TCPConn and *tls.Conn implement it; a yamux stream's Close is
+// itself a half-close, and anything else falls back to the grace above.
+type closeWriter interface{ CloseWrite() error }
+
+// spliceConns copies bytes bidirectionally between two connections until both
+// directions are finished, then closes both.
+//
+// The two directions end independently, and an EOF on one says only that that
+// peer has finished *sending*. It says nothing about bytes already in flight the
+// other way, so tearing the whole relay down at that point -- which this did,
+// closing both connections from whichever direction finished first -- discards
+// them, and the far peer sees a truncated stream rather than a clean end.
+//
+// Each direction now propagates a half-close instead and leaves the other to
+// drain. Note that this is about delivering what was already written; a relay
+// cannot invent bytes a peer never sent, so a peer that closes without replying
+// still produces an EOF at the far end, correctly.
 func spliceConns(c1, c2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	firstDone := make(chan struct{})
+	var once sync.Once
+
 	pipe := func(dst, src net.Conn) {
 		defer wg.Done()
 		_, _ = io.Copy(dst, src)
-		_ = dst.Close()
-		_ = src.Close()
+		// This direction is finished. Tell dst's peer, so it stops waiting for
+		// more, without disturbing what is still arriving the other way.
+		if cw, ok := dst.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		}
+		once.Do(func() { close(firstDone) })
 	}
 	go pipe(c1, c2)
 	go pipe(c2, c1)
-	wg.Wait()
+
+	both := make(chan struct{})
+	go func() { wg.Wait(); close(both) }()
+
+	<-firstDone
+	select {
+	case <-both:
+	case <-time.After(spliceDrainGrace):
+	}
+	_ = c1.Close()
+	_ = c2.Close()
 }
