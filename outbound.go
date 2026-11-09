@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bbockelm/cedar/addresses"
@@ -41,7 +42,9 @@ func (t *tcpDirectTransport) connect(ctx context.Context, target string, _ int) 
 	}
 	dctx, cancel := context.WithTimeout(ctx, t.s.cfg.RequestTimeout)
 	defer cancel()
-	var d net.Dialer
+	// The literal-address check in outboundTargetAllowed cannot see what a
+	// hostname resolves to; check the resolved address too.
+	d := net.Dialer{Control: chainDialControl(RefuseLocalAddresses, t.s.cfg.DialControl)}
 	conn, err := d.DialContext(dctx, "tcp", dialAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial target: %w", err)
@@ -152,9 +155,9 @@ func (s *Server) outboundTargetAllowed(target string) (string, error) {
 	}
 
 	// Refuse broker-local scopes so a hostile-but-authenticated requester cannot
-	// reach broker-local services (SSRF). Checked by literal IP and by obvious
-	// loopback hostnames; a hostname that resolves to a local scope is caught by
-	// the OS only after the allow-list, so also require an allow-list match below.
+	// reach broker-local services (SSRF). Checked here by literal IP and by
+	// obvious loopback hostnames, and again on the resolved address at dial time
+	// (RefuseLocalAddresses).
 	if ip := net.ParseIP(host); ip != nil {
 		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 			return "", fmt.Errorf("target %q is loopback/link-local (refused)", host)
@@ -202,4 +205,38 @@ func (s *Server) matchAllowlist(host string) bool {
 	// No non-blank entries configured: permit all (loopback/link-local already
 	// refused by the caller). A configured-but-unmatched host is denied.
 	return !hasEntry
+}
+
+// RefuseLocalAddresses is a Config.DialControl that refuses loopback,
+// link-local and unspecified destinations, judged by the resolved IP, so a
+// remote party cannot point the broker at its own host's services.
+func RefuseLocalAddresses(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("ccbserver: bad dial address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("ccbserver: dial address %q is not an IP", address)
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("ccbserver: refusing to dial local address %s", host)
+	}
+	return nil
+}
+
+// chainDialControl returns a dial control that runs each non-nil control in
+// turn, failing on the first error.
+func chainDialControl(controls ...func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		for _, control := range controls {
+			if control == nil {
+				continue
+			}
+			if err := control(network, address, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }

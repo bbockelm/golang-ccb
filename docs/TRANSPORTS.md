@@ -118,11 +118,21 @@ not a requirement.
     HTCondor IDTOKEN from the token directory.
   - `BearerTokenVerifier(sec)` (server): accepts **either** an HTCondor IDTOKEN
     (verified against the pool signing key via cedar `security.VerifyIDToken` —
-    HKDF+HMAC over `header.payload`) **or** a SciToken (cedar
-    `security.VerifySciToken` against the issuer JWKS), dispatching on the token.
-    `IDTokenVerifier(sec)` / `SciTokenVerifier` are the single-type variants.
-  The daemon wires `BearerTokenVerifier(Config.Security)` automatically for a
-  `ws(s)://` `CarrierListen`.
+    HKDF+HMAC over `header.payload`) **or** a SciToken, dispatching on the token.
+    `IDTokenVerifier(sec)` / `SciTokenVerifier(sec)` are the single-type variants.
+  - A SciToken is accepted only as an HTCondor server accepts SCITOKENS
+    authentication: `sec.SciTokensMapper` must map its `issuer,subject`, its
+    audience must satisfy `sec.SciTokensServerAudience`, it must be current, and
+    its https issuer must publish the signing key. An issuer no mapping names is
+    never contacted. With no mapper, every SciToken is refused. The identity is
+    the mapped user, with the UID domain appended when it has no `@`.
+  The daemon wires `BearerTokenVerifier` for a `ws(s)://` `CarrierListen`,
+  reading the SciToken settings as HTCondor does: the `SCITOKENS` lines of
+  `CERTIFICATE_MAPFILE` (principals are regular expressions unless
+  `CERTIFICATE_MAPFILE_ASSUME_HASH_KEYS` is true; reloaded on reconfig),
+  `SCITOKENS_SERVER_AUDIENCE`, `SEC_SCITOKENS_ALLOW_FOREIGN_TOKEN_TYPES` and
+  `SEC_SCITOKENS_FOREIGN_TOKEN_ISSUERS`. Without a map file only IDTOKENs are
+  accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
   ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
   (authenticated peer; yamux bounds its own windows).

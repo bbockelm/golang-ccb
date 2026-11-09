@@ -88,19 +88,47 @@ func readFirstToken(path string) (string, error) {
 	return "", fmt.Errorf("ccbserver: token file %s is empty", path)
 }
 
-// SciTokenVerifier is a Config.CarrierTokenVerify that accepts a SciToken/WLCG
-// JWT, verifying it against its issuer's JWKS (cedar security.VerifySciToken),
-// and returns "<issuer>/<subject>" as the identity. It rejects non-SciToken
-// bearer tokens; use BearerTokenVerifier to also accept HTCondor IDTOKENs.
-func SciTokenVerifier(ctx context.Context, token string) (string, error) {
-	if !security.IsSciToken(token) {
-		return "", fmt.Errorf("ccbserver: bearer token is not a SciToken")
+// SciTokenVerifier returns a Config.CarrierTokenVerify that accepts a
+// SciToken/WLCG JWT the way an HTCondor server accepts SCITOKENS
+// authentication (condor_auth_ssl.cpp): the token's "issuer,subject" must be
+// mapped by sec.SciTokensMapper (the SCITOKENS lines of CERTIFICATE_MAPFILE),
+// its audience must satisfy sec.SciTokensServerAudience
+// (SCITOKENS_SERVER_AUDIENCE), and it must be current and signed by a key its
+// https issuer publishes. The mapping is consulted before anything is fetched,
+// so an issuer no map line names is never contacted. The identity is the
+// mapped user, with sec's UID domain appended when it has no '@'
+// (SecurityConfig.CanonicalUser), as HTCondor names a SCITOKENS peer.
+//
+// With a nil sec or a nil sec.SciTokensMapper every SciToken is refused, as
+// HTCondor refuses them with no map file. It rejects non-SciToken bearer
+// tokens; use BearerTokenVerifier to also accept HTCondor IDTOKENs.
+func SciTokenVerifier(sec *security.SecurityConfig) func(ctx context.Context, token string) (string, error) {
+	return func(ctx context.Context, token string) (string, error) {
+		if !security.IsSciToken(token) {
+			return "", fmt.Errorf("ccbserver: bearer token is not a SciToken")
+		}
+		if sec == nil || sec.SciTokensMapper == nil {
+			return "", fmt.Errorf("ccbserver: no SCITOKENS mapping is configured, so no SciToken is accepted")
+		}
+		var user string
+		_, err := security.VerifySciToken(ctx, token, security.SciTokenVerifyOptions{
+			Accept: func(issuer, subject string) bool {
+				mapped, ok := sec.SciTokensMapper(issuer + "," + subject)
+				if !ok || mapped == "" {
+					return false
+				}
+				user = mapped
+				return true
+			},
+			Audiences:           sec.SciTokensServerAudience,
+			ForeignTokenIssuers: sec.SciTokensForeignTokenIssuers,
+			HTTPClient:          sec.SciTokensHTTPClient,
+		})
+		if err != nil {
+			return "", fmt.Errorf("ccbserver: SciToken verification failed: %w", err)
+		}
+		return sec.CanonicalUser(user), nil
 	}
-	claims, err := security.VerifySciToken(token)
-	if err != nil {
-		return "", fmt.Errorf("ccbserver: SciToken verification failed: %w", err)
-	}
-	return claims.Issuer + "/" + claims.Subject, nil
 }
 
 // IDTokenVerifier returns a Config.CarrierTokenVerify that accepts an HTCondor
@@ -120,13 +148,15 @@ func IDTokenVerifier(sec *security.SecurityConfig) func(ctx context.Context, tok
 
 // BearerTokenVerifier returns a Config.CarrierTokenVerify that accepts EITHER an
 // HTCondor IDTOKEN (HKDF+HMAC against the pool signing key in sec) or a SciToken
-// (verified against its issuer's JWKS), dispatching on the token's header. This
-// is the general choice for a pool that admits both credential types.
+// (see SciTokenVerifier: mapped by sec.SciTokensMapper, refused when it is nil),
+// dispatching on the token's header. This is the general choice for a pool that
+// admits both credential types.
 func BearerTokenVerifier(sec *security.SecurityConfig) func(ctx context.Context, token string) (string, error) {
 	idVerify := IDTokenVerifier(sec)
+	sciVerify := SciTokenVerifier(sec)
 	return func(ctx context.Context, token string) (string, error) {
 		if security.IsSciToken(token) {
-			return SciTokenVerifier(ctx, token)
+			return sciVerify(ctx, token)
 		}
 		return idVerify(ctx, token)
 	}
