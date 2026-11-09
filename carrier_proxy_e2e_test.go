@@ -107,13 +107,23 @@ func insideWSSConfig(addr, carrierURL string, clientTLS *tls.Config, proxy *prox
 // obviously wrong in either broker's log.
 func startInsideWSSCCB(t *testing.T, carrierURL string, clientTLS *tls.Config, proxy *proxytest.Proxy, outbound bool) (addr string, srv *Server, rec *logCatcher, cancel func()) {
 	t.Helper()
+	return startInsideWSSCCBConfig(t, insideWSSConfig("", carrierURL, clientTLS, proxy, outbound))
+}
+
+// startInsideWSSCCBConfig starts an inside CCB from a prepared Config, so a test
+// can set a field the helper above does not take. PublicAddress is always
+// replaced with the address actually bound: a local EP is told to reverse-connect
+// to it during a streaming rendezvous, so a placeholder there leaves the EP
+// dialing nowhere and the relay times out with nothing obviously wrong.
+func startInsideWSSCCBConfig(t *testing.T, cfg Config) (addr string, srv *Server, rec *logCatcher, cancel func()) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr = ln.Addr().String()
 	rec = &logCatcher{}
-	cfg := insideWSSConfig(addr, carrierURL, clientTLS, proxy, outbound)
+	cfg.PublicAddress = addr
 	cfg.Logger = slog.New(rec)
 	srv, err = New(cfg)
 	if err != nil {

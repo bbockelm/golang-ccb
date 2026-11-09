@@ -14,15 +14,35 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
 
-// yamuxConfig returns a yamux config with logging silenced. yamux keepalive is
-// left on: it gives stream-layer liveness above the carrier's own heartbeat.
-func yamuxConfig() *yamux.Config {
+// DefaultKeepalive is how often an idle carrier sends a yamux ping when no
+// interval is configured. It is yamux's own default, and it is chosen here for
+// a different reason than liveness: the ping is the only traffic a quiet
+// carrier produces, so it is also what stops a site proxy from reclaiming the
+// tunnel as idle. It must therefore be comfortably shorter than the shortest
+// idle timeout on the path.
+const DefaultKeepalive = 30 * time.Second
+
+// yamuxConfig returns a yamux config with logging silenced and the keepalive
+// interval set. keepalive <= 0 uses DefaultKeepalive.
+func yamuxConfig(keepalive time.Duration) *yamux.Config {
 	c := yamux.DefaultConfig()
 	c.LogOutput = io.Discard
+	if keepalive <= 0 {
+		keepalive = DefaultKeepalive
+	}
+	c.KeepAliveInterval = keepalive
+	// yamux fails a write that cannot complete within ConnectionWriteTimeout,
+	// and a keepalive ping is a write. A keepalive shorter than that timeout
+	// would let a stalled link queue several pings before the first is declared
+	// dead, so keep the timeout no longer than the interval.
+	if c.ConnectionWriteTimeout > keepalive {
+		c.ConnectionWriteTimeout = keepalive
+	}
 	return c
 }
 
@@ -61,7 +81,7 @@ func (l *MuxListener) acceptPipes() {
 		if err != nil {
 			return // inner closed or fatal
 		}
-		sess, err := yamux.Server(pipe, yamuxConfig())
+		sess, err := yamux.Server(pipe, yamuxConfig(0))
 		if err != nil {
 			_ = pipe.Close()
 			continue
@@ -118,7 +138,13 @@ type MuxDialer struct {
 // NewMuxDialer wraps an already-established carrier pipe in a yamux client. It
 // takes ownership of pipe and closes it on Close.
 func NewMuxDialer(pipe net.Conn) (*MuxDialer, error) {
-	sess, err := yamux.Client(pipe, yamuxConfig())
+	return NewMuxDialerKeepalive(pipe, 0)
+}
+
+// NewMuxDialerKeepalive is NewMuxDialer with an explicit keepalive interval;
+// 0 uses DefaultKeepalive.
+func NewMuxDialerKeepalive(pipe net.Conn, keepalive time.Duration) (*MuxDialer, error) {
+	sess, err := yamux.Client(pipe, yamuxConfig(keepalive))
 	if err != nil {
 		return nil, err
 	}

@@ -289,6 +289,7 @@ func run() error {
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
 		CarrierProxy:            cc.proxy,
+		CarrierKeepalive:        cc.keepalive,
 		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
@@ -449,6 +450,28 @@ func awaitCarrierReady(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Ser
 	log.Info(logging.DestinationGeneral, "carrier ready", "tunnel_contact", srv.TunnelContact())
 }
 
+// carrierKeepalive is how often an idle carrier sends a keepalive.
+// CCB_CARRIER_KEEPALIVE is in seconds; unset uses carrier.DefaultKeepalive.
+//
+// This is a network-policy setting, not a liveness one. A quiet carrier produces
+// no other traffic, so the keepalive is the only thing stopping a site proxy
+// from reclaiming the tunnel as idle -- and when it is too slow the failure is
+// silent: the carrier is dropped and transparently rebuilt, so everything still
+// works while the node churns a new connection through the proxy each time. Set
+// it comfortably below the shortest idle timeout on the path (squid's
+// read_timeout, and any load balancer in front of the broker).
+func carrierKeepalive(cfg *config.Config) time.Duration {
+	v, ok := cfg.Get("CCB_CARRIER_KEEPALIVE")
+	if !ok {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // carrierReadyTimeout bounds the wait before the daemon reports ready.
 // CCB_CARRIER_READY_TIMEOUT is in seconds.
 func carrierReadyTimeout(cfg *config.Config) time.Duration {
@@ -503,6 +526,7 @@ type carrierSettings struct {
 	tokenSource func(context.Context) (string, error)
 	proxy       func(*http.Request) (*url.URL, error)
 	proxySource string
+	keepalive   time.Duration
 	// sciTokens is the SciToken map file behind verify, reloaded on reconfig;
 	// nil when there is no ws/wss listener.
 	sciTokens *sciTokenMap
@@ -557,6 +581,7 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 		}
 		cc.proxy = proxyFn
 		cc.proxySource = proxySource
+		cc.keepalive = carrierKeepalive(cfg)
 	}
 	return cc, nil
 }

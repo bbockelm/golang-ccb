@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bbockelm/golang-ccb/transport/carrier"
 	"github.com/bbockelm/golang-ccb/transport/fstun"
@@ -72,6 +73,7 @@ type carrierClient struct {
 	tokenSource func(ctx context.Context) (string, error)
 	clientTLS   *tls.Config
 	proxy       func(*http.Request) (*url.URL, error)
+	keepalive   time.Duration
 
 	mu   sync.Mutex
 	md   *carrier.MuxDialer
@@ -86,6 +88,7 @@ func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) *carrierClie
 		tokenSource: cfg.CarrierTokenSource,
 		clientTLS:   cfg.CarrierClientTLS,
 		proxy:       cfg.CarrierProxy,
+		keepalive:   cfg.CarrierKeepalive,
 	}
 }
 
@@ -168,7 +171,7 @@ func (c *carrierClient) session(ctx context.Context) (*carrier.MuxDialer, error)
 		return nil, fmt.Errorf("carrier %s: dialing pipe: %w", c.describe(), err)
 	}
 
-	md, err := carrier.NewMuxDialer(pipe)
+	md, err := carrier.NewMuxDialerKeepalive(pipe, c.keepalive)
 	if err != nil {
 		_ = pipe.Close()
 		return nil, fmt.Errorf("carrier %s: yamux client: %w", c.describe(), err)

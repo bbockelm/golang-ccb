@@ -134,7 +134,13 @@ not a requirement.
   `SEC_SCITOKENS_FOREIGN_TOKEN_ISSUERS`. Without a map file only IDTOKENs are
   accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
-  ping/pong + yamux keepalive detect a dead peer. The message read limit is lifted
+  ping/pong + yamux keepalive detect a dead peer. The keepalive interval
+  (`CCB_CARRIER_KEEPALIVE`, default `carrier.DefaultKeepalive` = 30s) does
+  double duty: on a carrier it is also the only traffic a quiet tunnel
+  produces, so it is what keeps a site proxy from reclaiming it as idle. Too
+  slow fails silently -- the pipe is dropped and re-established on next use, so
+  every connection still succeeds while the node spends a fresh proxy
+  connection each time it goes quiet. The message read limit is lifted
   (authenticated peer; yamux bounds its own windows).
 - **TLS**: `wss://` requires a server `CarrierTLS` and (client) `CarrierClientTLS`
   for CA roots; `ws://` is plaintext, for test/dev only.

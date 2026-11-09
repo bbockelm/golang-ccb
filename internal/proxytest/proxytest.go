@@ -35,6 +35,10 @@ import (
 type Proxy struct {
 	ln    net.Listener
 	allow func(hostport string) int
+	// idle, when non-zero, closes an established tunnel after that long with no
+	// bytes in either direction -- what squid's read_timeout does to a quiet
+	// glidein, and the reason a carrier needs a keepalive at all.
+	idle time.Duration
 
 	mu       sync.Mutex
 	connects []string
@@ -61,6 +65,15 @@ func Start(t *testing.T, allow func(hostport string) int) *Proxy {
 
 // Deny is an allow function refusing every destination with code.
 func Deny(code int) func(string) int { return func(string) int { return code } }
+
+// StartWithIdleTimeout runs a proxy that closes an established tunnel after idle
+// with no traffic, reproducing a site proxy's read_timeout.
+func StartWithIdleTimeout(t *testing.T, idle time.Duration) *Proxy {
+	t.Helper()
+	p := Start(t, nil)
+	p.idle = idle
+	return p
+}
 
 func (p *Proxy) serve() {
 	for {
@@ -104,8 +117,42 @@ func (p *Proxy) handle(c net.Conn) {
 		return
 	}
 	_, _ = c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
-	go func() { _, _ = io.Copy(up, br); _ = up.Close() }()
-	go func() { _, _ = io.Copy(c, up); _ = c.Close() }()
+	if p.idle <= 0 {
+		go func() { _, _ = io.Copy(up, br); _ = up.Close() }()
+		go func() { _, _ = io.Copy(c, up); _ = c.Close() }()
+		return
+	}
+	// Refresh both deadlines on every byte seen in either direction, so the
+	// tunnel dies only when it has genuinely been quiet for p.idle.
+	var mu sync.Mutex
+	touch := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		dl := time.Now().Add(p.idle)
+		_ = c.SetDeadline(dl)
+		_ = up.SetDeadline(dl)
+	}
+	touch()
+	pump := func(dst io.Writer, src io.Reader) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				touch()
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+				touch()
+			}
+			if err != nil {
+				break
+			}
+		}
+		_ = c.Close()
+		_ = up.Close()
+	}
+	go pump(up, br)
+	go pump(c, up)
 }
 
 // URL is the proxy's address as an http:// URL.

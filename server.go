@@ -155,6 +155,12 @@ type Config struct {
 	// per dial so a rotated credential is picked up).
 	CarrierTokenSource func(ctx context.Context) (token string, err error)
 
+	// CarrierKeepalive is how often an idle carrier sends a keepalive. It is
+	// what stops a site proxy reclaiming a quiet tunnel as idle, so it must be
+	// shorter than the shortest idle timeout on the path. 0 uses
+	// carrier.DefaultKeepalive. Mirrors config CCB_CARRIER_KEEPALIVE.
+	CarrierKeepalive time.Duration
+
 	// CarrierProxy selects the HTTP proxy this (inside) CCB reaches a WebSocket
 	// carrier through, in the form http.Transport.Proxy takes. Nil honours
 	// HTTPS_PROXY / NO_PROXY from the environment; wscarrier.NoProxy forces a

@@ -311,10 +311,33 @@ ss -tnp state established '( dport = :3128 )'
 
 If you see more than one per inside broker, something is bypassing the tunnel.
 
-**Idle periods.** A glidein can sit idle for hours. The connection is kept alive
-underneath, but a proxy with a short idle timeout can still drop it; the broker
-reconnects, and `CcbLog` records it. If you see frequent reconnections, ask the
-site what its `read_timeout` and `client_lifetime` are.
+**Idle periods, and the one knob to get right.** A glidein can sit idle for
+hours, and a quiet carrier sends nothing of its own except a keepalive. That
+keepalive is therefore the only thing stopping the site proxy from reclaiming
+the tunnel as idle, so it has to be shorter than the shortest idle timeout on
+the path — squid's `read_timeout`, plus any load balancer in front of the
+broker. Ask the site for both numbers.
+
+```condor
+CCB_CARRIER_KEEPALIVE = 30
+```
+
+Seconds; 30 is the default. Lower it if the site's timeout is shorter.
+
+**Set it too slow and nothing appears to break.** The proxy drops the tunnel,
+the broker rebuilds it on next use, and every connection still succeeds — so a
+misconfigured keepalive does not show up as an error. What it costs is a new
+connection through the proxy each time the node goes quiet, which is exactly the
+socket budget the tunnel exists to conserve, and any connection in flight at the
+moment of the drop. Check for it by counting tunnels rather than by looking for
+failures:
+
+```sh
+grep -c 'CONNECT .* TCP_TUNNEL' /var/log/squid/access.log
+```
+
+One per glidein broker over its whole lifetime is right. Many per node means the
+keepalive is losing the race with the proxy.
 
 **Restarts.** The inside broker reconnects on its own. An execution point whose
 broker is briefly away keeps its address — contacts survive a broker restart.
@@ -377,6 +400,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | `user:password`, mode 600 |
 | `CCB_CARRIER_CA_FILE` | CA for the broker's certificate |
 | `CCB_CARRIER_TOKEN` | bearer token, if not discovered automatically |
+| `CCB_CARRIER_KEEPALIVE` | seconds between keepalives on an idle carrier (30). Must be below the proxy's idle timeout |
 | `CCB_CARRIER_READY_TIMEOUT` | seconds to wait for the tunnel before reporting ready (120) |
 | `CCB_TUNNEL_READY_FILE` | written once registered; a barrier for wrappers outside the master |
 | `CCB_OUTBOUND_PROXY` | enable relaying the local daemons' outbound connections |
