@@ -1,4 +1,4 @@
-// Command golang-ccb runs an HTCondor Condor Connection Broker (CCB) server as
+// Command htc-ccb runs an HTCondor Condor Connection Broker (CCB) server as
 // a Go daemon. It is intended to behave like the CCB embedded in the
 // condor_collector: it loads its policy from the HTCondor configuration, runs
 // under condor_master (DC_SET_READY / DC_CHILDALIVE), and accepts connections
@@ -43,13 +43,13 @@ import (
 // not support streaming" even though this broker implements it. That is
 // exactly what a literal 25.12.0 did when cedar moved the minimum to 25.13.0.
 var streamingVersionString = fmt.Sprintf(
-	"$CondorVersion: %s 2026-06-21 BuildID: golang-ccb GitSHA: dev $",
+	"$CondorVersion: %s 2026-06-21 BuildID: htc-ccb GitSHA: dev $",
 	ccb.StreamingMinVersion,
 )
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "golang-ccb:", err)
+		fmt.Fprintln(os.Stderr, "htc-ccb:", err)
 		os.Exit(1)
 	}
 }
@@ -301,7 +301,7 @@ func run() error {
 		return runCarrierCheck(srv)
 	}
 
-	log.Info(logging.DestinationGeneral, "golang-ccb starting",
+	log.Info(logging.DestinationGeneral, "htc-ccb starting",
 		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
 	return serveBroker(context.Background(), d, srv, az, lns...)

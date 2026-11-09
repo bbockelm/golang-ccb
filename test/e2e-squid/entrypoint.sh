@@ -39,7 +39,7 @@ CFG
     TARGET_ADDR=0.0.0.0:9700 e2esetup target &
 
     export CONDOR_CONFIG=/tmp/condor_config
-    exec golang-ccb -listen 0.0.0.0:9618 -public ccb.offsite.test:9618
+    exec htc-ccb -listen 0.0.0.0:9618 -public ccb.offsite.test:9618
     ;;
 
 harness)

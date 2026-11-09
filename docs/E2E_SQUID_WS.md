@@ -16,11 +16,11 @@ deployment regressing to a direct dial.
 
 ## 1. The claim being demonstrated
 
-> A glidein launched on a worker node brings its own `golang-ccb`. That broker
+> A glidein launched on a worker node brings its own `htc-ccb`. That broker
 > opens **one** `wss://` connection, outbound, through the site squid, to an
 > approved host on port 443. Every connection the EP makes or receives
 > thereafter — collector updates, the schedd's claim, shadow↔starter file
-> transfer — rides that one connection. Offsite, `golang-ccb` unwraps the
+> transfer — rides that one connection. Offsite, `htc-ccb` unwraps the
 > WebSocket back into ordinary CEDAR and relays to the rest of the pool, which
 > is unmodified. End-to-end CEDAR authentication and encryption are preserved;
 > neither broker holds the keys.
@@ -71,7 +71,7 @@ relay as an `Upgrade`. Production is `wss://` regardless.
 
 ### 2.2 The daemon has no proxy knob (done)
 
-`buildCarrierSettings` in `cmd/golang-ccb/main.go` resolved `CCB_CARRIER_TOKEN`
+`buildCarrierSettings` in `cmd/htc-ccb/main.go` resolved `CCB_CARRIER_TOKEN`
 and `CCB_CARRIER_CA_FILE` but nothing for a proxy. Added:
 
 | Knob | Meaning |
@@ -123,7 +123,7 @@ think it is, or whether the two agree on credentials.
 `Server.CheckCarrier` walks the stages in order and reports each separately, with
 advice naming the site policy that usually causes it (see
 [TRANSPORTS.md](TRANSPORTS.md) §3.2 for the stage table). The daemon runs it at
-startup and logs the report, never fatally; `golang-ccb -carrier-check` runs it
+startup and logs the report, never fatally; `htc-ccb -carrier-check` runs it
 and exits non-zero, for an administrator diagnosing a node by hand.
 
 The final stage is the one the transport cannot imply: a CEDAR handshake to the
@@ -143,7 +143,7 @@ property of the network rather than a knob a passing test could be ignoring.
    ┌─ net_hpc (internal: true, no gateway) ──┐   ┌─ net_pub ─────────────────┐
    │                                          │   │                          │
    │  ep                          squid ──────┼───┼──── offsite              │
-   │  ├ golang-ccb (inside)       :3128       │   │     ├ golang-ccb (outside)
+   │  ├ htc-ccb (inside)       :3128       │   │     ├ htc-ccb (outside)
    │  │   CCB_OUTBOUND_NEXT_HOP =             │   │     │   :9618  CEDAR (pool)
    │  │     wss://ccb.offsite.test/ccb/tunnel │   │     │   :443   wss carrier
    │  │   CCB_CARRIER_PROXY = http://squid:3128   │     ├ condor_collector
@@ -198,7 +198,7 @@ solved inside the broker rather than by a wrapper script.
 
 ```condor
 DAEMON_LIST = MASTER, CCB, STARTD
-CCB = /usr/sbin/golang-ccb
+CCB = /usr/sbin/htc-ccb
 CCB_ARGS = -listen 127.0.0.1:9700 -public 127.0.0.1:9700
 USE_SHARED_PORT = FALSE
 
@@ -232,7 +232,7 @@ The test should use a SciToken in one variant and an IDTOKEN in another, because
 sites differ.
 
 `USE_OUTBOUND_CCB` is deliberately not used: it auto-injects the *collector* as
-the local inside CCB, and here the inside CCB is a standalone `golang-ccb` with
+the local inside CCB, and here the inside CCB is a standalone `htc-ccb` with
 no collector role. Setting the two knobs explicitly is what a glidein does anyway.
 
 ---

@@ -2,7 +2,7 @@
 
 A module of its own, separate from the repository's, so the versions of the
 binaries CI builds are recorded and verified like any other dependency without
-dragging them into `golang-ccb`'s own dependency graph.
+dragging them into `htc-ccb`'s own dependency graph.
 
 Nothing imports it. `tools.go` is behind a `tools` build tag; the imports exist
 so `go.sum` has the versions and Dependabot has something to bump.

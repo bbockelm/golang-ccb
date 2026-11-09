@@ -1,10 +1,10 @@
 #!/bin/sh
-# Stage a prebuilt golang-ccb binary and turn it into an RPM with nfpm.
+# Stage a prebuilt htc-ccb binary and turn it into an RPM with nfpm.
 #
 # Usage:
 #   packaging/build-rpm.sh <binary> <arch> <version> [outdir]
 #
-#   binary   a linux build of cmd/golang-ccb (an RPM of a Darwin binary would
+#   binary   a linux build of cmd/htc-ccb (an RPM of a Darwin binary would
 #            install and then not run, so the caller picks)
 #   arch     amd64 | arm64 -- the RPM's architecture, which nfpm maps to
 #            x86_64 / aarch64
@@ -22,7 +22,7 @@ outdir="${4:-dist}"
 
 : "${NFPM:=nfpm}"
 : "${PKG_MAINTAINER:=Brian Bockelman <bbockelm@morgridge.org>}"
-: "${PKG_VENDOR:=golang-ccb}"
+: "${PKG_VENDOR:=htc-ccb}"
 
 # contents.src in nfpm.yaml names this directory literally; nfpm globs that
 # field without expanding variables, so the two have to agree.
@@ -42,8 +42,8 @@ packaging/check-static.sh "${bin}"
 
 rm -rf "${stage}"
 mkdir -p "${stage}"
-cp "${bin}" "${stage}/golang-ccb"
-chmod 0755 "${stage}/golang-ccb"
+cp "${bin}" "${stage}/htc-ccb"
+chmod 0755 "${stage}/htc-ccb"
 
 # nfpm writes --target as a FILE unless the path is an existing directory.
 mkdir -p "${outdir}"
@@ -54,7 +54,7 @@ set -- $(packaging/rpm-version.sh "${version}")
 pkg_version="$1"
 pkg_release="$2"
 
-echo "Packaging ${bin} as golang-ccb ${pkg_version}-${pkg_release} (${arch})..."
+echo "Packaging ${bin} as htc-ccb ${pkg_version}-${pkg_release} (${arch})..."
 PKG_VERSION="${pkg_version}" PKG_RELEASE="${pkg_release}" PKG_ARCH="${arch}" \
 PKG_MAINTAINER="${PKG_MAINTAINER}" PKG_VENDOR="${PKG_VENDOR}" \
 	"${NFPM}" package --config packaging/nfpm.yaml --packager rpm --target "${outdir}"

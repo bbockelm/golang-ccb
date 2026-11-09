@@ -58,7 +58,7 @@ reliable, ordered, bidirectional byte stream.
   `Dial func(ctx, brokerAddr string) (net.Conn, error)`. When set, `dialBroker`
   uses it instead of TCP/shared-port; when nil, behaviour is unchanged. The inside
   CCB sets this to `func(...) { return yamuxSession.Open() }`.
-- **golang-ccb** (outside CCB): when configured with a carrier, build the carrier
+- **htc-ccb** (outside CCB): when configured with a carrier, build the carrier
   `net.Listener`, wrap each accepted byte-pipe in a `yamux.Server`, and run a
   goroutine that `Accept()`s streams and hands each to `srv.Serve` — identical to
   the TCP accept loop.
@@ -219,7 +219,7 @@ The broker runs the check at startup, before reporting itself ready, and logs
 the report; it is never fatal, since the proxy may be transiently down and the
 broker retries anyway. What protects an EP meanwhile is that an inside CCB
 refuses to register one until it is tunnel-ready, rather than handing out an
-address the pool cannot reach. `golang-ccb -carrier-check` prints the same
+address the pool cannot reach. `htc-ccb -carrier-check` prints the same
 per-stage report and exits non-zero, as a diagnostic to run by hand.
 
 ---
@@ -484,7 +484,7 @@ discipline.
   injection, deadline behaviour.
 
 The yamux layer and the cedar dialer hook live outside this package (a thin
-`carrier` adapter in golang-ccb) so `fstun` stays a self-contained,
+`carrier` adapter in htc-ccb) so `fstun` stays a self-contained,
 independently-testable FS transport.
 
 ## 6. Testing plan

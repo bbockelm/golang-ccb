@@ -8,7 +8,7 @@ Dockerfile
 README.md
 
 # Local build artifacts / test output (also gitignored).
-/golang-ccb
+/htc-ccb
 *.test
 *.out
 test-results.xml

@@ -9,7 +9,7 @@ execution point on such a node: it reaches your pool through **one** proxied TLS
 connection, and the pool reaches it back down the same connection.
 
 Nothing in your central manager, schedd or submit hosts changes. The only new
-component is a second `golang-ccb`, one on each side.
+component is a second `htc-ccb`, one on each side.
 
 ---
 
@@ -38,14 +38,14 @@ point makes or receives is multiplexed over it.
 flowchart LR
     subgraph HPC["HPC worker node — no outbound TCP"]
         STARTD["condor_startd<br/>condor_starter"]
-        INSIDE["golang-ccb<br/>(inside broker)"]
+        INSIDE["htc-ccb<br/>(inside broker)"]
         STARTD -->|"local"| INSIDE
     end
 
     SQUID["Site proxy (squid)<br/>CONNECT, port 443,<br/>approved destinations only"]
 
     subgraph POOL["Your pool"]
-        OUTSIDE["golang-ccb<br/>(outside broker)<br/>:9618 CEDAR · :443 wss"]
+        OUTSIDE["htc-ccb<br/>(outside broker)<br/>:9618 CEDAR · :443 wss"]
         CM["collector<br/>negotiator"]
         SCHEDD["schedd / shadow"]
         OUTSIDE --- CM
@@ -76,7 +76,7 @@ sequenceDiagram
     Note over IN,OUT: once, at startup
     IN->>PX: CONNECT ccb.example.org:443
     PX->>OUT: TLS, then WebSocket upgrade with a bearer token
-    OUT-->>IN: registered — your contact is <outside>#42
+    OUT-->>IN: registered — your contact names the outside broker
 
     Note over EP,POOL: outbound: the EP reaches the pool
     EP->>IN: connect to collector
@@ -85,7 +85,7 @@ sequenceDiagram
     POOL-->>EP: end-to-end CEDAR, opaque to both brokers
 
     Note over POOL,EP: inbound: the pool reaches the EP
-    POOL->>OUT: connect to <outside>#42#17
+    POOL->>OUT: connect to the EP's nested contact
     OUT->>IN: (over the same connection)
     IN->>EP: reverse connect
     EP-->>POOL: end-to-end CEDAR
@@ -130,7 +130,7 @@ configuration plus:
 ```condor
 # Serve CCB to the pool as usual.
 DAEMON_LIST = $(DAEMON_LIST), CCB
-CCB = /usr/sbin/golang-ccb
+CCB = /usr/sbin/htc-ccb
 CCB_ARGS = -listen 0.0.0.0:9618 -public ccb.example.org:9618
 CCB_LOG = $(LOG)/CcbLog
 
@@ -201,7 +201,7 @@ broker is one of its daemons — list it first so the master starts it first:
 
 ```condor
 DAEMON_LIST = MASTER, CCB, STARTD
-CCB = /usr/sbin/golang-ccb
+CCB = /usr/sbin/htc-ccb
 CCB_ARGS = -listen 127.0.0.1:9700 -public 127.0.0.1:9700
 CCB_LOG = $(LOG)/CcbLog
 ```
@@ -262,7 +262,7 @@ CCB carrier proxy configuration source="CCB_CARRIER_PROXY (overriding any enviro
 ## 6. Checking that it works
 
 ```sh
-golang-ccb -listen 127.0.0.1:0 -carrier-check
+htc-ccb -listen 127.0.0.1:0 -carrier-check
 ```
 
 It walks the path one layer at a time and exits non-zero on the first failure:

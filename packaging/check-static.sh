@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fail if a built golang-ccb binary was linked against C.
+# Fail if a built htc-ccb binary was linked against C.
 #
 # Usage: packaging/check-static.sh <binary> [<binary>...]
 #
@@ -9,7 +9,7 @@
 # binary while the variable still reads 0 everywhere you look. So this reads
 # the binary instead of the environment that produced it.
 #
-# Why it matters here: golang-ccb is deployed onto worker nodes whose glibc is
+# Why it matters here: htc-ccb is deployed onto worker nodes whose glibc is
 # older than any builder's, often with no shell to diagnose it. A cgo build
 # fails there at exec time with a loader error, which is a long way from the
 # cause. modernc.org/sqlite is the cgo-free SQLite driver precisely so this
@@ -26,7 +26,7 @@ fail() {
 
 for bin in "$@"; do
 	test -f "${bin}" || fail "${bin}: no such file" \
-		"Build it first, e.g. CGO_ENABLED=0 go build -o ${bin} ./cmd/golang-ccb"
+		"Build it first, e.g. CGO_ENABLED=0 go build -o ${bin} ./cmd/htc-ccb"
 
 	settings="$(go version -m "${bin}" 2>/dev/null || true)"
 	cgo="$(printf '%s\n' "${settings}" | awk '$1 == "build" && $2 ~ /^CGO_ENABLED=/ { sub(/^CGO_ENABLED=/, "", $2); print $2; exit }')"

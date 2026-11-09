@@ -337,7 +337,7 @@ func New(cfg Config) (*Server, error) {
 }
 
 // RegisterOn registers the CCB command handlers onto an existing cedar
-// command-dispatch server. A standalone golang-ccb registers on its own internal
+// command-dispatch server. A standalone htc-ccb registers on its own internal
 // server (via New); a host daemon that wants an *embedded* CCB -- e.g. the
 // collector serving CCB on its own shared command socket, like the C++ collector's
 // ENABLE_CCB_SERVER -- creates the Server, calls RegisterOn(hostServer), then runs

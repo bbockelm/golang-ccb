@@ -28,7 +28,7 @@ func freePort(t *testing.T) int {
 	return p
 }
 
-// launchCCBBinary starts one golang-ccb process with the given extra config and
+// launchCCBBinary starts one htc-ccb process with the given extra config and
 // waits until it accepts connections. Returns its "127.0.0.1:port" address. The
 // process runs with SEC_* OPTIONAL + ALLOW_* = * so an unauthenticated test
 // client is accepted (the CCB path is plaintext by design).
@@ -57,7 +57,7 @@ CCB_OUTBOUND_PROXY = true
 	cmd.Env = append(os.Environ(), "CONDOR_CONFIG="+cfgPath)
 	if err := cmd.Start(); err != nil {
 		cancel()
-		t.Fatalf("starting golang-ccb: %v", err)
+		t.Fatalf("starting htc-ccb: %v", err)
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -77,11 +77,11 @@ CCB_OUTBOUND_PROXY = true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("golang-ccb at %s did not start listening in time", addr)
+	t.Fatalf("htc-ccb at %s did not start listening in time", addr)
 	return ""
 }
 
-// launchBinaryChain launches n golang-ccb processes: an exit CCB that dials
+// launchBinaryChain launches n htc-ccb processes: an exit CCB that dials
 // targetIP directly, then n-1 inside CCBs each pointing at the previous as its
 // next hop. Returns the entry (innermost) broker address.
 func launchBinaryChain(t *testing.T, bin string, n int, targetIP string) string {
@@ -94,7 +94,7 @@ func launchBinaryChain(t *testing.T, bin string, n int, targetIP string) string 
 }
 
 // TestBinaryTunnelChain is the process-level end-to-end test: it compiles the
-// golang-ccb binary and relays bulk data across chains of 1, 2, and 3 launched
+// htc-ccb binary and relays bulk data across chains of 1, 2, and 3 launched
 // CCB processes -- exercising the daemon's config wiring (CCB_OUTBOUND_PROXY /
 // _NEXT_HOP / _TARGET_ALLOWLIST) and its client-security building, which the
 // in-process library tests do not cover.
@@ -134,12 +134,12 @@ func TestBinaryTunnelChain(t *testing.T) {
 	}
 }
 
-// buildCCBBinary compiles the golang-ccb command into a temporary directory.
+// buildCCBBinary compiles the htc-ccb command into a temporary directory.
 func buildCCBBinary(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "golang-ccb")
-	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "./cmd/golang-ccb").CombinedOutput(); err != nil {
-		t.Fatalf("building golang-ccb: %v\n%s", err, out)
+	bin := filepath.Join(t.TempDir(), "htc-ccb")
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "./cmd/htc-ccb").CombinedOutput(); err != nil {
+		t.Fatalf("building htc-ccb: %v\n%s", err, out)
 	}
 	return bin
 }

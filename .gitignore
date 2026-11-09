@@ -1,4 +1,4 @@
-/golang-ccb
+/htc-ccb
 *.test
 
 # Release and packaging output (release.yml, packaging/build-rpm.sh).

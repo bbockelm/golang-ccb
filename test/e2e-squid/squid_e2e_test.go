@@ -38,7 +38,7 @@ import (
 
 const (
 	sharedDir   = "/shared"
-	ccbBinary   = "/usr/local/bin/golang-ccb"
+	ccbBinary   = "/usr/local/bin/htc-ccb"
 	carrierHost = "ccb.offsite.test"
 )
 
@@ -167,7 +167,7 @@ CCB_CARRIER_READY_TIMEOUT = 60
 	return path
 }
 
-// carrierCheck runs `golang-ccb -carrier-check` against a config and returns its
+// carrierCheck runs `htc-ccb -carrier-check` against a config and returns its
 // report and whether it passed.
 func carrierCheck(t *testing.T, nextHop string) (report string, ok bool) {
 	t.Helper()
