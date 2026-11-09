@@ -135,7 +135,7 @@ not a requirement.
   accepted.
 - **Framing**: WebSocket binary messages carry raw yamux bytes; WebSocket
   ping/pong + yamux keepalive detect a dead peer. The keepalive interval
-  (`CCB_CARRIER_KEEPALIVE`, default `carrier.DefaultKeepalive` = 30s) does
+  (`CCB_CARRIER_KEEPALIVE`, default `carrier.DefaultKeepalive` = 20s) does
   double duty: on a carrier it is also the only traffic a quiet tunnel
   produces, so it is what keeps a site proxy from reclaiming it as idle. Too
   slow fails silently -- the pipe is dropped and re-established on next use, so
