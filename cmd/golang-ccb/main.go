@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
+	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
 
 // streamingVersionString advertises a CondorVersion at or above the streaming
@@ -58,6 +61,7 @@ func run() error {
 	// config lookups (CCB.<key> / <local-name>.<key> beat the bare key).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
+	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; intended as a pilot's startup gate.")
 	flag.Parse()
 
 	// Did the operator explicitly set -listen? Only then do we bind it as an extra public
@@ -273,16 +277,68 @@ func run() error {
 		CarrierClientTLS:        cc.clientTLS,
 		CarrierToken:            cc.token,
 		CarrierTokenSource:      cc.tokenSource,
+		CarrierProxy:            cc.proxy,
 		Logger:                  d.Slog(),
 	})
 	if err != nil {
 		return err
 	}
 
+	if *carrierCheck {
+		return runCarrierCheck(srv)
+	}
+
+	logCarrierCheck(log, srv)
+
 	log.Info(logging.DestinationGeneral, "golang-ccb starting",
 		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
 	return serveBroker(context.Background(), d, srv, az, lns...)
+}
+
+// carrierCheckTimeout bounds the startup health check. It is generous because
+// every stage it walks is one a slow site proxy can legitimately take seconds on,
+// and the check is diagnostic -- a slow pass is still a pass.
+const carrierCheckTimeout = 60 * time.Second
+
+// logCarrierCheck walks the carrier's stages at startup, before anything depends
+// on it, so a site-policy problem (unreachable proxy, refused CONNECT,
+// intercepted TLS, rejected token, mismatched credentials) is named once, up
+// front, instead of appearing as a retry loop against an opaque dial failure.
+//
+// Never fatal: the proxy may be transiently down and the broker's own loops keep
+// retrying. A pilot that wants a hard gate runs -carrier-check instead.
+func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server) {
+	if !srv.HasCarrier() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), carrierCheckTimeout)
+	defer cancel()
+	res := srv.CheckCarrier(ctx)
+	if err := res.Err(); err != nil {
+		log.Warn(logging.DestinationGeneral, "carrier health check failed; the broker will keep retrying",
+			"carrier", res.URL, "route", res.Route, "error", err)
+	} else {
+		log.Info(logging.DestinationGeneral, "carrier health check passed",
+			"carrier", res.URL, "route", res.Route)
+	}
+	for _, line := range strings.Split(strings.TrimRight(res.String(), "\n"), "\n") {
+		log.Info(logging.DestinationGeneral, "carrier check: "+line)
+	}
+}
+
+// runCarrierCheck implements -carrier-check: print the per-stage report to
+// stdout and exit non-zero on the first failure. A pilot gates on this before
+// starting condor_master, so the failure it reports is the one a human reads.
+func runCarrierCheck(srv *ccbserver.Server) error {
+	if !srv.HasCarrier() {
+		return fmt.Errorf("-carrier-check: no carrier is configured (set CCB_OUTBOUND_NEXT_HOP or the upstream broker to a ws://, wss:// or fs: address)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), carrierCheckTimeout)
+	defer cancel()
+	res := srv.CheckCarrier(ctx)
+	fmt.Print(res.String())
+	return res.Err()
 }
 
 // newBroker creates the CCB server with the daemon's ALLOW_/DENY_ policy and
@@ -363,6 +419,7 @@ type carrierSettings struct {
 	clientTLS   *tls.Config
 	token       string
 	tokenSource func(context.Context) (string, error)
+	proxy       func(*http.Request) (*url.URL, error)
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -404,8 +461,112 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 			}
 			cc.clientTLS = tlsc
 		}
+		proxyFn, err := buildCarrierProxy(cfg)
+		if err != nil {
+			return cc, err
+		}
+		cc.proxy = proxyFn
 	}
 	return cc, nil
+}
+
+// buildCarrierProxy resolves how this (inside) CCB reaches a WebSocket carrier:
+// directly, or through an HTTP proxy. A site that permits no outbound TCP except
+// through a squid-style proxy is the reason the WebSocket carrier exists, so the
+// proxy is first-class configuration rather than something inherited by accident
+// from the environment.
+//
+//	CCB_CARRIER_PROXY unset   honour HTTPS_PROXY / NO_PROXY from the environment
+//	CCB_CARRIER_PROXY = none  dial directly, overriding any environment proxy
+//	CCB_CARRIER_PROXY = <url> always dial through that proxy (http://squid:3128)
+//
+// CCB_CARRIER_PROXY_CREDENTIAL_FILE names a file holding "user:password" for a
+// proxy that requires authentication. It is a file rather than a config value
+// because the configuration is world-readable, and it is re-read per dial so a
+// rotated credential is picked up without a restart.
+func buildCarrierProxy(cfg *config.Config) (func(*http.Request) (*url.URL, error), error) {
+	raw := ""
+	if v, ok := cfg.Get("CCB_CARRIER_PROXY"); ok {
+		raw = strings.TrimSpace(v)
+	}
+	credFile := ""
+	if v, ok := cfg.Get("CCB_CARRIER_PROXY_CREDENTIAL_FILE"); ok {
+		credFile = strings.TrimSpace(v)
+	}
+
+	var base func(*http.Request) (*url.URL, error)
+	switch {
+	case raw == "":
+		base = http.ProxyFromEnvironment
+	case strings.EqualFold(raw, "none"):
+		base = wscarrier.NoProxy
+	default:
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
+		}
+		if u.Scheme == "" {
+			// "squid.example:3128" parses with no scheme and an empty Host; retry
+			// as an authority so the common shorthand works.
+			if u, err = url.Parse("http://" + raw); err != nil {
+				return nil, fmt.Errorf("CCB_CARRIER_PROXY %q is not a URL: %w", raw, err)
+			}
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("CCB_CARRIER_PROXY %q names no host (want e.g. http://squid.example:3128)", raw)
+		}
+		base = func(*http.Request) (*url.URL, error) { return u, nil }
+	}
+
+	if credFile == "" {
+		return base, nil
+	}
+	// Validate once at startup so a missing or malformed credential file fails the
+	// daemon rather than every carrier dial.
+	if _, err := readProxyCredential(credFile); err != nil {
+		return nil, err
+	}
+	return func(r *http.Request) (*url.URL, error) {
+		u, err := base(r)
+		if err != nil || u == nil {
+			return u, err
+		}
+		cred, err := readProxyCredential(credFile)
+		if err != nil {
+			return nil, err
+		}
+		withAuth := *u
+		withAuth.User = cred
+		return &withAuth, nil
+	}, nil
+}
+
+// readProxyCredential reads "user:password" from a credential file, refusing one
+// that is world-readable (as HTCondor does for its own credential files).
+func readProxyCredential(path string) (*url.Userinfo, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE: %w", err)
+	}
+	if st.Mode().Perm()&0o004 != 0 {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE %s is world-readable (mode %#o); it holds a password", path, st.Mode().Perm())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE: %w", err)
+	}
+	line := ""
+	for _, l := range strings.Split(string(data), "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			line = t
+			break
+		}
+	}
+	user, pass, ok := strings.Cut(line, ":")
+	if !ok || user == "" {
+		return nil, fmt.Errorf("CCB_CARRIER_PROXY_CREDENTIAL_FILE %s: want one line of the form user:password", path)
+	}
+	return url.UserPassword(user, pass), nil
 }
 
 // loadCarrierClientTLS builds a client TLS config trusting the CA bundle in
