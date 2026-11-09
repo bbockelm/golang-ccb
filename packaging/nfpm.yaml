@@ -1,0 +1,58 @@
+# Package definition for golang-ccb, built by packaging/build-rpm.sh.
+name: golang-ccb
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+release: ${PKG_RELEASE}
+version_schema: none
+section: net
+priority: optional
+maintainer: ${PKG_MAINTAINER}
+description: |
+  Connection broker (CCB) for HTCondor.
+
+  Makes daemons behind NAT or a private network reachable, using the same
+  wire protocol as the CCB embedded in condor_collector. Additionally
+  tunnels an execution point that has no outbound network through a single
+  proxied connection. Runs as a DaemonCore daemon under condor_master.
+vendor: ${PKG_VENDOR}
+homepage: https://github.com/bbockelm/golang-ccb
+license: Apache-2.0
+
+depends:
+  # Started by condor_master and reads the pool configuration and credentials;
+  # with no HTCondor installed the package has nothing to attach to.
+  - condor
+
+contents:
+  # Staged here by build-rpm.sh (PKG_STAGE) rather than named through a
+  # variable: nfpm expands environment variables in its scalar fields but
+  # globs contents.src literally, so a ${...} here silently matches no files.
+  # This path and PKG_STAGE are one fact written twice; keep them together.
+  - src: packaging/staging/golang-ccb
+    dst: /usr/sbin/golang-ccb
+    file_info:
+      mode: 0755
+
+  - src: packaging/golang-ccb.conf
+    dst: /etc/condor/config.d/50-golang-ccb.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/golang-ccb/README.md
+    type: doc
+    file_info:
+      mode: 0644
+
+  - src: docs/ADMIN_TUNNELING.md
+    dst: /usr/share/doc/golang-ccb/ADMIN_TUNNELING.md
+    type: doc
+    file_info:
+      mode: 0644
+
+rpm:
+  group: System Environment/Daemons
+  # Compression every EL8+ host can read.
+  compression: gzip

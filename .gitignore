@@ -1,2 +1,7 @@
 /golang-ccb
 *.test
+
+# Release and packaging output (release.yml, packaging/build-rpm.sh).
+/dist/
+/build/
+/packaging/staging/

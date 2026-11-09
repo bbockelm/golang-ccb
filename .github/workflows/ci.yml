@@ -110,7 +110,17 @@ jobs:
       run: go build -v ./...
 
     - name: Build the golang-ccb binary
+      # Everything that ships is static and cgo-free -- the daemon runs on
+      # worker nodes with an older libc than this runner's, and the container
+      # image has no libc at all.
+      env:
+        CGO_ENABLED: '0'
       run: go build -v -o golang-ccb ./cmd/golang-ccb
+
+    - name: Check the binary is static and cgo-free
+      # Reads the build settings and ELF headers of the binary just built, so
+      # losing CGO_ENABLED=0 above fails here rather than on a worker node.
+      run: ./packaging/check-static.sh golang-ccb
 
   squid-e2e:
     name: Squid end-to-end
