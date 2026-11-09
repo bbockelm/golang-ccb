@@ -4,7 +4,9 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+    # No base-branch filter: a PR stacked on another branch needs CI as much as
+    # one targeting main, and filtering on main silently gave stacked PRs no
+    # checks at all.
   schedule:
     # Nightly, for the container tier: it needs a real proxy and real
     # containers, which is too slow to put in front of every push.
