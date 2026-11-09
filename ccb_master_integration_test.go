@@ -26,18 +26,28 @@ import (
 // It runs under two policies the startd registers (CCB_REGISTER, at DAEMON)
 // under: integrity required with encryption optional, and encryption required
 // as `use security:recommended` sets it.
+//
+// The schedccb case also puts the schedd behind the Go CCB, with encryption
+// required and BLOWFISH among the crypto methods, so the C++ negotiator reaches
+// the schedd by a CCB_REQUEST over the family session it shares with the
+// broker. The schedd's UDP RESCHEDULE resumes that session in the negotiator
+// with BLOWFISH, which the negotiator then prefers for the session over TCP
+// too; the broker refuses such a resumption (it holds only the AES key), and
+// the negotiator negotiates a new session, which uses AES.
 func TestGoCCBUnderCondorMaster(t *testing.T) {
 	for _, tc := range []struct {
-		name, policy string
+		name, policy  string
+		privateSchedd bool
 	}{
-		{"integrity", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = OPTIONAL"},
-		{"encryption", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = REQUIRED"},
+		{"integrity", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = OPTIONAL", false},
+		{"encryption", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = REQUIRED", false},
+		{"schedccb", "SEC_DEFAULT_INTEGRITY = REQUIRED\nSEC_DEFAULT_ENCRYPTION = REQUIRED\nSEC_DEFAULT_CRYPTO_METHODS = AES, BLOWFISH, 3DES", true},
 	} {
-		t.Run(tc.name, func(t *testing.T) { testGoCCBUnderCondorMaster(t, tc.policy) })
+		t.Run(tc.name, func(t *testing.T) { testGoCCBUnderCondorMaster(t, tc.policy, tc.privateSchedd) })
 	}
 }
 
-func testGoCCBUnderCondorMaster(t *testing.T, policy string) {
+func testGoCCBUnderCondorMaster(t *testing.T, policy string, privateSchedd bool) {
 	if _, err := exec.LookPath("condor_master"); err != nil {
 		t.Skip("condor_master not found in PATH, skipping integration test")
 	}
@@ -121,6 +131,15 @@ PREEMPT = FALSE
 KILL = FALSE
 RUNBENCHMARKS = FALSE
 `, collectorPort, ccbBin, ccbAddr, ccbAddr, ccbAddr, policy, passwordDir, filepath.Join(passwordDir, "POOL"))
+	if privateSchedd {
+		// The negotiator, on the default network, reaches the schedd only
+		// through the Go CCB.
+		extra += fmt.Sprintf(`
+SCHEDD.PRIVATE_NETWORK_NAME = NET_SCHEDD
+SCHEDD.CCB_ADDRESS = %s
+NEGOTIATOR_DEBUG = D_FULLDEBUG D_SECURITY
+`, ccbAddr)
+	}
 
 	h := htcondor.SetupCondorHarnessWithConfig(t, extra)
 	defer h.Shutdown()
@@ -201,6 +220,43 @@ queue 1
 		t.Fatalf("job did not terminate normally; log:\n%s", data)
 	}
 	t.Log("job completed: shadow reached the CCB-routed startd through the Go CCB")
+	if privateSchedd {
+		assertFamilySessionRenegotiated(t, logDir)
+	}
+}
+
+// assertFamilySessionRenegotiated checks, once the job has run (so the
+// negotiator reached the CCB-routed schedd), that the Go CCB read every
+// command the C++ daemons sent it and refused at most one family-session
+// resumption keyed on a cipher other than AES: the negotiator renegotiates
+// once and then holds an AES session with the broker.
+func assertFamilySessionRenegotiated(t *testing.T, logDir string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(logDir, "CcbLog"))
+	if err != nil {
+		t.Fatalf("reading CcbLog: %v", err)
+	}
+	ccbLog := string(data)
+	if strings.Contains(ccbLog, "decryption failed") {
+		t.Errorf("Go CCB could not decrypt a command from a C++ daemon:\n%s", grepLines(ccbLog, "decryption failed"))
+	}
+	refused := strings.Count(ccbLog, "cedar implements only AES-GCM, refusing the session")
+	t.Logf("Go CCB refused %d non-AES family-session resumption(s)", refused)
+	if refused > 1 {
+		t.Errorf("Go CCB refused %d non-AES resumptions, want at most 1 (the negotiator renegotiates once):\n%s",
+			refused, grepLines(ccbLog, "refusing the session"))
+	}
+}
+
+// grepLines returns the lines of text containing substr.
+func grepLines(text, substr string) string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // freePort returns a currently-free TCP port on the loopback interface.
@@ -285,7 +341,8 @@ func dumpLog(t *testing.T, path string) {
 // condor_ping -table ALL against the broker reports each level's decision
 // under that policy, and each level negotiated under its own SEC_<level>_*:
 // READ unauthenticated, DAEMON and the ADVERTISE_* levels (which fall back to
-// SEC_DAEMON_*) encrypted.
+// SEC_DAEMON_*) encrypted -- with the same authentication, encryption,
+// integrity and identity the C++ collector in the pool reports.
 func TestGoCCBSharedPortUnderCondorMaster(t *testing.T) {
 	for _, tool := range []string{"condor_master", "condor_reconfig", "condor_ping"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -367,6 +424,15 @@ SEC_CLIENT_ENCRYPTION = OPTIONAL
 			t.Errorf("condor_ping %s: encryption %q, want encrypted (SEC_DAEMON_ENCRYPTION = REQUIRED)", lvl, got)
 		}
 	}
+	// Every level both daemons admit negotiates as the C++ collector's does.
+	// ALLOW is left out: DaemonCore relaxes the ALLOW level's authentication
+	// to OPTIONAL, which golang-htcondor's per-level policy does not.
+	collector := pingTableOf(t, configFile, "-type", "collector")
+	for _, lvl := range []string{"READ", "WRITE", "NEGOTIATOR", "DAEMON", "ADVERTISE_STARTD", "ADVERTISE_SCHEDD", "ADVERTISE_MASTER"} {
+		if got, want := table[lvl], collector[lvl]; got != want {
+			t.Errorf("condor_ping %s: Go CCB %+v, C++ collector %+v", lvl, got, want)
+		}
+	}
 	// A refused level is the broker's answer, not a command it lacks; a
 	// permitted one reports the broker's own version.
 	verbose := pingOut(t, configFile, "-addr", addr, "-verbose", "ADMINISTRATOR", "CONFIG", "READ")
@@ -414,21 +480,28 @@ SEC_CLIENT_ENCRYPTION = OPTIONAL
 
 // pingRow is one level's row of condor_ping -table.
 type pingRow struct {
-	auth, encryption, decision string
+	auth, encryption, integrity, decision, identity string
 }
 
 // pingTable runs condor_ping -table ALL against addr and returns its rows by
 // level.
 func pingTable(t *testing.T, configFile, addr string) map[string]pingRow {
 	t.Helper()
-	out := pingOut(t, configFile, "-addr", addr, "-table", "ALL")
+	return pingTableOf(t, configFile, "-addr", addr)
+}
+
+// pingTableOf runs condor_ping -table ALL against the daemon target names and
+// returns its rows by level.
+func pingTableOf(t *testing.T, configFile string, target ...string) map[string]pingRow {
+	t.Helper()
+	out := pingOut(t, configFile, append(target, "-table", "ALL")...)
 	rows := map[string]pingRow{}
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 5 || f[0] == "Instruction" {
+		if len(f) < 6 || f[0] == "Instruction" {
 			continue
 		}
-		rows[f[0]] = pingRow{auth: f[1], encryption: f[2], decision: f[4]}
+		rows[f[0]] = pingRow{auth: f[1], encryption: f[2], integrity: f[3], decision: f[4], identity: f[5]}
 	}
 	if len(rows) == 0 {
 		t.Fatalf("condor_ping printed no table:\n%s", out)

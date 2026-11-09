@@ -16,6 +16,7 @@ import (
 	"github.com/bbockelm/cedar/commands"
 	"github.com/bbockelm/cedar/message"
 	"github.com/bbockelm/cedar/security"
+	"github.com/bbockelm/cedar/version"
 	"github.com/bbockelm/golang-htcondor/authz"
 	"github.com/bbockelm/golang-htcondor/config"
 	"github.com/bbockelm/golang-htcondor/daemon"
@@ -74,6 +75,7 @@ func startTestBroker(t *testing.T, knobs map[string]string) *testBroker {
 			Encryption:     security.SecurityOptional,
 			Integrity:      security.SecurityOptional,
 			SessionCache:   b.cache,
+			RemoteVersion:  streamingVersionString, // as run sets it
 		},
 		RequestTimeout: 5 * time.Second,
 	})
@@ -181,6 +183,42 @@ func (b *testBroker) request(sec *security.SecurityConfig) bool {
 		return false
 	}
 	return strings.Contains(ccb.AdString(reply, ccb.AttrErrorString), "no target registered")
+}
+
+// TestBrokerAdvertisesStreamingVersion: the handshakes for CCB_REQUEST (at
+// READ) and CCB_REGISTER (at DAEMON) advertise at least
+// ccb.StreamingMinVersion, below which a requester makes no streaming
+// request, both when they negotiate a session and when a later connection
+// resumes it.
+func TestBrokerAdvertisesStreamingVersion(t *testing.T) {
+	b := startTestBroker(t, map[string]string{"ALLOW_READ": "*", "ALLOW_DAEMON": "*"})
+	for name, cmd := range map[string]int{"CCB_REQUEST": ccb.CommandRequest, "CCB_REGISTER": ccb.CommandRegister} {
+		cs := security.SecurityConfig{
+			Command:        cmd,
+			AuthMethods:    []security.AuthMethod{security.AuthFS},
+			Authentication: security.SecurityOptional,
+			CryptoMethods:  []security.CryptoMethod{security.CryptoAES},
+			Encryption:     security.SecurityOptional,
+			Integrity:      security.SecurityOptional,
+			SessionCache:   security.NewSessionCache(),
+		}
+		for _, resume := range []bool{false, true} {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			cl, err := client.ConnectAndAuthenticate(ctx, b.addr, &cs)
+			cancel()
+			if err != nil {
+				t.Fatalf("%s (resume=%v): %v", name, resume, err)
+			}
+			neg := cl.GetSecurityNegotiation()
+			_ = cl.Close()
+			if neg.SessionResumed != resume {
+				t.Fatalf("%s: session resumed = %v, want %v", name, neg.SessionResumed, resume)
+			}
+			if v, ok := version.Parse(neg.ServerConfig.RemoteVersion); !ok || !v.AtLeast(ccb.StreamingMinVersion) {
+				t.Errorf("%s (resume=%v): broker advertised %q, want at least %s", name, resume, neg.ServerConfig.RemoteVersion, ccb.StreamingMinVersion)
+			}
+		}
+	}
 }
 
 // TestFamilyReconfigsUnderRestrictiveAdmin: condor_master's family session
