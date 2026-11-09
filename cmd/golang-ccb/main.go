@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -294,8 +295,6 @@ func run() error {
 		return runCarrierCheck(srv)
 	}
 
-	logCarrierCheck(log, srv)
-
 	log.Info(logging.DestinationGeneral, "golang-ccb starting",
 		"public", pub, "listen", ln.Addr().String(), "listeners", len(lns), "under_master", d.UnderMaster())
 
@@ -314,12 +313,10 @@ const carrierCheckTimeout = 60 * time.Second
 //
 // Never fatal: the proxy may be transiently down and the broker's own loops keep
 // retrying. A pilot that wants a hard gate runs -carrier-check instead.
-func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server) {
+func logCarrierCheck(log *logging.Logger, srv *ccbserver.Server, ctx context.Context) {
 	if !srv.HasCarrier() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), carrierCheckTimeout)
-	defer cancel()
 	res := srv.CheckCarrier(ctx)
 	if err := res.Err(); err != nil {
 		log.Warn(logging.DestinationGeneral, "carrier health check failed; the broker will keep retrying",
@@ -381,11 +378,67 @@ func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daem
 
 // serveBroker starts srv's background work and serves its command socket on
 // every listener until d shuts down, logging each command the policy refuses.
+//
+// A tunneling broker verifies its carrier BEFORE serving, because
+// ServeListeners reports the daemon ready to condor_master (DC_SET_READY) as
+// soon as the accept loops are up, and the master starts this node's remaining
+// daemons on that signal. Readiness should mean the broker can do its job: if
+// it cannot reach its outside CCB, an EP started behind it has nowhere to go.
 func serveBroker(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server, az *daemon.Authz, lns ...net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	srv.StartBackground(ctx)
+	awaitCarrierReady(ctx, d, srv)
 	return d.ServeListeners(ctx, az.Serve(srv.CommandServer(), d.Slog()), lns...)
+}
+
+// awaitCarrierReady verifies the carrier and waits for the tunnel before the
+// daemon reports itself ready.
+//
+// It is deliberately not fatal. A broker that refused to start would be
+// restarted by condor_master in a loop, destroying the very diagnosis the staged
+// report just produced, and the proxy it could not reach a moment ago may be
+// back a moment later -- the broker's own loops keep retrying either way. So a
+// failure here is loud and the daemon carries on; what protects correctness is
+// that an inside CCB refuses to hand out a contact until it is tunnel-ready, so
+// an EP cannot be given an unroutable address in the meantime.
+func awaitCarrierReady(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server) {
+	if !srv.HasCarrier() {
+		return
+	}
+	log := d.Logger()
+	timeout := carrierReadyTimeout(d.Config())
+
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	logCarrierCheck(log, srv, cctx)
+
+	// The authoritative signal for an inside CCB: upstream registration has
+	// completed, so the contacts it hands out will nest. Returns at once for a
+	// broker with no upstream, where the check above was the whole story.
+	if err := srv.WaitTunnelReady(cctx); err != nil {
+		log.Warn(logging.DestinationGeneral,
+			"reporting ready without a tunnel: this broker has not registered with its outside CCB, so it cannot hand out routable contacts yet",
+			"waited", timeout, "error", err)
+		return
+	}
+	log.Info(logging.DestinationGeneral, "carrier ready", "tunnel_contact", srv.TunnelContact())
+}
+
+// carrierReadyTimeout bounds the wait before the daemon reports ready.
+// CCB_CARRIER_READY_TIMEOUT is in seconds.
+func carrierReadyTimeout(cfg *config.Config) time.Duration {
+	const def = 120 * time.Second
+	v, ok := cfg.Get("CCB_CARRIER_READY_TIMEOUT")
+	if !ok {
+		return def
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return def
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // buildSessionStore constructs the encrypted session-cache store when

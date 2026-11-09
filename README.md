@@ -19,6 +19,23 @@ Point HTCondor daemons at it with `CCB_ADDRESS = <public-host>:9618` (and a
 shared `SEC_*` configuration). They will register and become reachable through
 their advertised ccb contact (`<public-host>:9618#<id>`).
 
+## Execution points with no outbound network
+
+Worker nodes that cannot open outbound TCP — or may open only one or two sockets
+— can still join a pool, by pairing a broker on the node with a broker beside
+the pool and tunneling everything between them over a single connection. Where
+the site runs an HTTP proxy, that connection is a `wss://` tunnel through it;
+where it runs no network path at all, a shared filesystem will do.
+
+**Administrators start here: [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md)**
+— what to ask the site for, the configuration for both brokers and the execution
+point, how to verify it with `golang-ccb -carrier-check`, and what each failure
+means.
+
+- [docs/TRANSPORTS.md](docs/TRANSPORTS.md) — how the carriers work, and the
+  filesystem carrier.
+- [docs/E2E_SQUID_WS.md](docs/E2E_SQUID_WS.md) — how it is tested (developers).
+
 ## Protocol
 
 Commands (`condor_commands.h`): `CCB_REGISTER=67`, `CCB_REQUEST=68`,
