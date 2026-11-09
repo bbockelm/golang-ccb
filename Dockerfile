@@ -29,6 +29,11 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" \
     -o /out/golang-ccb ./cmd/golang-ccb
 
+# The runtime stage has no dynamic loader and no libc, so a cgo binary would
+# build here and then fail to exec with an error naming neither. Read the
+# binary rather than trust the variable above.
+RUN ./packaging/check-static.sh /out/golang-ccb
+
 # ---- runtime stage ----
 FROM gcr.io/distroless/static-debian12:nonroot
 
