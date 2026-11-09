@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -70,6 +71,7 @@ type carrierClient struct {
 	token       string
 	tokenSource func(ctx context.Context) (string, error)
 	clientTLS   *tls.Config
+	proxy       func(*http.Request) (*url.URL, error)
 
 	mu   sync.Mutex
 	md   *carrier.MuxDialer
@@ -83,6 +85,7 @@ func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) *carrierClie
 		token:       cfg.CarrierToken,
 		tokenSource: cfg.CarrierTokenSource,
 		clientTLS:   cfg.CarrierClientTLS,
+		proxy:       cfg.CarrierProxy,
 	}
 }
 
@@ -92,15 +95,38 @@ func (c *carrierClient) dialPipe(ctx context.Context) (net.Conn, error) {
 	case "fs":
 		return fstun.Dial(ctx, c.ref.fstunConfig())
 	case "ws":
-		return wscarrier.Dial(ctx, wscarrier.DialConfig{
-			URL:         c.ref.url,
-			Token:       c.token,
-			TokenSource: c.tokenSource,
-			TLS:         c.clientTLS,
-		})
+		return wscarrier.Dial(ctx, c.wsDialConfig())
 	default:
 		return nil, fmt.Errorf("ccbserver: unknown carrier scheme %q", c.ref.scheme)
 	}
+}
+
+// wsDialConfig is the WebSocket dial parameters for this carrier, in one place
+// so the dial and the route reported in logs cannot drift apart.
+func (c *carrierClient) wsDialConfig() wscarrier.DialConfig {
+	return wscarrier.DialConfig{
+		URL:         c.ref.url,
+		Token:       c.token,
+		TokenSource: c.tokenSource,
+		TLS:         c.clientTLS,
+		Proxy:       c.proxy,
+	}
+}
+
+// route describes how this carrier reaches its peer -- "direct" or "via
+// <proxy>" -- for the session log. An operator (and a test) otherwise cannot
+// tell a proxied carrier from one that silently ignored a configured proxy and
+// dialed out directly, which on a node with no route out is the whole
+// diagnosis. Empty for carriers with no notion of a route.
+func (c *carrierClient) route() string {
+	if c.ref.scheme != "ws" {
+		return ""
+	}
+	proxyURL, err := c.wsDialConfig().ResolvedProxy()
+	if err != nil {
+		return "unresolved (" + err.Error() + ")"
+	}
+	return wscarrier.RouteDescription(proxyURL)
 }
 
 func (c *carrierClient) describe() string {
@@ -141,13 +167,18 @@ func (c *carrierClient) session(ctx context.Context) (*carrier.MuxDialer, error)
 	if err != nil {
 		return nil, fmt.Errorf("carrier %s: dialing pipe: %w", c.describe(), err)
 	}
+
 	md, err := carrier.NewMuxDialer(pipe)
 	if err != nil {
 		_ = pipe.Close()
 		return nil, fmt.Errorf("carrier %s: yamux client: %w", c.describe(), err)
 	}
 	c.md = md
-	c.log.Info("carrier session established", "carrier", c.describe())
+	attrs := []any{"carrier", c.describe()}
+	if r := c.route(); r != "" {
+		attrs = append(attrs, "route", r)
+	}
+	c.log.Info("carrier session established", attrs...)
 	return md, nil
 }
 
