@@ -1,7 +1,7 @@
-github.com/PelicanPlatform/classad v0.38.0 h1:9Uet68B9TR9JnLuWi3hqA0LZkxiYRDD9dGw0xBjkiew=
-github.com/PelicanPlatform/classad v0.38.0/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
-github.com/bbockelm/cedar v0.7.13 h1:xAkO9fE2oTaTVY+79P9i43N5ccPnBU7wu8PhkOYXqXY=
-github.com/bbockelm/cedar v0.7.13/go.mod h1:F+smiPjoyfMaXXz/15vguiP9QKjJpGqWar/qnVraa5M=
+github.com/PelicanPlatform/classad v0.38.2 h1:FqhqCbSZg/soRV4E0swPP1uU/53nLvXSY4Sak5zQq0U=
+github.com/PelicanPlatform/classad v0.38.2/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
+github.com/bbockelm/cedar v0.7.14 h1:Fkjyj0ENc/yiPlzwuxe0W+8s4Bcv+mqU6HEpPKge71s=
+github.com/bbockelm/cedar v0.7.14/go.mod h1:2eWqCc8NXXVXeM3fiL2KZstx7LzcvI3aPznav9SKa/Q=
 github.com/bbockelm/golang-htcondor v0.22.1 h1:eVLf08GlNZKcsrxtNHZKARGapZkdh+nseGzlljL5mkI=
 github.com/bbockelm/golang-htcondor v0.22.1/go.mod h1:S/ULg2+k+0XuXsSa9djUnoQqWrd5pkwmjYVjBKcxPyI=
 github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=
