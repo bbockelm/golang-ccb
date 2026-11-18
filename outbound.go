@@ -161,7 +161,17 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 	}
 	s.log.Info("proxy-connect splice established", "remote", c.RemoteAddr, "target", target,
 		"via", s.outbound.describe(), "name", name)
-	spliceConns(c.Stream.GetConnection(), targetConn)
+	st := spliceConns(c.Stream.GetConnection(), targetConn)
+	// A relay that only ever logs its start cannot be used to tell a transport
+	// failure from an application one. The counterpart carries how much crossed
+	// in each direction, how long it lasted, and why it stopped.
+	args := append([]any{"remote", c.RemoteAddr, "target", target,
+		"via", s.outbound.describe(), "name", name}, st.LogArgs()...)
+	if st.OK() {
+		s.log.Info("proxy-connect splice closed", args...)
+	} else {
+		s.log.Warn("proxy-connect splice failed", args...)
+	}
 	return cedarserver.KeepOpen()
 }
 
