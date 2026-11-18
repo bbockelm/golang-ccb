@@ -21,7 +21,7 @@ component is a second `htc-ccb`, one on each side.
 | open outbound TCP, but too few sockets | this guide; the whole node collapses to one connection |
 | reach only an HTTP proxy, to approved destinations | this guide |
 | reach nothing, but you can `ssh` **in** to the cluster's login host | this guide — §4.5 shape A, the usual cluster |
-| `ssh` **out** to a bastion and nothing else | this guide — §4.5 shapes B and C |
+| `ssh` **out** to a bastion and nothing else | this guide — §4.5 shape B |
 | reach nothing at all, but share a filesystem with the pool | the filesystem carrier in [TRANSPORTS.md](TRANSPORTS.md) §4 |
 
 If an ordinary CCB works at your site, use it. What follows costs you a public
