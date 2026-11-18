@@ -235,6 +235,11 @@ func (p *process) drainStderr(r *os.File) {
 // annotate explains an I/O error on the pipe. A carrier command that failed to
 // connect shows up as a bare EOF, and the reason is in the child's exit status
 // and its last stderr lines -- which is the whole diagnosis for ssh.
+//
+// Both the I/O error and the child's exit status are wrapped (fmt.Errorf takes
+// more than one %w since Go 1.20), so a caller can still recognize the
+// underlying io.EOF AND reach the *exec.ExitError for the exit code, rather
+// than having to scrape either out of the message.
 func (p *process) annotate(err error) error {
 	select {
 	case <-p.waited:
@@ -245,9 +250,9 @@ func (p *process) annotate(err error) error {
 
 	switch {
 	case exited && exitErr != nil && detail != "":
-		return fmt.Errorf("carrier command %s exited (%v); its last output was: %s: %w", p.label, exitErr, detail, err)
+		return fmt.Errorf("carrier command %s exited (%w); its last output was: %s: %w", p.label, exitErr, detail, err)
 	case exited && exitErr != nil:
-		return fmt.Errorf("carrier command %s exited (%v) without explaining why; run it by hand to see what it reports: %w", p.label, exitErr, err)
+		return fmt.Errorf("carrier command %s exited (%w) without explaining why; run it by hand to see what it reports: %w", p.label, exitErr, err)
 	case exited && detail != "":
 		return fmt.Errorf("carrier command %s exited cleanly, closing the carrier; its last output was: %s: %w", p.label, detail, err)
 	case exited:

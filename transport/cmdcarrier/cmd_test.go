@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -175,5 +176,26 @@ func TestDialContextDoesNotOwnThePipe(t *testing.T) {
 	}
 	if _, err := io.ReadFull(c, buf); err != nil {
 		t.Fatalf("read after the dial context was cancelled: %v", err)
+	}
+}
+
+// The annotated error keeps both of its causes reachable: the I/O error that
+// ended the read, and the child's exit status. Scraping either out of the
+// message text would be the alternative.
+func TestAnnotatedErrorUnwrapsToBothCauses(t *testing.T) {
+	c := dialArgv(t, "/bin/sh", "-c", "echo nope >&2; exit 42")
+	_, err := io.ReadAll(c)
+	if err == nil {
+		t.Fatal("reading from a pipe whose child died returned no error")
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("errors.Is(err, io.EOF) = false; the underlying read error was lost: %v", err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("errors.As(err, *exec.ExitError) = false; the exit status is not reachable: %v", err)
+	}
+	if got := exitErr.ExitCode(); got != 42 {
+		t.Errorf("ExitCode() = %d, want 42", got)
 	}
 }

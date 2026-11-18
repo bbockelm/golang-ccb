@@ -247,34 +247,9 @@ func run() error {
 	// inbound tunneling (§5). Both make this broker a CCB *client* of the next hop,
 	// so build a client-side security config (this daemon's own credentials)
 	// under SEC_CLIENT_*, as an HTCondor daemon's CCB client does.
-	var outboundNextHop string
-	var nextHopSec *security.SecurityConfig
-	var upstream *ccbserver.UpstreamConfig
-	hop, hopSet := d.Config().Get("CCB_OUTBOUND_NEXT_HOP")
-	if *carrierStdio {
-		// The flag is sugar for the config knob, so everything downstream --
-		// upstream registration, outbound forwarding -- is wired exactly as it
-		// is for any other carrier.
-		if hopSet && hop != "" && hop != "stdio:" && hop != "stdio" {
-			return fmt.Errorf("-carrier-stdio conflicts with CCB_OUTBOUND_NEXT_HOP = %q; the broker has one carrier, so set one or the other", hop)
-		}
-		hop, hopSet = "stdio:", true
-	}
-	if hopSet && hop != "" {
-		outboundNextHop = hop
-		nextHopSec, err = htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "CLIENT")
-		if err != nil {
-			return fmt.Errorf("building next-hop client security config: %w", err)
-		}
-		nextHopSec.RemoteVersion = streamingVersionString
-		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
-		upstream = &ccbserver.UpstreamConfig{
-			BrokerAddr: hop,
-			Security:   nextHopSec,
-			ReadyFile:  readyFile,
-		}
-		log.Info(logging.DestinationGeneral, "inside CCB: tunneling through next hop",
-			"next_hop", hop, "ready_file", readyFile)
+	outboundNextHop, nextHopSec, upstream, err := insideRole(d, *carrierStdio, log)
+	if err != nil {
+		return err
 	}
 
 	// Non-TCP carrier wiring (see docs/TRANSPORTS.md). CCB_CARRIER_LISTEN makes
@@ -872,6 +847,42 @@ func carrierAuthName(unauthenticated bool) string {
 		return "none"
 	}
 	return "token"
+}
+
+// insideRole resolves this broker's inside-CCB role: the next hop it forwards
+// outbound proxy requests to, and the upstream it registers with for inbound
+// tunneling. Both make this broker a CCB *client* of the next hop, so the
+// security config is built under SEC_CLIENT_*, as an HTCondor daemon's CCB
+// client does. Returns zero values when no next hop is configured, which is the
+// ordinary outside-or-standalone broker.
+func insideRole(d *daemon.Daemon, carrierStdio bool, log *logging.Logger) (string, *security.SecurityConfig, *ccbserver.UpstreamConfig, error) {
+	hop, ok := d.Config().Get("CCB_OUTBOUND_NEXT_HOP")
+	if carrierStdio {
+		// The flag is sugar for the config knob, so everything downstream --
+		// upstream registration, outbound forwarding -- is wired exactly as it
+		// is for any other carrier.
+		if ok && hop != "" && hop != "stdio:" && hop != "stdio" {
+			return "", nil, nil, fmt.Errorf("-carrier-stdio conflicts with CCB_OUTBOUND_NEXT_HOP = %q; the broker has one carrier, so set one or the other", hop)
+		}
+		hop, ok = "stdio:", true
+	}
+	if !ok || hop == "" {
+		return "", nil, nil, nil
+	}
+
+	sec, err := htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "CLIENT")
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("building next-hop client security config: %w", err)
+	}
+	sec.RemoteVersion = streamingVersionString
+	readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
+	log.Info(logging.DestinationGeneral, "inside CCB: tunneling through next hop",
+		"next_hop", hop, "ready_file", readyFile)
+	return hop, sec, &ccbserver.UpstreamConfig{
+		BrokerAddr: hop,
+		Security:   sec,
+		ReadyFile:  readyFile,
+	}, nil
 }
 
 // configSeconds reads a knob expressed in seconds. Unset, empty or
