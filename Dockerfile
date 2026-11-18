@@ -14,7 +14,17 @@
 #     htc-ccb -listen :9618 -public <public-host>:9618
 
 # ---- build stage ----
-FROM golang:1.27 AS build
+#
+# Pinned to the BUILD platform and cross-compiled with GOOS/GOARCH rather than
+# emulated. A multi-arch `docker buildx --platform linux/amd64,linux/arm64`
+# would otherwise run the arm64 compile under QEMU, which for a Go build is
+# minutes of emulated work for a toolchain that cross-compiles natively in
+# seconds. BuildKit sets BUILDPLATFORM/TARGETOS/TARGETARCH itself, so a plain
+# `docker build .` still works and simply targets the host.
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -26,12 +36,17 @@ COPY . .
 
 # Static, stripped, reproducible binary. buildvcs=false because .git is not in
 # the build context (see .dockerignore).
-RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -buildvcs=false -ldflags="-s -w" \
     -o /out/htc-ccb ./cmd/htc-ccb
 
 # The runtime stage has no dynamic loader and no libc, so a cgo binary would
 # build here and then fail to exec with an error naming neither. Read the
 # binary rather than trust the variable above.
+#
+# Safe to run on the build platform even for a cross-built binary: the script
+# inspects `go version -m` and the ELF headers, and never executes what it
+# checks.
 RUN ./packaging/check-static.sh /out/htc-ccb
 
 # ---- runtime stage ----
