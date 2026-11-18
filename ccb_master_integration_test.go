@@ -124,6 +124,14 @@ SEC_TOKEN_POOL_SIGNING_KEY_FILE = %s
 TRUST_DOMAIN = ccb.test
 
 # --- A tiny, fast vanilla job works ---
+# Matching is normally prompt -- the negotiator cycles at startup and on the
+# schedd's reschedule -- but if that first cycle lands before the startd has
+# advertised, the next one is NEGOTIATOR_INTERVAL away. At the 60s default
+# that makes the 150s condor_wait below a two-cycle budget, and on a loaded
+# machine missing twice is enough to time out. Same reasoning as
+# CCB_RECONNECT_TIME above: make the retry after the inevitable startup race
+# cheap rather than inheriting a production default.
+NEGOTIATOR_INTERVAL = 5
 START = TRUE
 SUSPEND = FALSE
 CONTINUE = TRUE
