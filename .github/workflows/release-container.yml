@@ -91,6 +91,17 @@ jobs:
       # is distinguished -- which is precisely the failure a cross-build or a
       # stray cgo dependency would introduce.
       - name: Smoke-test the amd64 image
+        # The image runs as `nonroot` out of a distroless base with no shell,
+        # so there is no `docker run ... sh -c` available. -carrier-check with
+        # nothing configured runs the daemon's startup and exits non-zero on
+        # the missing carrier, which distinguishes "the binary ran" from "the
+        # binary did not exec" -- the failure a bad cross-build or a stray cgo
+        # dependency would produce.
+        #
+        # Asserts on the startup BANNER rather than the absence of error
+        # strings: htc-ccb warns about a missing shared_port ad with a message
+        # containing "no such file or directory", and an earlier version of
+        # this check failed on that -- on an image that was perfectly fine.
         env:
           # Multi-line; the first is enough to name the image just pushed.
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -101,11 +112,12 @@ jobs:
           out="$(docker run --rm --platform linux/amd64 "${image}" \
             -listen 127.0.0.1:0 -carrier-check 2>&1 || true)"
           echo "${out}"
-          # Any output at all means the binary ran. An exec failure prints a
-          # loader error from the runtime, not from htc-ccb.
           case "${out}" in
-            *"exec format error"*|*"no such file or directory"*|"")
-              echo "::error::htc-ccb did not exec in the published image"
+            *"CCB starting"*)
+              echo "ok: htc-ccb exec'd and reached its own startup"
+              ;;
+            *)
+              echo "::error::htc-ccb did not run in the published image"
               exit 1
               ;;
           esac

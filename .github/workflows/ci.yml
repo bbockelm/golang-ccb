@@ -172,17 +172,27 @@ jobs:
 
     - name: Smoke-test the image
       # distroless with no shell, so there is no `docker run ... sh -c` to
-      # fall back on. -carrier-check with nothing configured exits non-zero
-      # after printing its own error, which is enough to distinguish "the
-      # binary ran" from "the binary did not exec" -- the failure a bad
-      # cross-build or a stray cgo dependency would produce.
+      # fall back on. -carrier-check with nothing configured runs the daemon's
+      # startup and then exits non-zero on the missing carrier, which is
+      # enough to tell "the binary ran" from "the binary did not exec" -- the
+      # failure a bad cross-build or a stray cgo dependency would produce.
+      #
+      # Asserts on the startup BANNER, not on the absence of error strings.
+      # The first version of this check looked for "no such file or directory"
+      # and duly failed on htc-ccb's own harmless warning about a missing
+      # shared_port ad, which contains exactly that phrase. A binary that
+      # cannot exec never reaches its own logging, so the banner is the signal
+      # that actually means what it is being asked to mean.
       run: |
         set -uo pipefail
         out="$(docker run --rm htc-ccb:ci -listen 127.0.0.1:0 -carrier-check 2>&1 || true)"
         echo "${out}"
         case "${out}" in
-          *"exec format error"*|*"no such file or directory"*|"")
-            echo "::error::htc-ccb did not exec in the built image"
+          *"CCB starting"*)
+            echo "ok: htc-ccb exec'd and reached its own startup"
+            ;;
+          *)
+            echo "::error::htc-ccb did not run in the built image"
             exit 1
             ;;
         esac
