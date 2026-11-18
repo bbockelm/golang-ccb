@@ -25,6 +25,7 @@ someone wants to reach it the broker tells it to dial *back*.
 | Both ends private (an EP and a submit host that cannot reach each other) | the collector's CCB does this from HTCondor 26.0.0; **this** if you also want the broker off the collector's host |
 | Worker nodes that may open only one or two sockets, or reach only an HTTP proxy | **this** — see [§7](#7-execution-points-with-no-outbound-network) |
 | Worker nodes with no network path at all, but a shared filesystem | **this** — see [docs/TRANSPORTS.md](docs/TRANSPORTS.md) |
+| Nodes that may reach only a bastion over SSH | **this** — the carrier can be `ssh` itself, see [docs/TRANSPORTS.md §5](docs/TRANSPORTS.md) |
 
 If the collector's built-in CCB already works for you, there is no reason to
 change. What you get here is a broker you can put on its own host, restart
@@ -289,8 +290,9 @@ Worker nodes that cannot open outbound TCP — or may open only one or two
 sockets — can still join a pool, by pairing a broker **on the node** with a
 broker **beside the pool** and tunneling everything between them over a single
 connection. Where the site runs an HTTP proxy, that connection is a `wss://`
-tunnel through it; where it runs no network path at all, a shared filesystem
-will do.
+tunnel through it; where it permits only SSH to a bastion, the connection is an
+`ssh` the broker runs itself; where it runs no network path at all, a shared
+filesystem will do.
 
 **Start here: [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md)** — what to ask
 the site for, the configuration for both brokers and the execution point, how to
