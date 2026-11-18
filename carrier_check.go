@@ -68,6 +68,12 @@ func (s *Server) checkFarBroker(ctx context.Context) wscarrier.StageResult {
 		st.Elapsed = time.Since(start)
 		st.Err = err
 		st.Advice = "the carrier pipe is up but no logical connection could be multiplexed over it; the far end may not be serving a CCB on this carrier"
+		// A carrier backed by a command knows something nothing above the pipe
+		// can: why the child went away. For ssh that is the whole diagnosis,
+		// and without it this stage reports a bare EOF.
+		if d := s.carrier.pipeDiagnostics(); d != "" {
+			st.Advice = d
+		}
 		return st
 	}
 	defer func() { _ = conn.Close() }()
@@ -101,6 +107,9 @@ func (s *Server) checkFarBroker(ctx context.Context) wscarrier.StageResult {
 	default:
 		st.Err = err
 		st.Advice = "the far end answered but the CEDAR handshake failed; check that both brokers share a pool signing key / trust domain and agree on SEC_* policy"
+		if d := s.carrier.pipeDiagnostics(); d != "" {
+			st.Advice += "; " + d
+		}
 	}
 	return st
 }
@@ -156,3 +165,21 @@ func (s *Server) carrierPeerSecurity() *security.SecurityConfig {
 // HasCarrier reports whether this broker dials a carrier to reach its outside
 // CCB, i.e. whether CheckCarrier has anything to check.
 func (s *Server) HasCarrier() bool { return s.carrier != nil }
+
+// CarrierExhausted is closed when this broker's carrier can never be
+// re-established. Only a stdio carrier reaches that state: its pipe came from
+// the process that started this broker -- an ssh session, normally -- and when
+// that closes there is no way to obtain another, nor any route by which anyone
+// could reach this broker again. The daemon shuts down on this signal rather
+// than idling unreachably.
+//
+// Every other carrier is re-established on demand, so a carrier that is merely
+// down never closes this channel.
+func (s *Server) CarrierExhausted() <-chan struct{} { return s.carrierExhausted }
+
+func (s *Server) markCarrierExhausted() {
+	s.carrierExhaustedOnce.Do(func() {
+		s.log.Warn("the carrier can never be re-established; this broker is now unreachable and will shut down")
+		close(s.carrierExhausted)
+	})
+}

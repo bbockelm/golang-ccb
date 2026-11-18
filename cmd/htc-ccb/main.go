@@ -31,6 +31,7 @@ import (
 	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
+	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
 
@@ -63,6 +64,7 @@ func run() error {
 	// config lookups (CCB.<key> / <local-name>.<key> beat the bare key).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
+	carrierStdio := flag.Bool("carrier-stdio", false, "take this process's stdin and stdout as the carrier to the outside CCB, and run as the inside broker over it. This is what `ssh <node> htc-ccb -carrier-stdio` starts at the far end of a cmd: carrier: the broker joins the pool through the pipe it was started with and binds no port of its own to reach the outside. Equivalent to CCB_OUTBOUND_NEXT_HOP = stdio:.")
 	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; a diagnostic to run by hand when a node cannot reach its broker.")
 	flag.Parse()
 
@@ -76,6 +78,20 @@ func run() error {
 			listenExplicit = true
 		}
 	})
+
+	// Claim stdin and stdout for the carrier before anything else runs. The
+	// pipe carries a framed protocol, so one line written to stdout in between
+	// -- a config loader's warning, a startup banner -- would corrupt it, and
+	// the symptom would be an unintelligible yamux error at the far end.
+	// Claiming here also points stdout at stderr, so a later stray write is
+	// harmless.
+	var stdioPipe net.Conn
+	if *carrierStdio {
+		var err error
+		if stdioPipe, err = cmdcarrier.Stdio(nil); err != nil {
+			return err
+		}
+	}
 
 	cfg, err := config.NewWithOptions(config.ConfigOptions{Subsystem: "CCB", LocalName: *localName})
 	if err != nil {
@@ -231,24 +247,9 @@ func run() error {
 	// inbound tunneling (§5). Both make this broker a CCB *client* of the next hop,
 	// so build a client-side security config (this daemon's own credentials)
 	// under SEC_CLIENT_*, as an HTCondor daemon's CCB client does.
-	var outboundNextHop string
-	var nextHopSec *security.SecurityConfig
-	var upstream *ccbserver.UpstreamConfig
-	if hop, ok := d.Config().Get("CCB_OUTBOUND_NEXT_HOP"); ok && hop != "" {
-		outboundNextHop = hop
-		nextHopSec, err = htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "CLIENT")
-		if err != nil {
-			return fmt.Errorf("building next-hop client security config: %w", err)
-		}
-		nextHopSec.RemoteVersion = streamingVersionString
-		readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
-		upstream = &ccbserver.UpstreamConfig{
-			BrokerAddr: hop,
-			Security:   nextHopSec,
-			ReadyFile:  readyFile,
-		}
-		log.Info(logging.DestinationGeneral, "inside CCB: tunneling through next hop",
-			"next_hop", hop, "ready_file", readyFile)
+	outboundNextHop, nextHopSec, upstream, err := insideRole(d, *carrierStdio, log)
+	if err != nil {
+		return err
 	}
 
 	// Non-TCP carrier wiring (see docs/TRANSPORTS.md). CCB_CARRIER_LISTEN makes
@@ -259,6 +260,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	cc.pipe = stdioPipe
 	if cc.sciTokens != nil {
 		d.OnReconfig(cc.sciTokens.load)
 	}
@@ -295,6 +297,12 @@ func run() error {
 		CarrierTokenSource:      cc.tokenSource,
 		CarrierProxy:            cc.proxy,
 		CarrierKeepalive:        cc.keepalive,
+		CarrierCommandEnv:       cc.commandEnv,
+		CarrierCommandDir:       cc.commandDir,
+		CarrierCommandGrace:     cc.commandGrace,
+		CarrierRetryInitial:     cc.retryInitial,
+		CarrierRetryMax:         cc.retryMax,
+		CarrierPipe:             cc.pipe,
 		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
@@ -429,6 +437,21 @@ func serveBroker(ctx context.Context, d *daemon.Daemon, srv *ccbserver.Server, a
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	srv.StartBackground(ctx)
+
+	// A broker whose carrier can never be re-established has no way back to the
+	// pool and no way for anyone to reach it. That is only reachable for a
+	// stdio carrier, where the pipe came from the process that started this one
+	// -- normally an ssh session that has now ended -- so shut down and let the
+	// parent see us exit, rather than idling unreachably until something
+	// notices.
+	go func() {
+		select {
+		case <-srv.CarrierExhausted():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	awaitCarrierReady(ctx, d, srv)
 	return d.ServeListeners(ctx, az.Serve(srv.CommandServer(), d.Slog()), lns...)
 }
@@ -554,6 +577,16 @@ type carrierSettings struct {
 	maxPerSource    int
 	probation       time.Duration
 	probationOff    bool
+	// cmd: carrier child-process settings.
+	commandEnv   []string
+	commandDir   string
+	commandGrace time.Duration
+	// Backoff for an outside broker that obtains its pipes by reaching out.
+	retryInitial time.Duration
+	retryMax     time.Duration
+	// pipe is a carrier pipe already claimed before the daemon started
+	// logging, for -carrier-stdio.
+	pipe net.Conn
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -562,6 +595,11 @@ type carrierSettings struct {
 func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outboundNextHop string, upstream *ccbserver.UpstreamConfig, log *slog.Logger) (carrierSettings, error) {
 	var cc carrierSettings
 	cc.listen, _ = cfg.Get("CCB_CARRIER_LISTEN")
+	cc.commandDir, _ = cfg.Get("CCB_CARRIER_COMMAND_DIR")
+	cc.commandEnv = carrierCommandEnv(cfg)
+	cc.commandGrace = configSeconds(cfg, "CCB_CARRIER_COMMAND_GRACE")
+	cc.retryInitial = configSeconds(cfg, "CCB_CARRIER_RETRY_INITIAL")
+	cc.retryMax = configSeconds(cfg, "CCB_CARRIER_RETRY_MAX")
 	cc.maxSessions = configInt(cfg, "CCB_CARRIER_MAX_SESSIONS", 0)
 	cc.maxPerSource = configInt(cfg, "CCB_CARRIER_MAX_PER_SOURCE", 0)
 	// An explicit 0 turns probation off; leaving the knob unset keeps the
@@ -809,4 +847,77 @@ func carrierAuthName(unauthenticated bool) string {
 		return "none"
 	}
 	return "token"
+}
+
+// insideRole resolves this broker's inside-CCB role: the next hop it forwards
+// outbound proxy requests to, and the upstream it registers with for inbound
+// tunneling. Both make this broker a CCB *client* of the next hop, so the
+// security config is built under SEC_CLIENT_*, as an HTCondor daemon's CCB
+// client does. Returns zero values when no next hop is configured, which is the
+// ordinary outside-or-standalone broker.
+func insideRole(d *daemon.Daemon, carrierStdio bool, log *logging.Logger) (string, *security.SecurityConfig, *ccbserver.UpstreamConfig, error) {
+	hop, ok := d.Config().Get("CCB_OUTBOUND_NEXT_HOP")
+	if carrierStdio {
+		// The flag is sugar for the config knob, so everything downstream --
+		// upstream registration, outbound forwarding -- is wired exactly as it
+		// is for any other carrier.
+		if ok && hop != "" && hop != "stdio:" && hop != "stdio" {
+			return "", nil, nil, fmt.Errorf("-carrier-stdio conflicts with CCB_OUTBOUND_NEXT_HOP = %q; the broker has one carrier, so set one or the other", hop)
+		}
+		hop, ok = "stdio:", true
+	}
+	if !ok || hop == "" {
+		return "", nil, nil, nil
+	}
+
+	sec, err := htcondor.GetSecurityConfig(d.Config(), ccb.CommandRegister, "CLIENT")
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("building next-hop client security config: %w", err)
+	}
+	sec.RemoteVersion = streamingVersionString
+	readyFile, _ := d.Config().Get("CCB_TUNNEL_READY_FILE")
+	log.Info(logging.DestinationGeneral, "inside CCB: tunneling through next hop",
+		"next_hop", hop, "ready_file", readyFile)
+	return hop, sec, &ccbserver.UpstreamConfig{
+		BrokerAddr: hop,
+		Security:   sec,
+		ReadyFile:  readyFile,
+	}, nil
+}
+
+// configSeconds reads a knob expressed in seconds. Unset, empty or
+// unparseable yields 0, which every caller reads as "use the default" -- a
+// typo must not silently become an aggressive value.
+func configSeconds(cfg *config.Config, key string) time.Duration {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return 0
+	}
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// carrierCommandEnv builds the environment of a cmd: carrier's child process.
+//
+// Unset, the child inherits the broker's own environment, which is what lets
+// ssh find HOME (and so ~/.ssh/config and the known-hosts file), SSH_AUTH_SOCK
+// and KRB5CCNAME. CCB_CARRIER_COMMAND_ENV adds to or overrides that with
+// NAME=VALUE entries, so a broker running as the condor user can be pointed at
+// a specific HOME without changing the daemon's own environment.
+func carrierCommandEnv(cfg *config.Config) []string {
+	v, ok := cfg.Get("CCB_CARRIER_COMMAND_ENV")
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	env := os.Environ()
+	for _, entry := range strings.Fields(v) {
+		if !strings.Contains(entry, "=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
 }

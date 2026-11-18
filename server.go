@@ -197,6 +197,35 @@ type Config struct {
 	// direct dial. A proxied carrier must be wss:// (CONNECT). Mirrors config
 	// CCB_CARRIER_PROXY.
 	CarrierProxy func(*http.Request) (*url.URL, error)
+	// CarrierCommandEnv is the environment of a cmd: carrier's child process.
+	// Nil inherits the broker's own, which is what lets ssh find HOME (for
+	// ~/.ssh/config), SSH_AUTH_SOCK and KRB5CCNAME. Mirrors config
+	// CCB_CARRIER_COMMAND_ENV.
+	CarrierCommandEnv []string
+
+	// CarrierCommandDir is the working directory of a cmd: carrier's child
+	// process; empty means the broker's own. Mirrors config
+	// CCB_CARRIER_COMMAND_DIR.
+	CarrierCommandDir string
+
+	// CarrierCommandGrace is how long a closing cmd: carrier waits after
+	// SIGTERM before SIGKILL. 0 uses cmdcarrier.DefaultTerminateGrace. Mirrors
+	// config CCB_CARRIER_COMMAND_GRACE.
+	CarrierCommandGrace time.Duration
+
+	// CarrierPipe, if set, is an already-established byte pipe to use for a
+	// "stdio:" carrier instead of claiming this process's descriptors here. The
+	// daemon claims them before it starts logging, because a single line
+	// written to stdout in between would corrupt the carrier.
+	CarrierPipe net.Conn
+
+	// CarrierRetryInitial and CarrierRetryMax bound how fast an outside broker
+	// retries a carrier whose pipe it obtains by reaching out (a cmd: carrier
+	// in CarrierListen). 0 uses carrier.DefaultBackoff. Mirrors config
+	// CCB_CARRIER_RETRY_INITIAL and CCB_CARRIER_RETRY_MAX.
+	CarrierRetryInitial time.Duration
+	CarrierRetryMax     time.Duration
+
 	// DialControl, if set, is installed as net.Dialer.Control on the TCP dials
 	// this broker makes to addresses a remote party chose: the reverse connects
 	// an inside CCB makes for requests forwarded through its Upstream
@@ -257,6 +286,12 @@ type Server struct {
 	// registration and the outbound next-hop forwarding.
 	carrier *carrierClient
 
+	// carrierExhausted is closed when this broker's carrier can never be
+	// re-established -- a stdio carrier whose parent has gone away. The daemon
+	// watches it and shuts down, because nothing can reach this broker again.
+	carrierExhausted     chan struct{}
+	carrierExhaustedOnce sync.Once
+
 	bgOnce sync.Once // StartBackground
 }
 
@@ -309,12 +344,13 @@ func New(cfg Config) (*Server, error) {
 		cfg.Logger = slog.Default()
 	}
 	s := &Server{
-		cfg:        cfg,
-		log:        cfg.Logger,
-		targets:    map[uint64]*target{},
-		reconnects: map[uint64]*ReconnectRecord{},
-		requests:   map[uint64]*request{},
-		proxies:    map[string]*proxySession{},
+		cfg:              cfg,
+		log:              cfg.Logger,
+		targets:          map[uint64]*target{},
+		reconnects:       map[uint64]*ReconnectRecord{},
+		requests:         map[uint64]*request{},
+		proxies:          map[string]*proxySession{},
+		carrierExhausted: make(chan struct{}),
 	}
 	// Detect a non-TCP carrier on the inside-CCB knobs (a shared pipe to the
 	// outside CCB backing both upstream registration and outbound forwarding).
@@ -323,6 +359,15 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s.carrier = cc
+	if cc != nil {
+		// The inside role notices an exhausted pipe on its next dial; the
+		// outside role notices it on accept. Either way the daemon watches one
+		// channel.
+		go func() {
+			<-cc.Exhausted()
+			s.markCarrierExhausted()
+		}()
+	}
 
 	// Choose how an outbound proxy reaches a target: forward to a next-hop CCB
 	// (inside CCB, two-CCB tunnel) or dial directly (exit CCB).

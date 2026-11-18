@@ -1,15 +1,19 @@
 # CCB tunneling: pluggable carriers (non-TCP transports)
 
 CCB tunneling (see the C++ tree's `CCB_TUNNELING_DESIGN.md`) routes all of a
-restricted node's traffic through an **inside CCB → outside CCB** pair. Today the
-inside↔outside link is TCP. This document designs two alternative *carriers* for
-that one link, so a site that forbids outbound TCP entirely (or throttles live
-socket counts to ~1) can still tunnel:
+restricted node's traffic through an **inside CCB → outside CCB** pair. The
+default inside↔outside link is TCP. This document describes the alternative
+*carriers* for that one link, so a site that forbids outbound TCP entirely (or
+throttles live socket counts to ~1) can still tunnel:
 
-1. **WebSocket over HTTP/2** — a single long-lived TCP connection to an HTTPS port
-   on the outside CCB, token-authenticated. (Sketch; §3.)
+1. **WebSocket** — a single long-lived TCP connection to an HTTPS port on the
+   outside CCB, token-authenticated, optionally through a site HTTP proxy. (§3.)
 2. **Filesystem tunnel** — no sockets at all between the brokers: they rendezvous
-   through a shared (NFS-like) directory. (Detailed; §4. The fun one.)
+   through a shared (NFS-like) directory. (§4. The fun one.)
+3. **Command and stdio** — the pipe is a child process's stdin and stdout, so the
+   transport is whatever the operator runs: `ssh`, `kubectl exec`, a site gateway
+   wrapper. (§5.)
+4. **Raw TCP pipes** — where a relayed carrier lands. (§5.4.)
 
 Only the inside↔outside link changes. The outside CCB still faces the pool over
 normal TCP CEDAR; clients reaching a tunneled EP are unchanged. End-to-end CEDAR
@@ -63,9 +67,24 @@ reliable, ordered, bidirectional byte stream.
   goroutine that `Accept()`s streams and hands each to `srv.Serve` — identical to
   the TCP accept loop.
 
-The carrier is selected by the scheme of the broker address:
-`CCB_OUTBOUND_NEXT_HOP = fs:/gpfs/ccb/outbound` (filesystem) or `wss://cm.example`
-(websocket). A bare `host:port` keeps TCP.
+The carrier is selected by the scheme of the broker address, and the **role** by
+which knob that address appears in — `CCB_OUTBOUND_NEXT_HOP` (and
+`Upstream.BrokerAddr`) for the inside broker, `CCB_CARRIER_LISTEN` for the
+outside one. A bare `host:port` is not a carrier and keeps the default TCP path.
+
+| Address | Carrier | |
+|---|---|---|
+| `fs:/gpfs/ccb/outbound` | filesystem rendezvous | §4 |
+| `wss://cm.example.org/ccb/tunnel` | WebSocket over TLS | §3 |
+| `ws://cm.example.org/ccb/tunnel` | WebSocket, plaintext (test/dev) | §3 |
+| `tcp://host:9700` | raw carrier pipe over TCP | §5.4 |
+| `cmd:ssh bastion htc-ccb -carrier-stdio` | the command's stdin/stdout | §5 |
+| `stdio:` | this process's own stdin/stdout | §5.3 |
+
+Obtaining a pipe and playing a role are separate choices (§5.5): a `cmd:` carrier
+in `CCB_CARRIER_LISTEN` lets the **outside** broker reach into a network it
+cannot dial into, and the broker it starts there plays the inside role over the
+same pipe.
 
 ---
 
@@ -85,9 +104,19 @@ func Dial(ctx, cfg) (net.Conn, error) // one byte-pipe to the outside CCB
 ```
 
 The returned `net.Conn` must be a reliable, ordered, full-duplex byte stream with
-working deadlines and a clean `Close`. yamux is layered on top by the caller. The
-carrier need not multiplex — that is yamux's job — so a carrier is "just" one
-good pipe.
+a clean `Close`. yamux is layered on top by the caller. The carrier need not
+multiplex — that is yamux's job — so a carrier is "just" one good pipe.
+
+Deadlines are expected but not required. Nothing in the stack sets one on the
+pipe: yamux implements deadlines on its own streams, which is where the CEDAR
+command loop runs, and never touches the underlying conn. A carrier whose
+descriptors cannot take a deadline — an inherited stdin that could not be made
+non-blocking (§5.3) — is therefore fully functional.
+
+Since §5, a carrier is reached through `carrier.PipeSource` rather than directly,
+which is what lets either role dial or accept (§5.5). `Dial`/`Listen` above are
+still how each transport is written; the source is the thin wrapper that says
+which one this broker uses.
 
 ---
 
@@ -502,7 +531,199 @@ discipline.
 
 ---
 
-## 5. Package layout (`transport/fstun`)
+## 5. Carrier C — command and stdio carriers (`transport/cmdcarrier`, implemented)
+
+The carriers above each speak a protocol of their own. This one speaks none: it
+runs a command and takes the child's **stdin and stdout** as the pipe. What the
+command is, is the operator's business.
+
+```
+CCB_OUTBOUND_NEXT_HOP = cmd:ssh -W outside-ccb.example.org:9700 bastion.site.edu
+CCB_OUTBOUND_NEXT_HOP = cmd:ssh bastion.site.edu htc-ccb -carrier-stdio
+CCB_OUTBOUND_NEXT_HOP = cmd:kubectl exec -i ccb-relay -- htc-ccb -carrier-stdio
+```
+
+The point is not SSH specifically. It is that an SSH carrier implemented against
+`golang.org/x/crypto/ssh` would reimplement `ssh_config` badly — no `ProxyJump`,
+no `ControlMaster`, no GSSAPI, no certificates, no agent, no `Match` blocks — and
+sites want exactly those. Running the system `ssh` gets all of it for free, from
+people who already know how to configure it, and the same mechanism reaches a
+container or a site's bespoke gateway wrapper without another transport package.
+
+Two properties come with SSH that no other carrier here has. A site middlebox
+cannot transparently interpose on it: host-key pinning is the whole point of the
+protocol, where a TLS-intercepting proxy reads a WebSocket carrier's bearer token
+in plaintext (§3, and `CARRIER_AUTH.md` §6). And the credentials already exist at
+the sites that need this. What it costs in exchange is a Unix account and an
+`authorized_keys` entry per inside broker, where a WebSocket carrier needs only a
+URL and a token the node already had.
+
+### 5.1 The command is not run through a shell
+
+The command line is everything after `cmd:` in `CCB_OUTBOUND_NEXT_HOP` or
+`CCB_CARRIER_LISTEN`. It is split with shell-like quoting — single quotes
+literal, double quotes literal but for `\"` and `\\`, backslash escapes outside
+quotes — and then executed directly. There is no shell, so no variable
+expansion, no globbing, no pipelines, no redirection.
+
+An **unquoted** shell metacharacter is refused rather than passed through as a
+literal argument, because treating it as one is never what the operator meant:
+
+```
+cmd:ssh host htc-ccb | tee log
+                     ^ refused: the command is executed directly, not through a
+                       shell, so shell syntax does not work here
+```
+
+Quote it and it is kept, so a genuine argument containing one is still
+expressible: `cmd:ssh -o 'ProxyCommand=nc -X 5 -x proxy:1080 %h %p' host`.
+
+`argv[0]` is resolved against `PATH` when it names no directory, and the resolved
+absolute path is logged. On a broker running as root that makes `PATH` part of a
+security decision, so prefer an absolute path.
+
+### 5.2 Why the child's stderr is kept
+
+Starting the child is not the same as the carrier working. `ssh` takes seconds
+to authenticate and, when it fails, says so on stderr and exits — so the carrier
+dies as a bare EOF on a pipe, which says nothing at all. The carrier therefore
+retains the child's most recent stderr lines and attaches them, with its exit
+status, to the error:
+
+```
+carrier command "ssh bastion htc-ccb -carrier-stdio" exited (exit status 255);
+its last output was: Permission denied (publickey).: EOF
+```
+
+Each line is also logged at debug level as it arrives, so a chatty-but-working
+`ssh` ("Warning: Permanently added …") leaves steady state quiet while remaining
+available. The staged carrier check (`-carrier-check`) reports it the same way.
+
+### 5.3 The far end: `stdio:`
+
+```
+CCB_OUTBOUND_NEXT_HOP = stdio:        equivalently, htc-ccb -carrier-stdio
+CCB_CARRIER_LISTEN    = stdio:
+```
+
+A broker started as the far end of a `cmd:` carrier takes **its own** stdin and
+stdout as the pipe. Three things happen when it does, each closing a way the
+carrier would otherwise break:
+
+- The descriptors are duplicated and **fd 1 is pointed at fd 2**. The pipe carries
+  a framed protocol, so one stray write to stdout — a library's `fmt.Println`, a
+  panic trace — would corrupt it, surfacing as an unintelligible yamux error at
+  the other end. After the redirect a stray write lands in the log instead. The
+  daemon claims the descriptors before it loads config or starts logging, so the
+  window in which anything could write is as close to empty as it can be.
+- fd 0 is pointed at `/dev/null`, so nothing that reads stdin can steal carrier
+  bytes.
+- The duplicates are made non-blocking when they are pipes or sockets, which makes
+  them pollable and so able to take deadlines. A terminal is left alone:
+  `O_NONBLOCK` lives on the open file description, shared with everything else
+  that has the terminal open. Nothing in the stack requires pipe deadlines —
+  yamux implements deadlines on its own streams and never sets one on the
+  underlying pipe — so this is a nicety, not a requirement.
+
+A stdio carrier has **exactly one** pipe and can never obtain another. When it
+closes, the broker has no route to the pool and the pool has no route to it, so
+it shuts down rather than idling unreachably (`Server.CarrierExhausted`). Every
+other carrier is re-established on demand, so only this one can reach that state.
+
+### 5.4 Raw TCP pipes (`transport/tcpcarrier`)
+
+A relayed carrier needs somewhere to land. `ssh -W broker:9700 bastion` hands the
+inside broker a byte stream with nothing of ours on the bastion — but the outside
+broker's CEDAR port cannot accept it, because that port expects one CEDAR
+connection per socket, not a multiplexed carrier. Hence:
+
+```
+CCB_CARRIER_LISTEN = tcp://:9700          outside broker
+```
+
+`tcp://host:port` is a **raw carrier pipe**, not the broker's CEDAR port; a bare
+`host:port` still means ordinary CEDAR and is not a carrier at all. The same
+endpoint is what `ssh -L`, `kubectl port-forward` and `socat` deliver, and it is
+the simplest fixture for testing everything layered above a pipe.
+
+It authenticates nobody. That is the posture of `CCB_CARRIER_AUTH = none` and
+rests on the same argument (`CARRIER_AUTH.md` §6): the identity behind every
+authorization decision comes from the CEDAR handshake on the first command, not
+from the transport. What the transport must still do is bound what an
+unauthenticated peer can consume — `carrier.LimitListener`
+(`CCB_CARRIER_MAX_SESSIONS`, `CCB_CARRIER_MAX_PER_SOURCE`) plus `MuxListener`'s
+first-stream probation. Unlike the WebSocket carrier there is no TLS, so this
+endpoint belongs inside something that provides confidentiality — an SSH tunnel,
+a VPN, a loopback address. `Listen` says so when the bind address is not
+loopback.
+
+### 5.5 Direction is not role
+
+Every carrier before this one welded two choices together: the inside broker
+dialed, the outside broker accepted. A command carrier separates them, because
+the useful topologies need both halves of the cross-product.
+
+```
+                       obtains its pipe by …
+                   dialing / spawning        accepting
+inside broker   │ ws, fs, tcp, cmd        │ stdio                    │
+outside broker  │ cmd                     │ ws, fs, tcp, stdio       │
+```
+
+The new cell is the bottom-left, and it is the one the restrictive sites need:
+the **outside** broker reaches into a network it cannot dial into by running
+`ssh login-node htc-ccb -carrier-stdio`, and the broker that starts there plays
+the **inside** role over the very same pipe. Nobody dials the inside broker and
+the inside broker dials nobody; the carrier is a process the outside broker
+started. (It is also the shape that lets the outside broker stage the binary and
+control its startup, once an embedded SSH client replaces the system one.)
+
+`transport/carrier` carries the split:
+
+- `PipeSource` yields pipes — `Dialing` (a fresh pipe per call), `Accepting` (from
+  a `net.Listener`), `OnePipe` (the inherited one).
+- `SourceListener` presents any source as a `net.Listener`, so the outside role
+  runs over a dialing source unchanged.
+
+Which role a broker plays is still decided by **which knob** the address appears
+in — `Upstream.BrokerAddr`/`CCB_OUTBOUND_NEXT_HOP` for inside, `CCB_CARRIER_LISTEN`
+for outside — so no new knob was needed for any of this.
+
+Two details `SourceListener` has to get right:
+
+- **One pipe at a time.** `MuxListener` accepts pipes in a loop, so an outside
+  broker on `cmd:ssh node htc-ccb` would spawn a second `ssh` the instant the
+  first pipe was handed over, and keep going. A listener over a *dialing* source
+  holds one pipe and obtains the next only once that one closes. A listener over
+  an accepting source must not do this: there, many pipes at once is the point.
+- **Retry inside `Accept`.** `MuxListener` stops accepting on the first error its
+  inner listener returns, so a bastion that is briefly unreachable must not
+  surface as one — the outside broker would give up permanently on the first
+  blip. `Accept` retries with backoff (default 1s → 60s, jittered) and returns an
+  error only once closed or exhausted.
+
+### 5.6 Configuration
+
+| Knob | Meaning |
+|---|---|
+| `CCB_CARRIER_COMMAND_ENV` | `NAME=VALUE` entries added to the child's environment. Unset, the child inherits the broker's — which is what lets `ssh` find `HOME` (and so `~/.ssh/config` and known-hosts), `SSH_AUTH_SOCK` and `KRB5CCNAME`. |
+| `CCB_CARRIER_COMMAND_DIR` | The child's working directory; unset means the broker's own. |
+| `CCB_CARRIER_COMMAND_GRACE` | Seconds a closing carrier gives the child after `SIGTERM` before `SIGKILL` (default 2). The pipes are closed first, so a well-behaved `ssh` already has EOF on stdin and is leaving anyway. |
+| `CCB_CARRIER_RETRY_INITIAL` | Seconds before an outside broker retries a carrier it obtains by reaching out (default 1). |
+| `CCB_CARRIER_RETRY_MAX` | Ceiling on that backoff, in seconds (default 60). A carrier that is failing is usually failing for a reason that will not clear in a second, and a broker spawning an `ssh` per second against a site's bastion looks like an attack. |
+
+The child runs in its own process group, so a terminate aimed at the group
+reaches whatever `ssh` itself spawned (an askpass helper, a `ProxyCommand`), and
+a Ctrl-C in the broker's terminal does not race the broker to kill the carrier.
+
+A command or stdio peer has no network address of its own, so — exactly as for a
+WebSocket peer (§3) — host and netblock terms in `ALLOW_DAEMON` match no such
+registrant and fail closed. Carrier registrants must be admitted by an identity
+term, and reconnect IP pinning does not apply to them.
+
+---
+
+## 6. Package layout (`transport/fstun`)
 
 - `frame.go` — types, header/CRC encode+decode, partial-frame detection.
 - `seglog.go` — segment writer (append/rotate/reap) and reader (sequential across
@@ -518,9 +739,9 @@ The yamux layer and the cedar dialer hook live outside this package (a thin
 `carrier` adapter in htc-ccb) so `fstun` stays a self-contained,
 independently-testable FS transport.
 
-## 6. Testing plan
+## 7. Testing plan
 
-1. **fstun unit** — §5 loopback tests, incl. an injected torn tail and a simulated
+1. **fstun unit** — §6 loopback tests, incl. an injected torn tail and a simulated
    slow reader proving the writer stalls at ≈`Window`.
 2. **yamux-over-fstun** — many concurrent streams over one pipe; bulk + ping/pong.
 3. **CCB e2e** — the existing tunneling tests (inbound chain/tree, outbound,
