@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bbockelm/cedar/ccb"
@@ -120,7 +121,13 @@ func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replySt
 		}
 		// Splice raw bytes until either side closes.
 		s.log.Info("proxy splice established", "ccbid", t.id, "request", reqID)
-		spliceConns(sess.requesterConn, targetConn)
+		st := spliceConns(sess.requesterConn, targetConn)
+		args := append([]any{"ccbid", t.id, "request", reqID}, st.LogArgs()...)
+		if st.OK() {
+			s.log.Info("proxy splice closed", args...)
+		} else {
+			s.log.Warn("proxy splice failed", args...)
+		}
 		close(sess.done)
 		return cedarserver.KeepOpen()
 	case <-time.After(s.cfg.RequestTimeout):
@@ -250,34 +257,216 @@ type closeWriter interface{ CloseWrite() error }
 // drain. Note that this is about delivering what was already written; a relay
 // cannot invent bytes a peer never sent, so a peer that closes without replying
 // still produces an EOF at the far end, correctly.
-func spliceConns(c1, c2 net.Conn) {
+// spliceStats describes how a relay ended.
+//
+// Without it a relay that carried a megabyte and one torn down after four bytes
+// produce the same single log line, which makes a transport failure
+// unfalsifiable from the broker's side -- and the broker is the only component
+// that can see both ends. The byte counts are the valuable part: they separate
+// "the relay worked and the application gave up" from "the relay stopped
+// mid-stream", which no amount of client-side logging can do.
+type spliceStats struct {
+	// ToRequester and ToTarget count bytes written to each side. On a
+	// truncated relay the still-running direction reports what it had written
+	// so far, which on a kernel fast path is 0 until the copy completes --
+	// read them together with Truncated.
+	ToRequester int64
+	ToTarget    int64
+	Duration    time.Duration
+
+	// Err is the first copy error, nil on a clean close, and Side names the
+	// direction it happened in.
+	Err  error
+	Side string
+
+	// Truncated reports that the drain grace expired with a direction still
+	// copying, so the relay closed on bytes it had not finished delivering.
+	Truncated bool
+
+	// NoHalfClose reports that a transport could not propagate a half-close,
+	// so the peer on that side was never told the sender had finished and sat
+	// waiting for more. yamux streams are the case in practice: they have
+	// Close but no CloseWrite, so a relay over a carrier reaches the drain
+	// grace rather than ending when the data does. Naming it here turns an
+	// otherwise mysterious 30-second stall into a one-line diagnosis.
+	NoHalfClose bool
+}
+
+// OK reports a relay that ended cleanly: both directions reached EOF and
+// neither was cut short. A peer closing without replying is ordinary and still
+// OK -- a relay cannot invent bytes nobody sent.
+func (s spliceStats) OK() bool { return s.Err == nil && !s.Truncated }
+
+// Reason names what ended the relay, for an operator reading one log line.
+func (s spliceStats) Reason() string {
+	switch {
+	case s.Err != nil:
+		return s.Side + ": " + s.Err.Error()
+	case s.Truncated && s.NoHalfClose:
+		return "drain grace expired with " + s.Side + " still copying; the transport cannot half-close, so the peer was never told the sender had finished"
+	case s.Truncated:
+		return "drain grace expired with " + s.Side + " still copying"
+	default:
+		return "eof"
+	}
+}
+
+// LogArgs renders the stats as slog key/value pairs.
+func (s spliceStats) LogArgs() []any {
+	return []any{
+		"bytes_to_target", s.ToTarget,
+		"bytes_to_requester", s.ToRequester,
+		"duration", s.Duration.Round(time.Millisecond),
+		"reason", s.Reason(),
+	}
+}
+
+// otherSide names the direction opposite side. The two directions of a relay
+// are labelled by where their bytes are going.
+func otherSide(side string) string {
+	switch side {
+	case sideToTarget:
+		return sideToRequester
+	case sideToRequester:
+		return sideToTarget
+	default:
+		return "a direction"
+	}
+}
+
+// The two directions of a relay, labelled by where their bytes go.
+const (
+	sideToRequester = "to requester"
+	sideToTarget    = "to target"
+)
+
+// countingConn counts the bytes written to a connection.
+//
+// It implements io.ReaderFrom so io.Copy still reaches the underlying
+// connection's own ReadFrom -- on Linux a TCP-to-TCP relay uses splice(2)
+// there, and quietly dropping to a userspace copy would be a real cost in a
+// daemon whose whole job is moving bytes. The trade is that the fast path
+// reports its count only when the copy finishes, where the per-Write path
+// updates as it goes. That falls the right way round: the fast path exists
+// only for plain TCP, and the carrier transports that have no fast path are
+// exactly the ones where an in-flight count is worth having.
+type countingConn struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func (c countingConn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(r)
+		c.n.Add(n)
+		return n, err
+	}
+	// No fast path underneath. This MUST do the copy itself: io.Copy calls
+	// ReadFrom and returns whatever it gets, with no fallback, so an error
+	// here would silently relay nothing -- which is every carrier relay, since
+	// a yamux stream has no ReadFrom.
+	//
+	// writeOnly hides this type's own ReadFrom from io.Copy's probe, so the
+	// copy below goes through Write (which counts) instead of recursing.
+	return io.Copy(writeOnly{Writer: c}, r)
+}
+
+// writeOnly exposes nothing but Write, so io.Copy cannot find a ReadFrom on it.
+type writeOnly struct{ io.Writer }
+
+// spliceConns copies bytes bidirectionally between two connections until both
+// directions are finished, then closes both. c1 is the requester and c2 the
+// target, which is how the returned stats are labelled.
+//
+// The two directions end independently, and an EOF on one says only that that
+// peer has finished *sending*. It says nothing about bytes already in flight the
+// other way, so tearing the whole relay down at that point -- which this did,
+// closing both connections from whichever direction finished first -- discards
+// them, and the far peer sees a truncated stream rather than a clean end.
+//
+// Each direction now propagates a half-close instead and leaves the other to
+// drain. Note that this is about delivering what was already written; a relay
+// cannot invent bytes a peer never sent, so a peer that closes without replying
+// still produces an EOF at the far end, correctly.
+func spliceConns(c1, c2 net.Conn) spliceStats {
+	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	firstDone := make(chan struct{})
 	var once sync.Once
 
-	pipe := func(dst, src net.Conn) {
+	var toRequester, toTarget atomic.Int64
+	var errMu sync.Mutex
+	var firstErr error
+	var firstSide string
+	var noHalfClose bool
+	var finishedFirst string
+
+	pipe := func(dst, src net.Conn, n *atomic.Int64, side string) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		_, err := io.Copy(countingConn{Conn: dst, n: n}, src)
+		if err != nil {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr, firstSide = err, side
+			}
+			errMu.Unlock()
+		}
 		// This direction is finished. Tell dst's peer, so it stops waiting for
 		// more, without disturbing what is still arriving the other way.
 		if cw, ok := dst.(closeWriter); ok {
 			_ = cw.CloseWrite()
+		} else {
+			errMu.Lock()
+			noHalfClose = true
+			errMu.Unlock()
 		}
-		once.Do(func() { close(firstDone) })
+		once.Do(func() {
+			errMu.Lock()
+			finishedFirst = side
+			errMu.Unlock()
+			close(firstDone)
+		})
 	}
-	go pipe(c1, c2)
-	go pipe(c2, c1)
+	go pipe(c1, c2, &toRequester, sideToRequester)
+	go pipe(c2, c1, &toTarget, sideToTarget)
 
 	both := make(chan struct{})
 	go func() { wg.Wait(); close(both) }()
 
 	<-firstDone
+	truncated := false
 	select {
 	case <-both:
 	case <-time.After(spliceDrainGrace):
+		truncated = true
 	}
 	_ = c1.Close()
 	_ = c2.Close()
+
+	errMu.Lock()
+	err, side, half, first := firstErr, firstSide, noHalfClose, finishedFirst
+	errMu.Unlock()
+	if truncated && side == "" {
+		// Name the direction that did NOT finish: it is the one still holding
+		// bytes, and the opposite of whichever finished first. "a direction"
+		// would send an operator looking at both.
+		side = otherSide(first)
+	}
+	return spliceStats{
+		ToRequester: toRequester.Load(),
+		ToTarget:    toTarget.Load(),
+		Duration:    time.Since(start),
+		Err:         err,
+		Side:        side,
+		Truncated:   truncated,
+		NoHalfClose: half,
+	}
 }

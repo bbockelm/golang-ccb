@@ -147,3 +147,70 @@ func TestMuxBulkOverOneStream(t *testing.T) {
 		t.Fatal("bulk payload mismatch")
 	}
 }
+
+// A relay endpoint must be able to end its sending side without ending the
+// connection, or the peer waits for data that will never come and the relay
+// tears the transfer down when its drain grace expires. yamux spells that
+// Close rather than CloseWrite, which a relay probing for CloseWrite does not
+// find -- so the streams this package hands out adapt it.
+func TestStreamsSupportHalfClose(t *testing.T) {
+	ml, md := fstunPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	client, err := md.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	server, err := ml.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer func() { _ = server.Close() }()
+
+	cw, ok := client.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatalf("a dialed stream (%T) has no CloseWrite; a relay cannot half-close it", client)
+	}
+	if _, ok := server.(interface{ CloseWrite() error }); !ok {
+		t.Fatalf("an accepted stream (%T) has no CloseWrite", server)
+	}
+
+	// The client sends a request and says it is done sending.
+	req := []byte("request bytes")
+	if _, err := client.Write(req); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	// The server must see the request, then EOF -- that is what tells it to
+	// stop waiting and reply.
+	got, err := io.ReadAll(server)
+	if err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if !bytes.Equal(got, req) {
+		t.Fatalf("server read %q, want %q", got, req)
+	}
+
+	// And the reverse direction must still work after the half-close. This is
+	// the half that a plain Close would have destroyed.
+	reply := []byte("reply after the client half-closed")
+	if _, err := server.Write(reply); err != nil {
+		t.Fatalf("server write after client half-close: %v", err)
+	}
+	if err := server.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+		t.Fatalf("server CloseWrite: %v", err)
+	}
+	back, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("client read after half-close: %v", err)
+	}
+	if !bytes.Equal(back, reply) {
+		t.Fatalf("client read %q after half-closing, want %q", back, reply)
+	}
+}

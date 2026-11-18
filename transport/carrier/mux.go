@@ -132,10 +132,11 @@ func (l *MuxListener) acceptStreams(sess *yamux.Session) {
 		defer probation.Stop()
 	}
 	for {
-		st, err := sess.AcceptStream()
+		raw, err := sess.AcceptStream()
 		if err != nil {
 			return // session died
 		}
+		st := withHalfClose(raw)
 		if probation != nil {
 			probation.Stop()
 			probation = nil
@@ -202,7 +203,11 @@ func (d *MuxDialer) Open(ctx context.Context) (net.Conn, error) {
 	ch := make(chan res, 1)
 	go func() {
 		st, err := d.sess.OpenStream()
-		ch <- res{st, err}
+		if err != nil {
+			ch <- res{nil, err}
+			return
+		}
+		ch <- res{withHalfClose(st), nil}
 	}()
 	select {
 	case r := <-ch:
@@ -219,3 +224,31 @@ func (d *MuxDialer) NumStreams() int { return d.sess.NumStreams() }
 func (d *MuxDialer) Closed() bool { return d.sess.IsClosed() }
 
 func (d *MuxDialer) Close() error { return d.sess.Close() }
+
+// halfCloseStream gives a yamux stream the CloseWrite a relay needs.
+//
+// yamux has no CloseWrite method, so a relay that probes for one finds nothing
+// and cannot tell its peer that the sender has finished. The peer then waits
+// for data that will never arrive, the relay's drain grace expires, and a
+// transfer that had completed is torn down and looks truncated -- on a carrier,
+// every time, which is why control traffic survives it and bulk transfers do
+// not.
+//
+// yamux's Close IS a half-close on an established stream: it sends a FIN and
+// prohibits further local writes while leaving reads working. Its own Read
+// says so -- "LocalClose only prohibits further local writes. Handle reads
+// normally." A stream whose peer has already closed goes fully closed instead,
+// which is also right: there is nothing left to read.
+type halfCloseStream struct{ *yamux.Stream }
+
+// CloseWrite ends this side's sending without disturbing what is still
+// arriving the other way.
+//
+// Close here is the embedded yamux stream's, not this type's -- halfCloseStream
+// declares no Close of its own, so there is no recursion.
+func (s halfCloseStream) CloseWrite() error { return s.Close() }
+
+// withHalfClose adapts a yamux stream for use as a relay endpoint. It is
+// applied wherever a stream leaves this package, so nothing downstream has to
+// know that yamux spells half-close differently.
+func withHalfClose(s *yamux.Stream) net.Conn { return halfCloseStream{Stream: s} }
