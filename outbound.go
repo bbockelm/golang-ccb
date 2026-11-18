@@ -11,6 +11,7 @@ import (
 
 	"github.com/bbockelm/cedar/addresses"
 	"github.com/bbockelm/cedar/ccb"
+	"github.com/bbockelm/cedar/client/sharedport"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 )
@@ -36,7 +37,7 @@ type tcpDirectTransport struct{ s *Server }
 func (t *tcpDirectTransport) describe() string { return "direct" }
 
 func (t *tcpDirectTransport) connect(ctx context.Context, target string, _ int) (net.Conn, error) {
-	dialAddr, err := t.s.outboundTargetAllowed(target)
+	dialAddr, sharedPortID, err := t.s.outboundTargetAllowed(target)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +45,30 @@ func (t *tcpDirectTransport) connect(ctx context.Context, target string, _ int) 
 	defer cancel()
 	// The literal-address check in outboundTargetAllowed cannot see what a
 	// hostname resolves to; check the resolved address too.
-	d := net.Dialer{Control: chainDialControl(RefuseLocalAddresses, t.s.cfg.DialControl)}
+	control := chainDialControl(RefuseLocalAddresses, t.s.cfg.DialControl)
+
+	// A target behind shared port needs the SHARED_PORT_CONNECT handoff before
+	// anything else crosses the connection: a bare TCP connect reaches the
+	// remote condor_shared_port with nothing saying which daemon it is for, and
+	// it is closed without a reply. The requester cannot do this itself -- on
+	// the outbound-CCB path the client hands us the whole sinful and expects
+	// the broker to reach it (CCB_TUNNELING_DESIGN.md section 5: "non-blocking
+	// dial the target via the standard connect path (so the target may itself
+	// be direct / shared-port / CCB-routed)").
+	if sharedPortID != "" {
+		spc := sharedport.NewSharedPortClient("htc-ccb outbound proxy")
+		spc.DialControl = control
+		st, err := spc.ConnectViaSharedPort(dctx, dialAddr, sharedPortID, t.s.cfg.RequestTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to reach target behind shared port: %w", err)
+		}
+		// The handoff writes and reads nothing back, so no bytes are buffered
+		// above the connection: the raw socket is positioned exactly where the
+		// relay needs it, with the target daemon on the other end.
+		return st.GetConnection(), nil
+	}
+
+	d := net.Dialer{Control: control}
 	conn, err := d.DialContext(dctx, "tcp", dialAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial target: %w", err)
@@ -144,14 +168,19 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 // outboundTargetAllowed parses target (a Sinful), enforces the loopback/link-local
 // refusal and the allow-list, and returns the "host:port" to dial. Deny-by-
 // default: an empty allow-list (or no match) permits nothing.
-func (s *Server) outboundTargetAllowed(target string) (string, error) {
+// It returns the "host:port" to dial and the target's shared-port id, if it
+// carries one. The id is NOT part of the authorization decision -- the
+// allow-list governs which hosts may be reached, and a shared-port id only
+// selects a daemon once there -- but it must survive to the dial, or the
+// connection lands on the remote shared-port server addressed to nobody.
+func (s *Server) outboundTargetAllowed(target string) (string, string, error) {
 	info, err := addresses.ParseSinful(target)
 	if err != nil {
-		return "", fmt.Errorf("bad target sinful %q", target)
+		return "", "", fmt.Errorf("bad target sinful %q", target)
 	}
 	host, port := info.Host, info.Port
 	if host == "" || port == "" {
-		return "", fmt.Errorf("target %q has no host:port", target)
+		return "", "", fmt.Errorf("target %q has no host:port", target)
 	}
 
 	// Refuse broker-local scopes so a hostile-but-authenticated requester cannot
@@ -160,16 +189,16 @@ func (s *Server) outboundTargetAllowed(target string) (string, error) {
 	// (RefuseLocalAddresses).
 	if ip := net.ParseIP(host); ip != nil {
 		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return "", fmt.Errorf("target %q is loopback/link-local (refused)", host)
+			return "", "", fmt.Errorf("target %q is loopback/link-local (refused)", host)
 		}
 	} else if strings.EqualFold(host, "localhost") {
-		return "", fmt.Errorf("target %q is loopback (refused)", host)
+		return "", "", fmt.Errorf("target %q is loopback (refused)", host)
 	}
 
 	if !s.matchAllowlist(host) {
-		return "", fmt.Errorf("target host %q not permitted by CCB_OUTBOUND_TARGET_ALLOWLIST", host)
+		return "", "", fmt.Errorf("target host %q not permitted by CCB_OUTBOUND_TARGET_ALLOWLIST", host)
 	}
-	return net.JoinHostPort(host, port), nil
+	return net.JoinHostPort(host, port), info.SharedPortID, nil
 }
 
 // matchAllowlist reports whether host matches any allow-list entry. An entry is a

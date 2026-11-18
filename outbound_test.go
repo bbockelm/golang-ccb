@@ -2,6 +2,7 @@ package ccbserver
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync/atomic"
@@ -416,4 +417,134 @@ func TestOutboundProxyDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected outbound connect to fail against a broker without the outbound proxy")
 	}
+}
+
+// A target behind shared port must be reached through the SHARED_PORT_CONNECT
+// handoff, not by a bare TCP connect. Essentially every modern HTCondor daemon
+// advertises a sock= -- a schedd's sinful is
+// "<host:9618?...&sock=schedd_7891_25eb>" -- and dropping it lands the
+// connection on the remote condor_shared_port addressed to nobody, which
+// closes it without a reply. See issue #39.
+//
+// The shared-port server must be off loopback, because the proxy refuses
+// loopback targets; the daemon behind it need not be, since only the
+// shared-port server dials it.
+func TestOutboundProxyReachesTargetBehindSharedPort(t *testing.T) {
+	targetIP := nonLoopbackIPv4(t)
+
+	served := make(chan struct{}, 1)
+	backendAddr, stopBackend := startCedarDialTarget(t, "127.0.0.1", served)
+	defer stopBackend()
+
+	const sock = "schedd_7891_25eb"
+	sp := startFwdSharedPortServerOn(t, targetIP, map[string]string{sock: backendAddr})
+	defer sp.Close()
+
+	brokerAddr, rec, stopSrv := startOutboundBroker(t, []string{targetIP + "/32"})
+	defer stopSrv()
+
+	target := fmt.Sprintf("<%s?sock=%s>", sp.addr(), sock)
+	if err := outboundDCNopRetrying(t, brokerAddr, target); err != nil {
+		t.Fatalf("outbound DC_NOP to a shared-port target: %v", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon behind shared port never saw the command; the sock= was dropped")
+	}
+	if !rec.saw("proxy-connect splice established") {
+		t.Fatal("broker did not log an outbound proxy splice")
+	}
+}
+
+// The allow-list governs hosts; a shared-port id only selects a daemon once
+// there. A target the list does not permit must still be refused, sock= or no.
+func TestOutboundProxySharedPortTargetStillNeedsAllowlist(t *testing.T) {
+	targetIP := nonLoopbackIPv4(t)
+
+	served := make(chan struct{}, 1)
+	backendAddr, stopBackend := startCedarDialTarget(t, "127.0.0.1", served)
+	defer stopBackend()
+
+	const sock = "schedd_7891_25eb"
+	sp := startFwdSharedPortServerOn(t, targetIP, map[string]string{sock: backendAddr})
+	defer sp.Close()
+
+	brokerAddr, _, stopSrv := startOutboundBroker(t, []string{"192.0.2.1/32"})
+	defer stopSrv()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	target := fmt.Sprintf("<%s?sock=%s>", sp.addr(), sock)
+	if err := outboundDCNop(ctx, brokerAddr, target); err == nil {
+		t.Fatal("a shared-port target outside the allow-list was reached")
+	}
+	select {
+	case <-served:
+		t.Fatal("the refused target was dialed anyway")
+	case <-time.After(time.Second):
+	}
+}
+
+// outboundTargetAllowed must hand the shared-port id back rather than fold it
+// into the dial address or drop it.
+func TestOutboundTargetAllowedKeepsSharedPortID(t *testing.T) {
+	s := &Server{cfg: Config{OutboundTargetAllowlist: []string{"*"}}}
+	for _, tc := range []struct {
+		name, target, wantAddr, wantSock string
+	}{
+		{"schedd behind shared port",
+			"<128.105.68.112:9618?addrs=128.105.68.112-9618&alias=ap2001.chtc.wisc.edu&noUDP&sock=schedd_7891_25eb>",
+			"128.105.68.112:9618", "schedd_7891_25eb"},
+		{"collector without one",
+			"<128.105.68.172:9618?addrs=128.105.68.172-9618&alias=cm.chtc.wisc.edu&noUDP>",
+			"128.105.68.172:9618", ""},
+		{"bare host:port", "192.0.2.5:9618", "192.0.2.5:9618", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, sock, err := s.outboundTargetAllowed(tc.target)
+			if err != nil {
+				t.Fatalf("outboundTargetAllowed(%q): %v", tc.target, err)
+			}
+			if addr != tc.wantAddr {
+				t.Errorf("dial address = %q, want %q", addr, tc.wantAddr)
+			}
+			if sock != tc.wantSock {
+				t.Errorf("shared-port id = %q, want %q", sock, tc.wantSock)
+			}
+		})
+	}
+}
+
+// outboundDCNopRetrying runs an outbound proxy connection, retrying a failed
+// attempt with a fresh deadline.
+//
+// Every test here that needs a non-loopback target -- the outbound proxy
+// refuses loopback, so they all do -- is intermittently unreliable on a host
+// whose non-loopback address belongs to a VPN or overlay interface: a
+// connection to the host's own address stalls or resets for no reason the test
+// can see. Observed on this suite as TestOutboundProxyTwoCCB failing in three
+// of four full-suite runs while everything around it passed.
+//
+// The retry does not weaken what the test proves. Without the shared-port
+// handoff the remote shared-port server closes every connection that does not
+// begin with SHARED_PORT_CONNECT, so all three attempts fail, every run --
+// which is exactly what the pre-fix check confirms.
+func outboundDCNopRetrying(t *testing.T, brokerAddr, target string) error {
+	t.Helper()
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = outboundDCNop(ctx, brokerAddr, target)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				t.Logf("the outbound connection succeeded on attempt %d", attempt)
+			}
+			return nil
+		}
+		t.Logf("attempt %d failed: %v", attempt, err)
+	}
+	return fmt.Errorf("three attempts failed, last: %w", err)
 }
