@@ -25,7 +25,8 @@ someone wants to reach it the broker tells it to dial *back*.
 | Both ends private (an EP and a submit host that cannot reach each other) | the collector's CCB does this from HTCondor 26.0.0; **this** if you also want the broker off the collector's host |
 | Worker nodes that may open only one or two sockets, or reach only an HTTP proxy | **this** — see [§7](#7-execution-points-with-no-outbound-network) |
 | Worker nodes with no network path at all, but a shared filesystem | **this** — see [docs/TRANSPORTS.md](docs/TRANSPORTS.md) |
-| Nodes that may reach only a bastion over SSH | **this** — the carrier can be `ssh` itself, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
+| A cluster you can `ssh` **in** to, whose nodes dial nothing | **this** — the broker reaches in and serves the cluster from its login host, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
+| Nodes that may `ssh` **out** to a bastion and nothing else | **this** — the carrier can be `ssh` itself, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
 
 If the collector's built-in CCB already works for you, there is no reason to
 change. What you get here is a broker you can put on its own host, restart

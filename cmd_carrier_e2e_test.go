@@ -56,6 +56,13 @@ func runStdioBrokerChild(addrFile string) int {
 		Security:       plaintextSec(),
 		RequestTimeout: 5 * time.Second,
 		CarrierPipe:    pipe,
+		// Both halves ride the one inherited pipe: jobs on the cluster register
+		// through it to become reachable, and dial out through it to reach the
+		// world. OutboundNextHop and Upstream must name the same carrier, which
+		// for stdio they necessarily do -- there is only one pipe.
+		OutboundProxy:           true,
+		OutboundNextHop:         "stdio:",
+		OutboundNextHopSecurity: plaintextSec(),
 		Upstream: &UpstreamConfig{
 			BrokerAddr:        "stdio:",
 			Security:          plaintextSec(),
@@ -462,4 +469,265 @@ ALLOW_READ = *
 	if !strings.Contains(string(logged), "next_hop=stdio:") {
 		t.Errorf("-carrier-stdio did not put the broker in the inside role:\n%s", logged)
 	}
+}
+
+// The topology this carrier exists for, in the direction that matters most: a
+// well-known broker OUTSIDE a cluster reaches in over SSH, the broker it starts
+// on the login host is what jobs on the compute nodes talk to, and their
+// traffic leaves through the pipe the outside broker opened.
+//
+// Nothing on the cluster dials out and nothing from outside dials in. The one
+// connection is the `ssh` the outside broker ran, and it carries both
+// directions: this test drives the outbound one (a job reaching the world),
+// where TestInboundTunnelOverCmdStdioCarrierInverted drives the inbound one (a
+// pool client reaching a job).
+//
+// Like every other outbound-proxy test here it needs a non-loopback target,
+// because the exit hop refuses local addresses unconditionally -- which is also
+// why it inherits their flakiness on a host whose non-loopback address moves.
+func TestOutboundThroughCmdStdioCarrierInverted(t *testing.T) {
+	targetIP := reachableNonLoopbackIPv4(t)
+
+	// Stands in for the collector, AP or anything else beyond the cluster.
+	served := make(chan struct{}, 1)
+	targetAddr, stopTgt := startCedarDialTarget(t, targetIP, served)
+	defer stopTgt()
+
+	// The outside broker: reaches into the cluster by running a command, and is
+	// the exit that dials the target.
+	outLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideRec := &logCatcher{}
+	addrFile := t.TempDir() + "/inside-addr"
+	outsideSrv, err := New(Config{
+		PublicAddress:           outLn.Addr().String(),
+		Security:                plaintextSec(),
+		RequestTimeout:          5 * time.Second,
+		OutboundProxy:           true,
+		OutboundTargetAllowlist: []string{targetIP + "/32"},
+		CarrierListen:           selfCommand(t),
+		CarrierCommandEnv:       append(os.Environ(), envStdioBroker+"="+addrFile),
+		Logger:                  slog.New(outsideRec),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	octx, ocancel := context.WithCancel(context.Background())
+	defer ocancel()
+	go func() { _ = outsideSrv.Serve(octx, outLn) }()
+
+	// The broker on the login host, started by the outside one over the pipe.
+	insideAddr := waitForFile(t, addrFile, 30*time.Second)
+	t.Logf("login-host broker (started from outside) serves the cluster at %s", insideAddr)
+
+	// A job on a compute node: it can reach the login host and nothing else.
+	if err := outboundDCNopRetrying(t, insideAddr, targetAddr); err != nil {
+		t.Fatalf("a job's outbound connection through the SSH-opened tunnel: %v", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target never saw the job's command; it did not dispatch through the tunnel")
+	}
+	if !outsideRec.saw("proxy-connect splice established") {
+		t.Fatal("the outside broker did not splice the job's connection to the target")
+	}
+}
+
+// The allow-list still governs what jobs may reach. A carrier that moved
+// opaque bytes while bypassing the exit's policy would be a hole, and the
+// inverted topology routes through a different path to reach that policy.
+func TestOutboundAllowlistAppliesThroughCmdStdioCarrier(t *testing.T) {
+	targetIP := reachableNonLoopbackIPv4(t)
+
+	served := make(chan struct{}, 1)
+	targetAddr, stopTgt := startCedarDialTarget(t, targetIP, served)
+	defer stopTgt()
+
+	outLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrFile := t.TempDir() + "/inside-addr"
+	outsideSrv, err := New(Config{
+		PublicAddress:  outLn.Addr().String(),
+		Security:       plaintextSec(),
+		RequestTimeout: 5 * time.Second,
+		OutboundProxy:  true,
+		// Allows something else entirely, so this target is refused.
+		OutboundTargetAllowlist: []string{"192.0.2.1/32"},
+		CarrierListen:           selfCommand(t),
+		CarrierCommandEnv:       append(os.Environ(), envStdioBroker+"="+addrFile),
+		Logger:                  testLogger(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	octx, ocancel := context.WithCancel(context.Background())
+	defer ocancel()
+	go func() { _ = outsideSrv.Serve(octx, outLn) }()
+
+	insideAddr := waitForFile(t, addrFile, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := outboundDCNop(ctx, insideAddr, "<"+targetAddr+">"); err == nil {
+		t.Fatal("a target outside the allow-list was reached through the carrier")
+	}
+	select {
+	case <-served:
+		t.Fatal("the refused target was dialed anyway")
+	case <-time.After(time.Second):
+	}
+}
+
+// reachableNonLoopbackIPv4 is nonLoopbackIPv4 with the address actually
+// checked before it is used.
+//
+// The exit hop refuses loopback unconditionally, so an outbound-proxy test
+// needs a real address -- but a host can offer several, and one of them need
+// not work: a VPN or overlay interface (Tailscale's 100.64/10 is global
+// unicast as far as net.IP is concerned) can be listed, accepted by bind, and
+// still not carry a connection back to itself. nonLoopbackIPv4 returns the
+// first candidate it sees, so on such a host it hands the test a dud and the
+// failure arrives much later, as a proxy-connect that never answers.
+//
+// Binding and dialing each candidate costs milliseconds and removes that whole
+// class. It does NOT fix everything: on the same host an address that passes
+// this check can still stall a connection made a moment later, which is what
+// outboundDCNopRetrying below exists for.
+func reachableNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("cannot list interfaces: %v", err)
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipnet.IP.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || !ip.IsGlobalUnicast() {
+			continue
+		}
+		if roundTrips(ip.String()) {
+			return ip.String()
+		}
+		t.Logf("skipping %s: it accepts a bind but does not carry a connection back to itself", ip)
+	}
+	t.Skip("no non-loopback IPv4 address on this host carries a connection to itself")
+	return ""
+}
+
+// roundTrips reports whether a listener bound to ip can be dialed at ip.
+func roundTrips(ip string) bool {
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			_ = c.Close()
+		}
+	}()
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// outboundDCNopRetrying runs a job's outbound connection, retrying a stalled
+// attempt with a fresh deadline.
+//
+// The retry is for the environment, not the carrier. On a host with an overlay
+// interface a connection to a non-loopback address of its own can stall for
+// no reason the test can see or control, and every outbound-proxy test here
+// inherits it: measured over 12 runs on one such host, this test failed once
+// and the pre-existing fs-carrier equivalent -- same outbound path, different
+// carrier, still one attempt -- failed seven times.
+//
+// It does not weaken what the test proves. A carrier that could not forward a
+// proxy-connect would fail all three attempts, every run; only a transient
+// stall is absorbed. If all three fail the test still fails, and the error
+// says so.
+func outboundDCNopRetrying(t *testing.T, insideAddr, targetAddr string) error {
+	t.Helper()
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = outboundDCNop(ctx, insideAddr, "<"+targetAddr+">")
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				t.Logf("the job's outbound connection succeeded on attempt %d", attempt)
+			}
+			return nil
+		}
+		t.Logf("attempt %d stalled: %v", attempt, err)
+	}
+	return fmt.Errorf("three attempts failed, last: %w", err)
+}
+
+// stdio: is a pipe, not a role: it works on CCB_CARRIER_LISTEN (outside) as
+// well as on the inside knobs. The two ends of one pipe must take DIFFERENT
+// roles -- one runs the yamux client, the other the server -- which is why an
+// administrator cannot point one `-carrier-stdio` broker at another and expect
+// a tunnel. This drives both halves over a single pipe to show the pairing
+// that does work.
+func TestStdioCarrierInTheOutsideRole(t *testing.T) {
+	outPipe, inPipe := net.Pipe()
+
+	outLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideSrv, err := New(Config{
+		PublicAddress:  outLn.Addr().String(),
+		Security:       plaintextSec(),
+		RequestTimeout: 5 * time.Second,
+		CarrierListen:  "stdio:", // outside role over the inherited pipe
+		CarrierPipe:    outPipe,
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("outside broker: %v", err)
+	}
+	octx, ocancel := context.WithCancel(context.Background())
+	defer ocancel()
+	go func() { _ = outsideSrv.Serve(octx, outLn) }()
+
+	inLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	insideSrv, err := New(Config{
+		PublicAddress:  inLn.Addr().String(),
+		Security:       plaintextSec(),
+		RequestTimeout: 5 * time.Second,
+		CarrierPipe:    inPipe, // inside role over the other end
+		Upstream: &UpstreamConfig{
+			BrokerAddr:        "stdio:",
+			Security:          plaintextSec(),
+			HeartbeatInterval: 30 * time.Second,
+		},
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("inside broker: %v", err)
+	}
+	ictx, icancel := context.WithCancel(context.Background())
+	defer icancel()
+	go func() { _ = insideSrv.Serve(ictx, inLn) }()
+
+	waitTunnelReady(t, insideSrv)
+	if tc := insideSrv.TunnelContact(); !strings.HasPrefix(tc, outLn.Addr().String()+"#") {
+		t.Fatalf("tunnel contact %q does not carry the outside broker's address", tc)
+	}
+	tunnelThrough(t, outLn.Addr().String(), inLn.Addr().String())
 }
