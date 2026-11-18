@@ -560,9 +560,10 @@ URL and a token the node already had.
 
 ### 5.1 The command is not run through a shell
 
-`CCB_CARRIER_COMMAND`-style values are split with shell-like quoting — single
-quotes literal, double quotes literal but for `\"` and `\\`, backslash escapes
-outside quotes — and then executed directly. There is no shell, so no variable
+The command line is everything after `cmd:` in `CCB_OUTBOUND_NEXT_HOP` or
+`CCB_CARRIER_LISTEN`. It is split with shell-like quoting — single quotes
+literal, double quotes literal but for `\"` and `\\`, backslash escapes outside
+quotes — and then executed directly. There is no shell, so no variable
 expansion, no globbing, no pipelines, no redirection.
 
 An **unquoted** shell metacharacter is refused rather than passed through as a

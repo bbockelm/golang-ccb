@@ -20,6 +20,7 @@ component is a second `htc-ccb`, one on each side.
 | open outbound TCP to your CCB's port | ordinary CCB — `CCB_ADDRESS`, nothing here applies |
 | open outbound TCP, but too few sockets | this guide; the whole node collapses to one connection |
 | reach only an HTTP proxy, to approved destinations | this guide |
+| reach only a bastion over SSH | this guide — the carrier is `ssh` itself (§4.5) |
 | reach nothing at all, but share a filesystem with the pool | the filesystem carrier in [TRANSPORTS.md](TRANSPORTS.md) §4 |
 
 If an ordinary CCB works at your site, use it. What follows costs you a public
@@ -117,6 +118,10 @@ shows up as a different failure.
 
 You also need, on your side, a TLS certificate for the broker's hostname that
 the worker nodes will trust.
+
+All four are about an HTTP proxy. **If the site runs no proxy but permits SSH to
+a bastion**, none of them apply and §4.5 has a different, shorter list: an
+account on the bastion, and whether the bastion may reach your broker.
 
 ---
 
@@ -224,6 +229,134 @@ state back to a factory, say.
 
 ---
 
+### 4.5 Carrying the tunnel over SSH instead
+
+Everything above assumes the carrier is a `wss://` tunnel through the site's
+HTTP proxy. Where the site runs no proxy but does permit **SSH to a bastion**,
+the carrier can be `ssh` itself: the broker runs the command and uses its stdin
+and stdout as the tunnel.
+
+Nothing else changes. The outside broker still faces the pool over ordinary
+CEDAR, the execution point's configuration (§4.3) is identical, and the startup
+order (§4.4) is identical. Only the one line naming the carrier differs.
+
+#### What to ask the site for
+
+A different list from §3, and usually a shorter conversation:
+
+1. **An account on the bastion** for the broker to log in as, and an
+   `authorized_keys` entry for the key it will present. This is the real cost of
+   this carrier — the WebSocket one needs only a URL and a token the glidein
+   already carries.
+2. **Whether the bastion may reach your outside broker**, and on which port. If
+   it may, you need nothing installed there at all (shape A below). If it may
+   not, `htc-ccb` has to run on the bastion itself (shape B).
+3. **Nothing about TLS, and nothing about the proxy.** There is no certificate
+   to obtain and no `CONNECT` destination to have approved. A site middlebox
+   also cannot transparently interpose on SSH the way it can on TLS, which is
+   the one security property this carrier has that the WebSocket one does not
+   (see [CARRIER_AUTH.md](CARRIER_AUTH.md) §2).
+
+#### Shape A — relay through the bastion, nothing installed on it
+
+The inside broker runs `ssh -W`, which is OpenSSH's own stdio-to-TCP relay, and
+the outside broker accepts the resulting raw pipe.
+
+On the **outside** broker, beside the pool:
+
+```condor
+DAEMON_LIST = $(DAEMON_LIST), CCB
+CCB = /usr/sbin/htc-ccb
+CCB_ARGS = -listen 0.0.0.0:9618 -public ccb.example.org:9618
+
+# Where tunnels arrive. This is NOT the CEDAR port above: it is a raw carrier
+# pipe, and the two are not interchangeable.
+CCB_CARRIER_LISTEN = tcp://0.0.0.0:9700
+
+CCB_OUTBOUND_PROXY = TRUE
+CCB_OUTBOUND_TARGET_ALLOWLIST = collector.example.org, *.ap.example.org
+```
+
+On the **inside** broker, on the worker node:
+
+```condor
+CCB_OUTBOUND_PROXY = TRUE
+CCB_OUTBOUND_NEXT_HOP = cmd:ssh -W ccb.example.org:9700 bastion.site.edu
+CCB_TUNNEL_READY_FILE = $(LOCAL_DIR)/ccb_tunnel_ready
+CCB_OUTBOUND_TARGET_ALLOWLIST = 192.0.2.0/24
+```
+
+A `tcp://` endpoint carries no TLS and no transport credential. That is the same
+posture as `CCB_CARRIER_AUTH = none` and rests on the same argument — the
+identity behind every authorization decision comes from the CEDAR handshake on
+the first command, not from the transport ([CARRIER_AUTH.md](CARRIER_AUTH.md)
+§3). What it means in practice is that the port must not be reachable from
+anywhere but the bastion. Bind it to an address the bastion can reach and
+nothing else can, or firewall it to the bastion's address; the broker warns at
+startup when it is bound beyond loopback. `CCB_CARRIER_MAX_SESSIONS` and
+`CCB_CARRIER_MAX_PER_SOURCE` bound it either way, and note that every node
+relaying through one bastion shares that bastion's address — so leave
+`CCB_CARRIER_MAX_PER_SOURCE` off here, exactly as behind a proxy.
+
+#### Shape B — `htc-ccb` at the far end
+
+Where the bastion may not reach your broker, put the binary there and let it
+carry the pipe:
+
+```condor
+CCB_OUTBOUND_NEXT_HOP = cmd:ssh bastion.site.edu htc-ccb -carrier-stdio
+```
+
+`-carrier-stdio` tells that process to take the stdin and stdout it was started
+with as its carrier. It needs an HTCondor configuration of its own on the
+bastion.
+
+#### Shape C — the outside broker reaches in
+
+The two shapes above have the restricted node reaching out. Where it cannot —
+an HPC cluster whose login node you can `ssh` to but whose compute nodes dial
+nothing — the direction reverses. The **outside** broker runs the command, and
+the broker it starts on the login node is the inside one:
+
+```condor
+# On the outside broker, instead of a tcp:// or wss:// CCB_CARRIER_LISTEN:
+CCB_CARRIER_LISTEN = cmd:ssh login.cluster.edu htc-ccb -carrier-stdio
+```
+
+Nobody dials the inside broker and the inside broker dials nobody; the carrier
+is a process the outside broker started, and it is re-run when the pipe dies
+(`CCB_CARRIER_RETRY_INITIAL`, `CCB_CARRIER_RETRY_MAX`).
+
+#### Two things that catch people
+
+**The command is not run through a shell.** Quoting works — single quotes,
+double quotes, backslashes — but pipelines, redirection and `$VARIABLES` do not,
+and an unquoted `|`, `;`, `&`, `>`, `$` or backtick is *refused* at startup
+rather than passed to `ssh` as a literal argument. Quote it if you mean it
+literally:
+
+```condor
+CCB_OUTBOUND_NEXT_HOP = cmd:ssh -o 'ProxyJump jump.site.edu' -W ccb.example.org:9700 bastion.site.edu
+```
+
+**The broker is not you.** It runs as the `condor` user, usually from
+`condor_master`, so `ssh` reads *that* account's `~/.ssh/config`,
+`~/.ssh/known_hosts` and keys — not root's and not yours. The child inherits the
+daemon's environment, so `SSH_AUTH_SOCK` and `KRB5CCNAME` carry through if they
+are set for the daemon; point `HOME` somewhere the broker can actually read with
+`CCB_CARRIER_COMMAND_ENV`:
+
+```condor
+CCB_CARRIER_COMMAND_ENV = HOME=/var/lib/condor
+```
+
+An unknown host key is the most common first failure, because a non-interactive
+`ssh` cannot answer the prompt. Pre-populate that account's `known_hosts`.
+Whatever goes wrong, `ssh` says so on stderr and `-carrier-check` repeats it
+verbatim (§6) — the diagnosis is almost always in that one line.
+
+---
+
 ## 5. A proxy that requires authentication
 
 Put the credential in a file rather than the configuration, which is
@@ -297,6 +430,30 @@ flowchart TD
 
 The same report is written to `CcbLog` at startup, so you can read it after the
 fact without re-running anything.
+
+### An `ssh` carrier reports what `ssh` said
+
+A `cmd:` carrier (§4.5) has no proxy, TLS or upgrade stage to walk — those are
+properties of a WebSocket endpoint. What it has instead is the command's own
+output, which is where the diagnosis invariably is:
+
+```
+carrier cmd:ssh -W ccb.example.org:9700 bastion.site.edu (not a WebSocket carrier)
+  FAIL far-broker-cedar  EOF
+       the carrier command (/usr/bin/ssh) exited (exit status 255); its last
+       output was: Host key verification failed.
+```
+
+Without that line the failure reaches you as a bare `EOF` on a pipe, which says
+nothing at all. The broker keeps the command's last stderr lines for exactly
+this, and reports them the same way whenever the carrier dies — not only under
+`-carrier-check`. The usual three, in order of how often they come up:
+
+| What `ssh` says | What to do |
+|---|---|
+| `Host key verification failed.` | The broker's account has no `known_hosts` entry for the bastion, and a non-interactive `ssh` cannot accept one. Pre-populate it (§4.5). |
+| `Permission denied (publickey).` | The key the broker's account presents is not in the bastion's `authorized_keys`, or `HOME` points somewhere it cannot read it. |
+| `connect to host … port 9700: Connection refused` | `ssh` reached the bastion; the bastion could not reach your `CCB_CARRIER_LISTEN`. Shape A needs that path to exist — otherwise use shape B. |
 
 ---
 
@@ -438,12 +595,18 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_MAX_SESSIONS` | concurrent tunnels, one per glidein broker (1024) |
 | `CCB_CARRIER_MAX_PER_SOURCE` | concurrent tunnels from one address (0 = off; leave off behind a proxy) |
 | `CCB_CARRIER_PIPE_PROBATION` | seconds a tunnel may sit without registering (60; `0` disables) |
+| `CCB_CARRIER_LISTEN = tcp://…` | a raw carrier pipe rather than a WebSocket, for a relayed tunnel (§4.5 shape A). No TLS and no transport credential — keep it reachable only from the relay host |
+| `CCB_CARRIER_LISTEN = cmd:…` | reach *into* the restricted network by running a command, the broker it starts playing the inside role (§4.5 shape C) |
+| `CCB_CARRIER_RETRY_INITIAL` / `CCB_CARRIER_RETRY_MAX` | seconds before, and the ceiling on, retrying a `cmd:` carrier (1 / 60) |
 
 ### Inside broker
 
 | Knob | Meaning |
 |---|---|
-| `CCB_OUTBOUND_NEXT_HOP` | `wss://…` — the outside broker's carrier endpoint |
+| `CCB_OUTBOUND_NEXT_HOP` | `wss://…` — the outside broker's carrier endpoint. Also `cmd:<command>` to carry the tunnel over `ssh` (§4.5), `tcp://…` for a raw pipe, or `stdio:` for a broker started by one |
+| `CCB_CARRIER_COMMAND_ENV` | `NAME=VALUE` entries added to a `cmd:` carrier's environment — in practice `HOME`, so `ssh` finds the broker account's keys and `known_hosts` |
+| `CCB_CARRIER_COMMAND_DIR` | working directory for that command; unset means the broker's own |
+| `CCB_CARRIER_COMMAND_GRACE` | seconds a closing carrier gives the command after `SIGTERM` before `SIGKILL` (2) |
 | `CCB_CARRIER_PROXY` | proxy URL, or `none` to force a direct connection. Unset uses `https_proxy` |
 | `CCB_CARRIER_PROXY_CREDENTIAL_FILE` | `user:password`, mode 600 |
 | `CCB_CARRIER_CA_FILE` | CA for the broker's certificate |
@@ -469,6 +632,7 @@ these are an HTTP forward proxy and are read by nothing else in the pool.
 
 ## 10. Further reading
 
-- [TRANSPORTS.md](TRANSPORTS.md) — the carrier design, and the filesystem
-  carrier for sites with no network path at all.
+- [TRANSPORTS.md](TRANSPORTS.md) — the carrier design: the filesystem carrier
+  for sites with no network path at all (§4), and why the `ssh` carrier of §4.5
+  runs the system `ssh` rather than speaking SSH itself (§5).
 - [E2E_SQUID_WS.md](E2E_SQUID_WS.md) — how this is tested, for developers.

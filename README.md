@@ -25,7 +25,7 @@ someone wants to reach it the broker tells it to dial *back*.
 | Both ends private (an EP and a submit host that cannot reach each other) | the collector's CCB does this from HTCondor 26.0.0; **this** if you also want the broker off the collector's host |
 | Worker nodes that may open only one or two sockets, or reach only an HTTP proxy | **this** — see [§7](#7-execution-points-with-no-outbound-network) |
 | Worker nodes with no network path at all, but a shared filesystem | **this** — see [docs/TRANSPORTS.md](docs/TRANSPORTS.md) |
-| Nodes that may reach only a bastion over SSH | **this** — the carrier can be `ssh` itself, see [docs/TRANSPORTS.md §5](docs/TRANSPORTS.md) |
+| Nodes that may reach only a bastion over SSH | **this** — the carrier can be `ssh` itself, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
 
 If the collector's built-in CCB already works for you, there is no reason to
 change. What you get here is a broker you can put on its own host, restart
@@ -250,6 +250,7 @@ and `<local-name>.CCB_SESSION_CACHE_FILE` beat the bare name.
 | `-listen <addr>` | the public TCP port peers connect to. Under `condor_master` this is bound *in addition* to the inherited command socket |
 | `-public <host:port>` | the address advertised in contacts. Defaults to the listen address, which is wrong whenever that is a wildcard or behind a NAT |
 | `-carrier-check` | run the tunnel diagnostic and exit; starts no daemon ([§7](#7-execution-points-with-no-outbound-network)) |
+| `-carrier-stdio` | take this process's stdin and stdout as the carrier and run as the inside broker over it. What `ssh <node> htc-ccb -carrier-stdio` starts at the far end of a tunnel ([docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md)) |
 
 ### State and policy
 
@@ -319,9 +320,11 @@ carrier wss://ccb.example.org/ccb/tunnel (via http://squid.site.example:3128)
 ## 8. Further reading
 
 - [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md) — running an execution
-  point behind a site HTTP proxy, end to end. For administrators.
+  point behind a site HTTP proxy, or over `ssh` to a bastion, end to end. For
+  administrators.
 - [docs/TRANSPORTS.md](docs/TRANSPORTS.md) — how the carriers work, including
-  the filesystem carrier for sites with no network path at all.
+  the filesystem carrier for sites with no network path at all, and why the
+  command carrier runs the system `ssh` rather than speaking SSH itself.
 - [docs/DEVELOPING.md](docs/DEVELOPING.md) — the CCB protocol as implemented,
   building, testing, packaging. For developers.
 - [docs/E2E_SQUID_WS.md](docs/E2E_SQUID_WS.md) — how the tunneled path is

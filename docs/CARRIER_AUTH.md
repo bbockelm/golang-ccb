@@ -157,6 +157,14 @@ This is worth knowing before removing the upgrade check: at a pool that leans
 on host-based `ALLOW_` lists, the host term was already not protecting the
 carrier.
 
+The same is true, for the same reason, of the carriers added since: a `cmd:`
+peer is a child process and a `stdio:` peer is the process that started this
+one, and neither has a network address to report. Everything in this section
+applies to them unchanged, in **both** auth modes. A `tcp://` carrier is the
+exception — it is an ordinary TCP connection and reports a real address — but it
+carries no transport credential at all, so §3.4 and §6 are what govern it, not
+the upgrade check discussed here.
+
 ### 3.6 DoS baseline of the current accept path
 
 What an unauthenticated peer can already make the outside broker do, today,
@@ -427,8 +435,14 @@ Then check two things:
 | `CCB_CARRIER_MAX_PER_SOURCE` | 0 (off) | Concurrent pipes from one address. **Leave this off behind an intercepting proxy**, where every node arrives from the proxy's address and this limit would fall on the one source that must not be limited. Useful only for brokers reached directly. |
 | `CCB_CARRIER_PIPE_PROBATION` | 60 (seconds) | Closes a pipe that opens no connection in this long. A real inside broker registers immediately, so this is invisible to working traffic. Set it to `0` to turn the check off. |
 
+The first three apply to a `tcp://` carrier too, which has no credential of any
+kind and so is always an open endpoint in this sense. The HTTP timeouts below
+are specific to the WebSocket upgrade; a raw pipe has no request to time out,
+and `CCB_CARRIER_PIPE_PROBATION` is what bounds a peer that connects and then
+says nothing.
+
 HTTP read timeouts (10s for headers, 30s for the request, 120s idle) apply in
-**both** modes and are not configurable. They close a gap that existed before
+**both** WebSocket modes and are not configurable. They close a gap that existed before
 this change: the request was parsed before any credential was checked, with no
 deadline, so a peer could hold a slot indefinitely while sending nothing.
 
