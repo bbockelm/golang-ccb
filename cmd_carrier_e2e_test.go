@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,12 +186,45 @@ func waitTunnelReady(t *testing.T, srv *Server) {
 // command's stderr ends up too.
 func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
-	return slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	w := &testWriter{t: t}
+	// Stop writing before the test is torn down. Cleanups run while the test
+	// is still live, so a write already in flight finishes under the lock and
+	// anything after it is dropped.
+	t.Cleanup(w.stop)
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-type testWriter struct{ t *testing.T }
+// testWriter sends a broker's logs to the test's output, and stops doing so
+// once the test is over.
+//
+// A broker's goroutines outlive the test that started it -- an accept loop, a
+// relay draining, a registration completing -- and any of them may log. Calling
+// t.Logf from there after the test has finished is a data race on the testing
+// package's own state, which the race detector reports against no test at all:
+// the package simply fails with every test passing, and the only clue is a
+// stray log line. That is what it did, and the cost was a red main that looked
+// like it came from the unrelated change which merely made relays log more.
+//
+// Dropping a line after the test ends loses nothing that could be read anyway:
+// the test's output is already closed.
+type testWriter struct {
+	t    *testing.T
+	mu   sync.Mutex
+	done bool
+}
 
-func (w testWriter) Write(p []byte) (int, error) {
+func (w *testWriter) stop() {
+	w.mu.Lock()
+	w.done = true
+	w.mu.Unlock()
+}
+
+func (w *testWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return len(p), nil
+	}
 	w.t.Logf("%s", strings.TrimRight(string(p), "\n"))
 	return len(p), nil
 }
