@@ -146,11 +146,29 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 	if err := insideSrv.WaitTunnelReady(rctx); err == nil {
 		t.Fatal("registration succeeded through a deny-all authorizer; the carrier bypassed authorization")
 	}
-	askedMu.Lock()
-	consulted := len(asked)
-	askedMu.Unlock()
-	if consulted == 0 {
-		t.Fatal("the authorizer was never consulted for a carrier connection")
+	// WaitTunnelReady returning an error proves registration did not succeed,
+	// but not why -- a carrier still connecting looks exactly like one that was
+	// denied. So wait for the authorizer to actually be consulted instead of
+	// sampling once: under -race on a loaded runner the carrier can take longer
+	// than the 3s above to get that far, and the single sample then failed on
+	// something that had simply not happened yet. That is what broke main on Go
+	// 1.27 while 1.26 passed on the same commit.
+	//
+	// The assertion keeps its teeth. A carrier that bypassed authorization
+	// leaves asked empty forever, and registration would have succeeded, which
+	// the check above already catches.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		askedMu.Lock()
+		consulted := len(asked)
+		askedMu.Unlock()
+		if consulted > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the authorizer was never consulted for a carrier connection")
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
