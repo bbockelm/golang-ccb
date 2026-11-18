@@ -25,7 +25,14 @@ type fwdSharedPortServer struct {
 
 func startFwdSharedPortServer(t *testing.T, backends map[string]string) *fwdSharedPortServer {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	return startFwdSharedPortServerOn(t, "127.0.0.1", backends)
+}
+
+// startFwdSharedPortServerOn binds a given address. The outbound-proxy tests
+// need one that is not loopback, since the proxy refuses loopback targets.
+func startFwdSharedPortServerOn(t *testing.T, listenIP string, backends map[string]string) *fwdSharedPortServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -523,7 +523,7 @@ func TestOutboundThroughCmdStdioCarrierInverted(t *testing.T) {
 	t.Logf("login-host broker (started from outside) serves the cluster at %s", insideAddr)
 
 	// A job on a compute node: it can reach the login host and nothing else.
-	if err := outboundDCNopRetrying(t, insideAddr, targetAddr); err != nil {
+	if err := outboundDCNopRetrying(t, insideAddr, "<"+targetAddr+">"); err != nil {
 		t.Fatalf("a job's outbound connection through the SSH-opened tunnel: %v", err)
 	}
 	select {
@@ -640,38 +640,6 @@ func roundTrips(ip string) bool {
 	}
 	_ = c.Close()
 	return true
-}
-
-// outboundDCNopRetrying runs a job's outbound connection, retrying a stalled
-// attempt with a fresh deadline.
-//
-// The retry is for the environment, not the carrier. On a host with an overlay
-// interface a connection to a non-loopback address of its own can stall for
-// no reason the test can see or control, and every outbound-proxy test here
-// inherits it: measured over 12 runs on one such host, this test failed once
-// and the pre-existing fs-carrier equivalent -- same outbound path, different
-// carrier, still one attempt -- failed seven times.
-//
-// It does not weaken what the test proves. A carrier that could not forward a
-// proxy-connect would fail all three attempts, every run; only a transient
-// stall is absorbed. If all three fail the test still fails, and the error
-// says so.
-func outboundDCNopRetrying(t *testing.T, insideAddr, targetAddr string) error {
-	t.Helper()
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err = outboundDCNop(ctx, insideAddr, "<"+targetAddr+">")
-		cancel()
-		if err == nil {
-			if attempt > 1 {
-				t.Logf("the job's outbound connection succeeded on attempt %d", attempt)
-			}
-			return nil
-		}
-		t.Logf("attempt %d stalled: %v", attempt, err)
-	}
-	return fmt.Errorf("three attempts failed, last: %w", err)
 }
 
 // stdio: is a pipe, not a role: it works on CCB_CARRIER_LISTEN (outside) as
