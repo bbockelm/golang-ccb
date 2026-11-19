@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,10 @@ var (
 	builtOnce sync.Once
 	builtPath string
 	builtErr  error
+
+	relayOnce sync.Once
+	relayPath string
+	relayErr  error
 )
 
 // brokerBinary compiles htc-ccb once for the whole run.
@@ -50,6 +55,34 @@ func brokerBinary(t *testing.T) string {
 		t.Fatal(builtErr)
 	}
 	return builtPath
+}
+
+// relayBinary compiles htc-ccb-relay once for the whole run.
+//
+// The relay is what a staging carrier should actually send, so it gets the
+// same end-to-end treatment as the full binary rather than being trusted to
+// behave because it shares a library: it is a different main with a
+// different, smaller wiring, and the ways it could differ -- a knob it does
+// not read, a role it does not take, a flag it rejects -- are exactly the
+// ones a unit test cannot see.
+func relayBinary(t *testing.T) string {
+	t.Helper()
+	relayOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "htc-ccb-relay-integration")
+		if err != nil {
+			relayErr = err
+			return
+		}
+		relayPath = filepath.Join(dir, "htc-ccb-relay")
+		out, err := exec.Command("go", "build", "-buildvcs=false", "-o", relayPath, "./cmd/htc-ccb-relay").CombinedOutput()
+		if err != nil {
+			relayErr = fmt.Errorf("building htc-ccb-relay: %w\n%s", err, out)
+		}
+	})
+	if relayErr != nil {
+		t.Fatal(relayErr)
+	}
+	return relayPath
 }
 
 // remoteConfig writes the configuration the staged broker will run with.
@@ -301,4 +334,94 @@ func identityFile(t *testing.T, srv *sshtest.Server) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// The relay is the binary a staging carrier should send, so stage it and
+// drive the same end-to-end path: an ssh session, the derived
+// `<binary> -carrier-stdio` command line, the staged configuration, and a
+// registration arriving back through the pipe.
+func TestIntegrationSSHCarrierStagesTheRelay(t *testing.T) {
+	srv, err := sshtest.Start(sshtest.RunReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	_, broker := sshCarrierBroker(t, srv, func(sc *SSHCarrierConfig) {
+		sc.StageBinary = relayBinary(t)
+	})
+	waitForStagedBroker(t, broker)
+}
+
+// A directory holding both builds must stage the relay: it is the one meant
+// to cross the network, and a site that has both should not pay for the
+// larger one by accident.
+func TestIntegrationADirectoryOfBuildsPrefersTheRelay(t *testing.T) {
+	srv, err := sshtest.Start(sshtest.RunReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	dir := t.TempDir()
+	goos, goarch := runtime.GOOS, runtime.GOARCH
+	copyFile(t, relayBinary(t), filepath.Join(dir, "htc-ccb-relay-"+goos+"-"+goarch))
+	copyFile(t, brokerBinary(t), filepath.Join(dir, "htc-ccb-"+goos+"-"+goarch))
+
+	remoteDir := filepath.Join(t.TempDir(), "staged")
+	_, broker := sshCarrierBroker(t, srv, func(sc *SSHCarrierConfig) {
+		sc.StageBinary = ""
+		sc.StageBinaryDir = dir
+		sc.RemoteDir = remoteDir
+	})
+	waitForStagedBroker(t, broker)
+
+	// Which build crossed is the whole point, and it is only visible in what
+	// landed: both run the same role, so a working tunnel proves nothing
+	// about which one is on the far host.
+	staged := stagedNames(t, remoteDir)
+	if len(staged) != 1 {
+		t.Fatalf("expected exactly one staged binary, found %v", staged)
+	}
+	got := fileSize(t, filepath.Join(remoteDir, staged[0]))
+	relaySize := fileSize(t, relayBinary(t))
+	if got != relaySize {
+		t.Errorf("staged %d bytes; the relay is %d and the full binary %d -- the wrong build was sent",
+			got, relaySize, fileSize(t, brokerBinary(t)))
+	}
+}
+
+func copyFile(t *testing.T, from, to string) {
+	t.Helper()
+	body, err := os.ReadFile(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(to, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Size()
+}
+
+func stagedNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".conf") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }

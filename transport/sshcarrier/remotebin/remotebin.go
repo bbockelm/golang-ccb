@@ -22,11 +22,25 @@ import (
 	"strings"
 )
 
-// Name is what a per-platform build is called in a directory:
-// htc-ccb-<os>-<arch>, as the release tarballs name them.
-func Name(goos, goarch string) string {
-	return fmt.Sprintf("htc-ccb-%s-%s", goos, goarch)
+// Names are what a per-platform build can be called in a directory, best
+// first: htc-ccb-relay-<os>-<arch> then htc-ccb-<os>-<arch>, as the release
+// tarballs name them.
+//
+// The relay is preferred because it is what should cross the network: it is
+// the same broker with the parts a staged process cannot use taken out, and
+// on linux/amd64 it is 4.7 MB gzipped against the full binary's 6.6 MB. A
+// site that ships only the full binary still works -- it is a complete
+// broker and runs the same -carrier-stdio role -- so this is a preference,
+// not a requirement.
+func Names(goos, goarch string) []string {
+	return []string{
+		fmt.Sprintf("htc-ccb-relay-%s-%s", goos, goarch),
+		fmt.Sprintf("htc-ccb-%s-%s", goos, goarch),
+	}
 }
+
+// Name is the preferred spelling for one platform.
+func Name(goos, goarch string) string { return Names(goos, goarch)[0] }
 
 // Source is where a staged binary came from, for the log line. An operator
 // debugging a staging problem needs to know which copy was sent.
@@ -35,14 +49,20 @@ type Source struct {
 	Path string
 	// Embedded reports a build carried inside this binary.
 	Embedded bool
-	Size     int
+	// Self reports this running binary, sent for a host of its own platform.
+	Self bool
+	Size int
 }
 
 func (s Source) String() string {
-	if s.Embedded {
+	switch {
+	case s.Embedded:
 		return fmt.Sprintf("embedded (%d bytes)", s.Size)
+	case s.Self:
+		return fmt.Sprintf("this running binary, %s (%d bytes)", s.Path, s.Size)
+	default:
+		return fmt.Sprintf("%s (%d bytes)", s.Path, s.Size)
 	}
-	return fmt.Sprintf("%s (%d bytes)", s.Path, s.Size)
 }
 
 // Find returns the build for goos/goarch.
@@ -53,22 +73,40 @@ func (s Source) String() string {
 // just that this one is missing -- "no linux/arm64 build" is not actionable
 // when the caller cannot see what there was.
 func Find(dir, goos, goarch string) ([]byte, Source, error) {
-	want := Name(goos, goarch)
+	wanted := Names(goos, goarch)
 	if dir != "" {
-		path := filepath.Join(dir, want)
-		body, err := os.ReadFile(path)
-		if err == nil {
-			return body, Source{Path: path, Size: len(body)}, nil
-		}
-		if !os.IsNotExist(err) {
-			return nil, Source{}, fmt.Errorf("remotebin: reading %s: %w", path, err)
+		for _, want := range wanted {
+			path := filepath.Join(dir, want)
+			body, err := os.ReadFile(path)
+			if err == nil {
+				return body, Source{Path: path, Size: len(body)}, nil
+			}
+			if !os.IsNotExist(err) {
+				return nil, Source{}, fmt.Errorf("remotebin: reading %s: %w", path, err)
+			}
 		}
 	}
-	if body, ok := embedded(want); ok {
-		return body, Source{Embedded: true, Size: len(body)}, nil
+	for _, want := range wanted {
+		if body, ok := embedded(want); ok {
+			return body, Source{Embedded: true, Size: len(body)}, nil
+		}
 	}
-	return nil, Source{}, fmt.Errorf("remotebin: no %s/%s build available%s; %s",
-		goos, goarch, inDir(dir), haveWhat(dir))
+	// Last: this running binary, when the far host is of its own platform.
+	//
+	// A broker never needs to carry a copy of itself. A linux/amd64 htc-ccb
+	// staging onto a linux/amd64 host already has, on disk, a binary that
+	// runs the role -- so the embedded copies are only ever needed for the
+	// OTHER platforms, which halves what `-tags embedremote` costs.
+	//
+	// It is last because it is the largest of the three: the running binary
+	// is usually the full htc-ccb, where a directory or an embedded copy
+	// would be the smaller relay. Self-staging is the fallback that means
+	// "always works", not the preferred source.
+	if body, src, err := self(goos, goarch); err == nil && body != nil {
+		return body, src, nil
+	}
+	return nil, Source{}, fmt.Errorf("remotebin: no %s/%s build available%s; %s. %s",
+		goos, goarch, inDir(dir), haveWhat(dir), remedy)
 }
 
 func inDir(dir string) string {
@@ -78,7 +116,14 @@ func inDir(dir string) string {
 	return " in " + dir
 }
 
-// haveWhat lists what is on hand, so the error names the fix.
+// remedy is the fix, said once rather than guessed at per case. A missing
+// platform is nearly always a build that was never made, so the message names
+// both ways to make one.
+const remedy = "Put an htc-ccb-relay-<os>-<arch> build in CCB_CARRIER_SSH_STAGE_BINARY_DIR, " +
+	"or build htc-ccb with -tags embedremote after running scripts/embed-builds.sh"
+
+// haveWhat lists what is on hand, so the error says what there was rather
+// than only what was missing.
 func haveWhat(dir string) string {
 	var have []string
 	if dir != "" {
@@ -91,19 +136,59 @@ func haveWhat(dir string) string {
 		}
 	}
 	have = append(have, embeddedNames()...)
-	if len(have) == 0 {
-		if dir == "" {
-			return "no directory is configured and this build carries none (rebuild with -tags embedremote, or set the directory)"
-		}
-		return "that directory holds no htc-ccb-<os>-<arch> builds"
-	}
+	// This binary can always stage itself onto a host of its own platform,
+	// so that is part of the inventory even when nothing else is configured.
+	have = append(have, fmt.Sprintf("this binary's own platform (%s/%s)", runtime.GOOS, runtime.GOARCH))
 	sort.Strings(have)
 	return "available: " + strings.Join(have, ", ")
 }
 
-// Local names the platform this binary was built for, which is the only one a
-// single-file install can stage without either a directory or the embed tag.
+// ParsePlatform reads an htc-ccb-relay-<os>-<arch> or htc-ccb-<os>-<arch>
+// file name back into its platform.
+//
+// Having one parser matters because there are now two spellings: code that
+// splits on "-" and takes the last two fields works for both, and code that
+// strips a single "htc-ccb-" prefix silently mis-parses the relay.
+func ParsePlatform(name string) (goos, goarch string, ok bool) {
+	name = strings.TrimSuffix(name, ".gz")
+	if !strings.HasPrefix(name, "htc-ccb-") {
+		return "", "", false
+	}
+	parts := strings.Split(name, "-")
+	if len(parts) < 4 {
+		return "", "", false
+	}
+	return parts[len(parts)-2], parts[len(parts)-1], true
+}
+
+// Local names the platform this binary was built for.
 func Local() (string, string) { return runtime.GOOS, runtime.GOARCH }
+
+// self returns this running binary when it matches the far host's platform.
+//
+// Returns (nil, _, nil) for any other platform, and an error only when the
+// executable cannot be read -- which is not fatal here, because a directory
+// or an embedded copy may still have the build.
+func self(goos, goarch string) ([]byte, Source, error) {
+	if goos != runtime.GOOS || goarch != runtime.GOARCH {
+		return nil, Source{}, nil
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return nil, Source{}, err
+	}
+	// Resolve symlinks so the bytes come from the real file: a broker started
+	// through /usr/local/bin/htc-ccb -> ../libexec/... would otherwise read a
+	// link.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, Source{}, err
+	}
+	return body, Source{Path: path, Self: true, Size: len(body)}, nil
+}
 
 // Any reports whether this build carries any compiled-in binaries at all.
 //
