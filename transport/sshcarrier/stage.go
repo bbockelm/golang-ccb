@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/bbockelm/golang-ccb/transport/sshcarrier/remotebin"
 )
 
 // DefaultRemoteDir is where a staged binary lands when none is configured. It
@@ -76,7 +78,20 @@ func normalizeArch(s string) string {
 type StageConfig struct {
 	// Binary is the local file to put on the far host. It must be the build
 	// for that host's platform; Stage refuses to send one that is not.
+	//
+	// Naming one file is the simple case: a single-architecture site, or a
+	// test. A site with a mixed fleet names BinaryDir instead and lets the
+	// detected platform choose.
 	Binary string
+	// BinaryDir holds per-platform builds named htc-ccb-<os>-<arch>, as the
+	// release tarballs name them. Used when Binary is empty: the build is
+	// chosen by what the far host reported, so one configuration serves an
+	// amd64 login node and an arm64 one.
+	//
+	// With neither set, a binary compiled into this one is used if there is
+	// one for that platform -- see the remotebin package, which carries them
+	// only under the `embedremote` build tag.
+	BinaryDir string
 	// Platform is what the far host reported. Stage checks the local binary
 	// against it rather than discovering a mismatch as "Exec format error"
 	// minutes later.
@@ -119,13 +134,9 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	if cfg.LocalPlatform != (Platform{}) && cfg.Platform != (Platform{}) && cfg.LocalPlatform != cfg.Platform {
-		return StagedPaths{}, fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
-	}
-
-	body, err := os.ReadFile(cfg.Binary)
+	body, source, err := resolveBinary(cfg)
 	if err != nil {
-		return StagedPaths{}, fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
+		return StagedPaths{}, err
 	}
 	sum := sha256.Sum256(body)
 	digest := hex.EncodeToString(sum[:])
@@ -137,7 +148,7 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 	name := "htc-ccb-" + digest[:16]
 	remote := path.Join(dir, name)
 
-	if err := putFile(ctx, client, remote, body, log, "broker binary", cfg.Platform.String()); err != nil {
+	if err := putFile(ctx, client, remote, body, log, "broker binary", cfg.Platform.String(), source); err != nil {
 		return StagedPaths{}, err
 	}
 	out := StagedPaths{Binary: remote}
@@ -149,7 +160,7 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 		}
 		confSum := sha256.Sum256(confBody)
 		conf := path.Join(dir, "htc-ccb-"+hex.EncodeToString(confSum[:])[:16]+".conf")
-		if err := putFile(ctx, client, conf, confBody, log, "configuration", ""); err != nil {
+		if err := putFile(ctx, client, conf, confBody, log, "configuration", "", cfg.CondorConfig); err != nil {
 			return StagedPaths{}, err
 		}
 		out.Config = conf
@@ -159,7 +170,7 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 
 // putFile stages one content-addressed file, skipping it when that exact
 // content is already there.
-func putFile(ctx context.Context, client *ssh.Client, remote string, body []byte, log *slog.Logger, what, platform string) error {
+func putFile(ctx context.Context, client *ssh.Client, remote string, body []byte, log *slog.Logger, what, platform, source string) error {
 	present, err := alreadyStaged(ctx, client, remote, len(body))
 	if err != nil {
 		return err
@@ -168,7 +179,7 @@ func putFile(ctx context.Context, client *ssh.Client, remote string, body []byte
 		log.Debug("ssh carrier file already staged", "what", what, "path", remote, "bytes", len(body))
 		return nil
 	}
-	log.Info("staging on the remote host", "what", what, "path", remote, "bytes", len(body), "platform", platform)
+	log.Info("staging on the remote host", "what", what, "path", remote, "bytes", len(body), "platform", platform, "from", source)
 	if err := upload(ctx, client, remote, body); err != nil {
 		return err
 	}
@@ -266,4 +277,35 @@ func runCommand(ctx context.Context, client *ssh.Client, cmd string) (string, er
 // today" is not a property worth relying on.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// resolveBinary picks the build to send and says where it came from.
+//
+// Three sources, in the order a site would mean them: a file named outright,
+// a directory of per-platform builds chosen by what the host reported, and --
+// only in a binary built with the `embedremote` tag -- a copy compiled into
+// this one. The last exists so a single-file install has something to stage
+// on a host it has never seen, which is the whole premise of zero touch.
+func resolveBinary(cfg StageConfig) ([]byte, string, error) {
+	if cfg.Binary != "" {
+		// An explicitly named file is the caller's word for "this build": the
+		// only check worth making is that it is not for the wrong machine,
+		// which otherwise surfaces as "Exec format error" at the far end.
+		if cfg.LocalPlatform != (Platform{}) && cfg.Platform != (Platform{}) && cfg.LocalPlatform != cfg.Platform {
+			return nil, "", fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
+		}
+		body, err := os.ReadFile(cfg.Binary)
+		if err != nil {
+			return nil, "", fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
+		}
+		return body, cfg.Binary, nil
+	}
+	if cfg.Platform == (Platform{}) {
+		return nil, "", fmt.Errorf("sshcarrier: no binary named and the remote platform is unknown, so none can be chosen")
+	}
+	body, src, err := remotebin.Find(cfg.BinaryDir, cfg.Platform.OS, cfg.Platform.Arch)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, src.String(), nil
 }

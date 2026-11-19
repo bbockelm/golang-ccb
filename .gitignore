@@ -5,3 +5,4 @@
 /dist/
 /build/
 /packaging/staging/
+transport/sshcarrier/remotebin/builds/*.gz
