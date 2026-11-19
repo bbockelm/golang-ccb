@@ -106,13 +106,61 @@ type HostKeyError struct {
 	Addr    string
 	Err     error
 	Changed bool
+
+	// Offered is the key the server actually presented, captured during the
+	// failed handshake. Having it means the operator does not need a second
+	// round trip to find out what to approve -- and, more to the point, does
+	// not need to re-fetch it from the same unverified source.
+	Offered ssh.PublicKey
+	// Where names the file to add the line to, for the message.
+	Where string
 }
 
 func (e *HostKeyError) Error() string {
+	what := "is not in known_hosts"
 	if e.Changed {
-		return fmt.Sprintf("sshcarrier: the host key for %s does not match known_hosts: %v", e.Addr, e.Err)
+		what = "does not match known_hosts"
 	}
-	return fmt.Sprintf("sshcarrier: the host key for %s is not in known_hosts: %v", e.Addr, e.Err)
+	msg := fmt.Sprintf("sshcarrier: the host key for %s %s: %v", e.Addr, what, e.Err)
+	if help := e.Help(); help != "" {
+		msg += "\n" + help
+	}
+	return msg
+}
+
+// Help tells an operator what to do about it.
+//
+// It deliberately does not say "run ssh-keyscan and paste the output".
+// ssh-keyscan trusts whatever answers the address, which is the exact thing
+// this carrier refuses to do -- following that advice would turn a refusal
+// into trust-on-first-use with extra steps. What it gives instead is the
+// fingerprint of the key that was actually offered, to be checked against
+// whatever the site publishes, and the line to add once it checks out.
+func (e *HostKeyError) Help() string {
+	if e.Offered == nil {
+		return ""
+	}
+	where := e.Where
+	if where == "" {
+		where = "the file named by CCB_CARRIER_SSH_KNOWN_HOSTS"
+	}
+	line := knownhosts.Line([]string{knownhosts.Normalize(e.Addr)}, e.Offered)
+
+	if e.Changed {
+		return fmt.Sprintf(
+			"The server offered %s %s, which is NOT the key on record.\n"+
+				"Do not simply replace the entry: this is what an interposed host looks like.\n"+
+				"Confirm with the site that the key was rotated, out of band, before changing anything.\n"+
+				"If it was, the new line is:\n\n  %s\n",
+			e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), line)
+	}
+	return fmt.Sprintf(
+		"The server offered %s %s.\n"+
+			"Check that fingerprint against what the site publishes -- asking the host itself\n"+
+			"(ssh-keyscan) would trust whatever answered, which is what this refusal is for.\n"+
+			"Once it matches, add to %s:\n\n  %s\n"+
+			"or set the same line as CCB_CARRIER_SSH_HOST_KEY.\n",
+		e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), where, line)
 }
 
 func (e *HostKeyError) Unwrap() error { return e.Err }
@@ -224,12 +272,13 @@ func Connect(ctx context.Context, cfg Config) (*ssh.Client, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	var offered ssh.PublicKey
 	client, err := dialClient(ctx, addr, &ssh.ClientConfig{
 		User:            user,
 		Auth:            auths,
-		HostKeyCallback: hostKey,
+		HostKeyCallback: capturingHostKey(hostKey, &offered),
 		Timeout:         timeout,
-	})
+	}, &offered, firstOf(cfg.KnownHosts))
 	if err != nil {
 		return nil, st.classify(err)
 	}
@@ -260,7 +309,7 @@ func Start(client *ssh.Client, cfg Config) (net.Conn, error) {
 
 // dialClient makes the TCP connection under ctx and then runs the SSH
 // handshake, classifying a host-key refusal so the retry policy can see it.
-func dialClient(ctx context.Context, addr string, cc *ssh.ClientConfig) (*ssh.Client, error) {
+func dialClient(ctx context.Context, addr string, cc *ssh.ClientConfig, offered *ssh.PublicKey, where string) (*ssh.Client, error) {
 	d := net.Dialer{Timeout: cc.Timeout}
 	tcp, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -270,7 +319,16 @@ func dialClient(ctx context.Context, addr string, cc *ssh.ClientConfig) (*ssh.Cl
 	if err != nil {
 		_ = tcp.Close()
 		if ke := asKeyError(err); ke != nil {
-			return nil, &HostKeyError{Addr: addr, Err: err, Changed: len(ke.Want) > 0}
+			hke := &HostKeyError{
+				Addr:    addr,
+				Err:     err,
+				Changed: len(ke.Want) > 0,
+				Where:   where,
+			}
+			if offered != nil {
+				hke.Offered = *offered
+			}
+			return nil, hke
 		}
 		return nil, fmt.Errorf("sshcarrier: ssh handshake with %s: %w", addr, err)
 	}
@@ -452,6 +510,16 @@ func (cfg Config) hostKeyCallback() (ssh.HostKeyCallback, error) {
 	return cb, nil
 }
 
+// capturingHostKey remembers the key the server offered, so a refusal can say
+// what it saw rather than sending the operator to fetch it again from the same
+// unverified place.
+func capturingHostKey(inner ssh.HostKeyCallback, seen *ssh.PublicKey) ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		*seen = key
+		return inner(hostname, remote, key)
+	}
+}
+
 // authMethods assembles the credentials to offer, agent first.
 func (cfg Config) authMethods() ([]ssh.AuthMethod, error) {
 	if len(cfg.authOverride) > 0 {
@@ -498,6 +566,13 @@ func writeInlineHostKeys(lines []string) (string, error) {
 		return "", fmt.Errorf("sshcarrier: writing inline host keys: %w", err)
 	}
 	return path, nil
+}
+
+func firstOf(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	return ss[0]
 }
 
 func normalizeAddr(addr string) (string, error) {
