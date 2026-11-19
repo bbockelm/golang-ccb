@@ -170,6 +170,7 @@ func Dial(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 			addr:     pipeAddr{network: "cmd", label: label},
 			onClose:  p.shutdown,
 			annotate: p.annotate,
+			settle:   p.settle,
 		},
 		proc: p,
 	}, nil
@@ -240,11 +241,18 @@ func (p *process) drainStderr(r *os.File) {
 // more than one %w since Go 1.20), so a caller can still recognize the
 // underlying io.EOF AND reach the *exec.ExitError for the exit code, rather
 // than having to scrape either out of the message.
-func (p *process) annotate(err error) error {
+// settle waits a bounded time for the child's exit status to be recorded. The
+// status normally lands within microseconds of the stream ending -- the same
+// event produces both -- so this is a race margin, not a timeout.
+func (p *process) settle() {
 	select {
 	case <-p.waited:
 	case <-time.After(exitReportGrace):
 	}
+}
+
+func (p *process) annotate(err error) error {
+	p.settle()
 	exitErr, exited := p.exited()
 	detail := p.tail.String()
 
