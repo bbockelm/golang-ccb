@@ -14,6 +14,9 @@ throttles live socket counts to ~1) can still tunnel:
    transport is whatever the operator runs: `ssh`, `kubectl exec`, a site gateway
    wrapper. (§5.)
 4. **Raw TCP pipes** — where a relayed carrier lands. (§5.4.)
+5. **Embedded SSH** — the broker speaks SSH itself, which is what lets it stage
+   its own binary on a host that has nothing, and route a login that needs a
+   person to one. (§6.)
 
 Only the inside↔outside link changes. The outside CCB still faces the pool over
 normal TCP CEDAR; clients reaching a tunneled EP are unchanged. End-to-end CEDAR
@@ -80,6 +83,7 @@ outside one. A bare `host:port` is not a carrier and keeps the default TCP path.
 | `tcp://host:9700` | raw carrier pipe over TCP | §5.4 |
 | `cmd:ssh bastion htc-ccb -carrier-stdio` | the command's stdin/stdout | §5 |
 | `stdio:` | this process's own stdin/stdout | §5.3 |
+| `ssh://[user@]host[:port]` | an SSH session the broker opens itself | §6 |
 
 Obtaining a pipe and playing a role are separate choices (§5.5): a `cmd:` carrier
 in `CCB_CARRIER_LISTEN` lets the **outside** broker reach into a network it
@@ -723,7 +727,174 @@ term, and reconnect IP pinning does not apply to them.
 
 ---
 
-## 6. Package layout (`transport/fstun`)
+## 6. Carrier D — the embedded SSH carrier (`transport/sshcarrier`, implemented)
+
+The `cmd:` carrier reaches a host by running the system `ssh` (§5). This one
+speaks SSH itself. Both exist on purpose, and which to prefer is a real choice
+rather than a migration.
+
+### 6.1 What embedding buys, and what it costs
+
+Three things the spawned `ssh` cannot do:
+
+- **Stage the binary.** The broker can put `htc-ccb` on the far host before it
+  runs anything, so a cluster needs nothing installed in advance (§6.3). With
+  `cmd:` the pipe *is* the child's stdin, so there is no second channel to send
+  a binary over.
+- **Finish a login that needs a person.** The client's auth callbacks are
+  reachable, so a password or one-time code can be routed to an administrator
+  and answered (§6.4). The spawned `ssh` talks to a terminal the broker does
+  not have.
+- **Watch startup step by step.** Connect, platform, stage, exec are separate
+  and separately reportable, rather than inferred from an exit status and
+  whatever `ssh` chose to print.
+
+What it costs is everything `ssh_config` does for free: `ProxyJump`,
+`ProxyCommand`, `ControlMaster`, `Match` blocks, certificates, GSSAPI, and
+every per-host option a site already maintains. **A site that needs those and
+does not need the three above should use `cmd:`** — it is not a lesser option,
+and reimplementing `ssh_config` here is explicitly not a goal.
+
+### 6.2 Host keys
+
+There is no mode that accepts an unverified key, and a configuration with no
+host-key policy is an error rather than a permissive default. A carrier hands
+the whole tunnel to whatever answers the address, so the first connection is
+exactly the one that must already know what it is talking to. There is no
+trust-on-first-use anywhere in the package.
+
+Keys live in `known_hosts`, in the format `ssh(1)` uses — **not** in the
+broker's database, although the broker has one and persists plenty there. The
+list is not state the broker owns; it is the administrator's decision about
+what a host is, and three things follow:
+
+- It has to be legible to the `ssh` that same administrator runs by hand when a
+  connection fails. A trust anchor in a SQLite blob can disagree with their
+  terminal and nothing explains why.
+- The session database is explicitly disposable — losing it costs sessions and
+  that is fine. A trust anchor whose loss is routine would quietly regenerate,
+  which is trust-on-first-use through the back door.
+- It is encrypted under the pool signing key, so putting host keys there makes
+  a pool-key problem into an SSH-trust problem for no reason.
+
+Where a database *would* win is a fleet: 500 brokers, one key rotation. That
+is config management's job, so `CCB_CARRIER_SSH_HOST_KEY` takes the same
+`known_hosts` lines inline — one config change, pushed, and no file to mount
+into a container. Still the operator declaring what the host is.
+
+A refusal says what to do about it: the fingerprint that was offered, the file
+to add the line to (or the setting, when no file is configured), the line
+itself, and the `ssh-keyscan` command that produces the same line, with a note
+that it reads the key from the host and so shows what is answering rather than
+confirming which host that is. A changed key says that a rotation and an
+interposed host look alike from here, and leaves the call to the person who can
+find out.
+
+### 6.3 Zero-touch staging
+
+`DialStaged` connects, asks the host what it is (`uname -s -m`), puts the
+binary there if that exact build is not already present, and runs the staged
+copy.
+
+The remote name contains the content hash, which is what makes this cheap
+enough to do on every connect: a host that already has this build is left
+alone, so a broker re-establishing its carrier on every blip does not move
+22 MB each time, and two brokers staging different builds cannot overwrite each
+other. The upload goes to a temporary name and is renamed into place, so a
+half-written binary is never at the path anyone executes, and the size is
+checked afterwards rather than trusted — a truncated upload is caught here
+instead of surfacing later as an unintelligible exec failure. A binary built
+for the wrong platform is refused before the transfer, not after.
+
+The command is derived from where the binary landed, so an operator configures
+a host and a binary rather than a path they would otherwise have to keep in
+step with the install. `CCB_CARRIER_SSH_COMMAND` overrides it for a site that
+installs the binary its own way.
+
+### 6.4 A login only a person can finish
+
+When the far server asks for a password or a keyboard-interactive answer, the
+carrier asks a `Prompter`. The broker implements that over its own CEDAR
+command surface (§6.5).
+
+Two rules shape the behaviour, and the second is the useful one:
+
+- **Nobody attached means fail now, not wait.** Waiting holds a doomed
+  handshake open for a timeout.
+- **Having failed that way, do not retry.** The server will ask the same
+  question and there will still be nobody to answer. Retrying is not merely
+  wasted: at a site whose bastion counts failed logins, a broker reconnecting
+  on a timer is a broker that gets the account locked. Measured on a listener
+  with a one-millisecond backoff and no gate: 248 attempts in 300 ms.
+
+So the carrier **parks** (`carrier.HumanGate`), and an operator's arrival is
+what releases it — not a clock. Everything else is still retried on the
+ordinary backoff, because parking a transient blip behind a human turns a
+network fault into an outage.
+
+The key methods are offered first, so a host that takes a key never wakes
+anyone, and a server that sends an empty challenge — some do, when they cannot
+tell in advance whether one is needed — summons nobody.
+
+### 6.5 The operator console
+
+```sh
+htc-ccb -finish-login <broker-address>
+```
+
+Attaching releases the gate, so the parked carrier retries at once and its
+question arrives on that same connection. Turning up to answer and telling the
+carrier to try again are one act, which is why there is nothing to poll.
+
+```
+Attached to ccb.example.org:9618; waiting for a login to finish.
+
+The broker is logging in to login.cluster.edu:22 as ccb.
+Two-factor required
+Verification code: ******
+The broker accepted the answer.
+```
+
+Attaching to a healthy broker is not an error: it reports that nothing was
+waiting, exits zero, and has still nudged anything that was parked. `Echo` is
+honoured, so a password or a code is not printed into a terminal, a scrollback
+buffer, or a ticket. An operator who gives up tells the broker rather than
+dropping the connection, because a dropped connection reads as a network fault
+and leaves the carrier waiting out its own timeout.
+
+The command is **ADMINISTRATOR**-level: whoever holds it can answer a password
+prompt from a host the broker logs into, which is as privileged as the
+carrier's own credentials. It is registered only when a carrier could ever ask,
+so an ordinary broker does not carry the surface at all.
+
+`CommandFinishLogin` is 70000, HTCondor's retired password-daemon block
+(`//#define PW_BASE 70000 /* Not used */`, commented out in
+`condor_commands.h`). Reusing a reserved-but-idle range keeps it clear of every
+live command while staying inside the historical numbering — the same move
+htcondordb made with the retired transfer-daemon block at 74000, and a
+different block, so the two do not collide with each other.
+
+### 6.6 Configuration
+
+| Knob | Meaning |
+|---|---|
+| `CCB_OUTBOUND_NEXT_HOP` / `CCB_CARRIER_LISTEN` | `ssh://[user@]host[:port]` selects this carrier. Which knob decides the role, as for every other carrier (§5.5). |
+| `CCB_CARRIER_SSH_USER` | Login name, when the address does not carry one. |
+| `CCB_CARRIER_SSH_KNOWN_HOSTS` | Comma-separated `known_hosts` files. Required, unless the keys are given inline. |
+| `CCB_CARRIER_SSH_HOST_KEY` | `known_hosts` lines inline, comma-separated, for a broker with no durable filesystem. A line contains spaces, which is why the separator is a comma. |
+| `CCB_CARRIER_SSH_IDENTITY` | Private keys to offer, in order. |
+| `CCB_CARRIER_SSH_AGENT` | Consult `SSH_AUTH_SOCK`. |
+| `CCB_CARRIER_SSH_STAGE_BINARY` | A local `htc-ccb` to put on the far host — the zero-touch install. |
+| `CCB_CARRIER_SSH_REMOTE_DIR` | Where a staged binary goes (default under the login account). |
+| `CCB_CARRIER_SSH_COMMAND` | Override what runs on the far host. |
+| `CCB_OPERATOR_WAIT` | Seconds an attached administrator waits for a question to arrive (default 120). |
+
+Either `CCB_CARRIER_SSH_STAGE_BINARY` or `CCB_CARRIER_SSH_COMMAND` must be set:
+without one there is nothing to run.
+
+---
+
+## 7. Package layout (`transport/fstun`)
 
 - `frame.go` — types, header/CRC encode+decode, partial-frame detection.
 - `seglog.go` — segment writer (append/rotate/reap) and reader (sequential across
@@ -739,9 +910,9 @@ The yamux layer and the cedar dialer hook live outside this package (a thin
 `carrier` adapter in htc-ccb) so `fstun` stays a self-contained,
 independently-testable FS transport.
 
-## 7. Testing plan
+## 8. Testing plan
 
-1. **fstun unit** — §6 loopback tests, incl. an injected torn tail and a simulated
+1. **fstun unit** — §7 loopback tests, incl. an injected torn tail and a simulated
    slow reader proving the writer stalls at ≈`Window`.
 2. **yamux-over-fstun** — many concurrent streams over one pipe; bulk + ping/pong.
 3. **CCB e2e** — the existing tunneling tests (inbound chain/tree, outbound,
