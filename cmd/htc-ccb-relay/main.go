@@ -38,6 +38,8 @@ import (
 	"github.com/bbockelm/golang-htcondor/daemon"
 	"github.com/bbockelm/golang-htcondor/logging"
 
+	"golang.org/x/term"
+
 	ccbserver "github.com/bbockelm/golang-ccb"
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 )
@@ -72,6 +74,16 @@ func run() error {
 			listenExplicit = true
 		}
 	})
+
+	// This binary's carrier is always its stdin, so a terminal there means it
+	// was run by hand rather than started through an ssh session. Say so,
+	// because the alternative is a process that sits forever trying to read a
+	// framed protocol from a keyboard.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return fmt.Errorf("stdin is a terminal, so there is no carrier to the outside CCB. " +
+			"This binary is started by an ssh:// carrier at the far end of the session it opens " +
+			"(see docs/TRANSPORTS.md section 6); to run a broker by hand, use htc-ccb")
+	}
 
 	// Claim stdin and stdout before anything else can write to them. The pipe
 	// carries a framed protocol, so one stray line on stdout -- a config
