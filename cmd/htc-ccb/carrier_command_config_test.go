@@ -150,3 +150,15 @@ func TestNoSSHSettingsIsEmpty(t *testing.T) {
 		t.Errorf("unset config produced %+v", got)
 	}
 }
+
+// A chain of jump hosts, nearest first, as ssh -J takes them.
+func TestProxyJumpChainFromConfig(t *testing.T) {
+	cfg := proxyConfig(t, "CCB_CARRIER_SSH_PROXY_JUMP = ops@edge.site.edu, bastion.cluster.edu:2222")
+	got := sshCarrierSettings(cfg)
+	if len(got.ProxyJump) != 2 {
+		t.Fatalf("ProxyJump = %q, want two hops", got.ProxyJump)
+	}
+	if got.ProxyJump[0] != "ops@edge.site.edu" || got.ProxyJump[1] != "bastion.cluster.edu:2222" {
+		t.Errorf("ProxyJump = %q; order is nearest-first and must be preserved", got.ProxyJump)
+	}
+}

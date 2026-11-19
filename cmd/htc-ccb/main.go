@@ -943,6 +943,7 @@ func sshCarrierSettings(cfg *config.Config) ccbserver.SSHCarrierConfig {
 		HostKeys:      configList(cfg, "CCB_CARRIER_SSH_HOST_KEY"),
 		IdentityFiles: configList(cfg, "CCB_CARRIER_SSH_IDENTITY"),
 		Agent:         configBool(cfg, "CCB_CARRIER_SSH_AGENT", false),
+		ProxyJump:     configList(cfg, "CCB_CARRIER_SSH_PROXY_JUMP"),
 		StageBinary:   configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
 		RemoteDir:     configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
 		StageConfig:   configString(cfg, "CCB_CARRIER_SSH_STAGE_CONFIG", ""),

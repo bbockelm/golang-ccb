@@ -277,6 +277,11 @@ type SSHCarrierConfig struct {
 	// Agent consults SSH_AUTH_SOCK.
 	Agent bool
 
+	// ProxyJump is a chain of hosts to reach the destination through, nearest
+	// first, as ssh -J takes them. Every hop is verified against the same
+	// host-key policy as the destination.
+	ProxyJump []string
+
 	// StageBinary is a local htc-ccb to put on the far host if it is not
 	// already there, after which the carrier runs the staged copy. This is the
 	// zero-touch install: with it, a cluster needs nothing in advance.

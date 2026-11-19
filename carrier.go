@@ -278,6 +278,7 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 		HostKeys:      cfg.CarrierSSH.HostKeys,
 		IdentityFiles: cfg.CarrierSSH.IdentityFiles,
 		Agent:         cfg.CarrierSSH.Agent,
+		ProxyJump:     cfg.CarrierSSH.ProxyJump,
 		Command:       cfg.CarrierSSH.Command,
 		Logger:        c.log,
 	}

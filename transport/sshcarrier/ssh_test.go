@@ -394,3 +394,128 @@ func TestKeyscanCommandIsRunnable(t *testing.T) {
 		}
 	}
 }
+
+// Reaching a cluster through a bastion, which is the usual shape for the
+// zero-touch case: the login host is not directly reachable.
+func TestProxyJumpReachesThroughABastion(t *testing.T) {
+	target := newTestSSHServer(t, echo)
+	bastion := newTestSSHServer(t, echo)
+
+	cfg := target.config("htc-ccb -carrier-stdio")
+	cfg.ProxyJump = []string{bastion.addr}
+	// Both hops must verify, so the policy has to know both keys.
+	cfg.HostKeyCallback = fixedHostKeys(target.hostKey, bastion.hostKey)
+	// One method offering both keys: the client tries each signer in turn,
+	// where two separate PublicKeys methods would not both be attempted.
+	cfg.authOverride = []ssh.AuthMethod{ssh.PublicKeys(target.clientKey, bastion.clientKey)}
+
+	c := dialTest(t, cfg)
+	payload := []byte("through the bastion")
+	go func() { _, _ = c.Write(payload) }()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(c, got); err != nil {
+		t.Fatalf("ReadFull: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Two hops, because a chain is where an off-by-one in the walk shows up.
+func TestProxyJumpChain(t *testing.T) {
+	target := newTestSSHServer(t, echo)
+	mid := newTestSSHServer(t, echo)
+	outer := newTestSSHServer(t, echo)
+
+	cfg := target.config("htc-ccb -carrier-stdio")
+	cfg.ProxyJump = []string{outer.addr, mid.addr}
+	cfg.HostKeyCallback = fixedHostKeys(target.hostKey, mid.hostKey, outer.hostKey)
+	cfg.authOverride = []ssh.AuthMethod{ssh.PublicKeys(target.clientKey, mid.clientKey, outer.clientKey)}
+
+	c := dialTest(t, cfg)
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+}
+
+// A chain is only as trustworthy as its weakest link: a jump host nobody has
+// approved sees and can alter everything crossing it, so it must be verified
+// like any other hop.
+func TestProxyJumpVerifiesTheBastionsKeyToo(t *testing.T) {
+	target := newTestSSHServer(t, echo)
+	bastion := newTestSSHServer(t, echo)
+
+	cfg := target.config("htc-ccb -carrier-stdio")
+	cfg.ProxyJump = []string{bastion.addr}
+	// The destination's key is known; the bastion's is not.
+	cfg.HostKeyCallback = fixedHostKeys(target.hostKey)
+	// One method offering both keys: the client tries each signer in turn,
+	// where two separate PublicKeys methods would not both be attempted.
+	cfg.authOverride = []ssh.AuthMethod{ssh.PublicKeys(target.clientKey, bastion.clientKey)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if c, err := Dial(ctx, cfg); err == nil {
+		_ = c.Close()
+		t.Fatal("connected through a bastion whose host key was never verified")
+	} else if !strings.Contains(err.Error(), "jump host") {
+		t.Errorf("error %q does not say which hop failed", err)
+	}
+}
+
+// And the destination is still verified when reached through a trusted
+// bastion -- the jump must not become a way to skip the far end's key.
+func TestProxyJumpStillVerifiesTheDestination(t *testing.T) {
+	target := newTestSSHServer(t, echo)
+	bastion := newTestSSHServer(t, echo)
+
+	cfg := target.config("htc-ccb -carrier-stdio")
+	cfg.ProxyJump = []string{bastion.addr}
+	cfg.HostKeyCallback = fixedHostKeys(bastion.hostKey) // destination unknown
+	// One method offering both keys: the client tries each signer in turn,
+	// where two separate PublicKeys methods would not both be attempted.
+	cfg.authOverride = []ssh.AuthMethod{ssh.PublicKeys(target.clientKey, bastion.clientKey)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if c, err := Dial(ctx, cfg); err == nil {
+		_ = c.Close()
+		t.Fatal("reached an unverified destination through a verified bastion")
+	}
+}
+
+func TestParseJump(t *testing.T) {
+	for _, tc := range []struct{ spec, wantAddr, wantUser string }{
+		{"bastion.site.edu", "bastion.site.edu:22", "deflt"},
+		{"ops@bastion.site.edu", "bastion.site.edu:22", "ops"},
+		{"ops@bastion.site.edu:2222", "bastion.site.edu:2222", "ops"},
+	} {
+		addr, user, err := parseJump(tc.spec, "deflt")
+		if err != nil {
+			t.Errorf("parseJump(%q): %v", tc.spec, err)
+			continue
+		}
+		if addr != tc.wantAddr || user != tc.wantUser {
+			t.Errorf("parseJump(%q) = %q,%q; want %q,%q", tc.spec, addr, user, tc.wantAddr, tc.wantUser)
+		}
+	}
+	if _, _, err := parseJump("  ", "u"); err == nil {
+		t.Error("an empty jump host was accepted")
+	}
+}
+
+// fixedHostKeys accepts exactly these keys, for whichever host offers them.
+func fixedHostKeys(keys ...ssh.PublicKey) ssh.HostKeyCallback {
+	return func(_ string, _ net.Addr, got ssh.PublicKey) error {
+		for _, k := range keys {
+			if string(k.Marshal()) == string(got.Marshal()) {
+				return nil
+			}
+		}
+		return fmt.Errorf("knownhosts: key is unknown")
+	}
+}
