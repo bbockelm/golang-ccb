@@ -140,30 +140,53 @@ extension that no C++ EP implements today, so that side needs a change either
 way -- and the change to make is "go back to your broker", which needs no
 address and no configuration.
 
-### 3.3 The requester picks the mode, and the broker cannot upgrade it
+### 3.3 The requester picks the mode, so the contact has to tell it
 
 `dialOne` chooses streaming only when the contact is CCB-routed (nested) or the
 caller supplied `ProxyReturnAddr`. A direct client holding a **flat** contact
-takes `dialStandard`, opens its own listener, and waits for a connection the
-walled EP can never make. The broker's decision to proxy arrives too late: the
-client is no longer reading the broker socket as a data path.
+takes `dialStandard`, opens its own listener, and waits for a connection a
+carrier-attached EP can never make. The broker's decision to proxy arrives too
+late: the client is no longer reading the broker socket as a data path, so the
+broker splices into a socket nobody reads. Observed, before this was fixed:
 
-So a flat contact cannot express "this target needs proxying", and this is the
-open question, not a detail. The honest reading is that **nested contacts are
-not an artifact of having two brokers — they are the wire signal that tells a
-client to stream.**
+```
+INFO  proxy splice established ccbid=1 request=1
+WARN  proxy splice failed  bytes_to_target=0 bytes_to_requester=0 duration=10.001s
+```
 
-That suggests the resolution is to keep the nested contact and drop only the
-second broker: present `<outside>#P#T` where `P` identifies the carrier and `T`
-the target, with the outside broker owning and resolving both. A client needs no
-change, because it already recurses on a nested contact; the outside broker
-collapses the hop internally instead of forwarding it to a peer. The helper
-still registers nothing — the broker allocates `P` locally when the pipe comes
-up.
+So the mode is negotiated by the requester before the broker gets a say, and
+the signal has to be in the contact. **Nested contacts are not an artifact of
+having two brokers -- they are that signal.**
 
-This is the part to design next, and it has to be settled before anything else
-is built. `ProxyReturnAddr` is forced in the test purely to isolate the data
-path from this question.
+#### Resolved: nest through the carrier, collapse the hop
+
+A carrier-attached target advertises `<public>#P#T`: `P` the carrier, `T` the
+target. An ordinary client already recurses on that shape, so nothing about it
+needs to change or to know a helper exists.
+
+The difference from a nested contact today is that **both ids belong to this
+broker**. There is no peer behind `P` to forward to, so `handleRequest`
+collapses the hop instead: a request naming a carrier, with the real target at
+the head of the route, becomes an ordinary single-hop proxy request for `T`.
+`P` exists only to make the contact nest.
+
+Implemented in `carrier_target.go`:
+
+- `ServeCarrier(ctx, ln)` serves one carrier's listener -- in production the
+  yamux listener over a pipe -- allocating a carrier id and tagging every
+  connection accepted from it.
+- A target registering over a tagged connection records its carrier, advertises
+  the nested contact, and is always proxied (standard mode would send it to the
+  requester, which is further away than the broker it reached us through).
+- `resolveCarrierHop` requires the route's head to be a target **of the carrier
+  named**. Without that check any carrier id would serve as a prefix for
+  reaching any target on the broker; `TestCarrierHopWillNotReachAnotherCarriersTarget`
+  holds the line, and fails when the check is removed.
+
+`TestCarrierContactMakesAnOrdinaryClientStream` drives it end to end with a
+client that sets no `ProxyReturnAddr` and is told nothing. Both tests were
+mutation-checked: flattening the contact fails the first by name, dropping the
+ownership check fails the second.
 
 ## 4. Determining the internal address (SUPERSEDED by §3.2; kept for the record)
 
@@ -201,7 +224,14 @@ configuration and falls through to loopback.
 ## 6. Status
 
 Proven: the data path (§2); that no reverse-connect address is needed by anyone,
-including a plain TCP EP (§3.2).
-Unresolved: how a client learns to stream (§3.3). That is the only open design
-question left.
-Not started: everything else.
+including a plain TCP EP (§3.2); that an ordinary client reaches a
+carrier-attached target with no knowledge of any of this (§3.3).
+
+Open design questions: none. What remains is engineering:
+
+- land the cedar half of §3.2 (six lines) so the EP needs no carrier hook;
+- drive `ServeCarrier` from a real carrier's yamux listener rather than a TCP
+  one, and tie carrier lifetime to the pipe;
+- build the helper itself -- a listener, a yamux client, and `io.Copy`;
+- decide where the outbound allowlist and registration policy live now that
+  they are enforced only at the outside broker (§5).

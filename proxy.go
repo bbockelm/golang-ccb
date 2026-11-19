@@ -74,17 +74,10 @@ func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replySt
 		s.mu.Unlock()
 	}()
 
-	// Ask the target to reverse-connect to the rendezvous address IT can reach:
-	// normally this broker's own, but a target behind a splice helper can dial
-	// only the helper, so it gets the helper's address instead. The requester's
-	// half of the rendezvous (below) is unaffected -- it reached us directly.
-	rendezvous := s.proxyAddrSinful()
-	if t.reverseAddr != "" {
-		rendezvous = "<" + strings.Trim(t.reverseAddr, "<>") + ">"
-	}
+	// Ask the target to reverse-connect to the broker's rendezvous address.
 	fwd := ccb.NewAd(map[string]any{
 		ccb.AttrCommand:   ccb.CommandRequest,
-		ccb.AttrMyAddress: rendezvous,
+		ccb.AttrMyAddress: s.proxyAddrSinful(),
 		ccb.AttrClaimID:   connectID,
 		ccb.AttrRequestID: reqID,
 		ccb.AttrName:      name,

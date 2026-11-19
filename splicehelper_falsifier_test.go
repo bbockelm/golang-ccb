@@ -2,12 +2,11 @@ package ccbserver
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -62,36 +61,57 @@ func startSpliceHelper(t *testing.T, outsideAddr string) (addr string, stop func
 	return ln.Addr().String(), func() { close(done); _ = ln.Close(); wg.Wait() }
 }
 
-// startWalledEP registers a DC_NOP EP through brokerAddr and REFUSES every
-// reverse-connect dial to anywhere but allowAddr. That is the restricted node:
-// the only address it can reach is the helper on its own side of the pipe.
-func startWalledEP(t *testing.T, brokerAddr, allowAddr string, served chan<- struct{}, refused chan<- string) (contact string, stop func()) {
+// startCarrierBroker starts a broker with two listeners: the public one that
+// clients reach, and a carrier listener standing in for the far end of one
+// pipe. In production the second is the yamux listener over the carrier; here
+// it is TCP, and only the helper ever dials it.
+func startCarrierBroker(t *testing.T) (publicAddr, carrierAddr string, stop func()) {
 	t.Helper()
-	srv := cedarserver.New(plaintextSec())
-	srv.Handle(commands.DC_NOP, func(_ context.Context, _ *cedarserver.Conn) error {
+	pub, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	car, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		PublicAddress:  pub.Addr().String(),
+		Security:       plaintextSec(),
+		RequestTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = srv.Serve(ctx, pub) }()
+	go func() { _ = srv.ServeCarrier(ctx, car) }()
+	return pub.Addr().String(), car.Addr().String(), cancel
+}
+
+// startHelperEP registers a DC_NOP EP through a splice helper. Its only way out
+// is the helper: the Dial hook stands in for the cedar change that makes a
+// proxy-mode reverse-connect go back to the broker the target registered
+// through (docs/SPLICE_HELPER.md 3.2), which is not landed yet.
+func startHelperEP(t *testing.T, helperAddr string, served chan<- struct{}) (contact string, stop func()) {
+	t.Helper()
+	cs := cedarserver.New(plaintextSec())
+	cs.Handle(commands.DC_NOP, func(_ context.Context, _ *cedarserver.Conn) error {
 		select {
 		case served <- struct{}{}:
 		default:
 		}
 		return cedarserver.KeepOpen()
 	})
-	_, allowPort, _ := net.SplitHostPort(allowAddr)
 	lis := ccb.NewListener(ccb.ListenerConfig{
-		BrokerAddr:        brokerAddr,
+		BrokerAddr:        helperAddr,
 		Security:          plaintextSec(),
-		Name:              "walled-ep",
+		Name:              "helper-ep",
 		HeartbeatInterval: 30 * time.Second,
-		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = srv.ServeConn(context.Background(), conn) },
-		DialControl: func(_, address string, _ syscall.RawConn) error {
-			_, port, _ := net.SplitHostPort(address)
-			if port != allowPort {
-				select {
-				case refused <- address:
-				default:
-				}
-				return errors.New("no outbound TCP from this node: refusing " + address)
-			}
-			return nil
+		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = cs.ServeConn(context.Background(), conn) },
+		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", helperAddr)
 		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,204 +128,100 @@ func startWalledEP(t *testing.T, brokerAddr, allowAddr string, served chan<- str
 	return "", cancel
 }
 
-// TestSpliceHelperInboundRendezvous is the falsifier for the splice-helper
-// model: can an EP be reached inbound when the far end of the carrier is a dumb
-// byte relay rather than a CCB broker?
+// TestCarrierContactMakesAnOrdinaryClientStream is Option 1 (docs/SPLICE_HELPER.md
+// 3.3). A target behind a splice helper can only be reached by proxy, but the
+// REQUESTER picks the mode and does so before the broker sees the request --
+// from the shape of the contact. So the contact nests one level through the
+// carrier's id, and an ordinary client takes the streaming path on its own.
 //
-// Registration is expected to work -- the helper is transparent, and the EP
-// cannot tell a spliced broker from a local one. The open question is the
-// return address: the broker tells the target to reverse-connect to MyAddress,
-// and in streaming mode that is the broker's OWN address, which a restricted
-// node cannot dial. This test walls the EP off from everything but the helper,
-// so that failure is forced rather than hidden by a loopback-reachable broker.
-func TestSpliceHelperInboundRendezvous(t *testing.T) {
-	// The two addresses are mutually dependent -- the helper dials the broker,
-	// and the broker must name the helper -- so the listener is opened first and
-	// the server built around it once the helper's address is known. A real
-	// deployment resolves this the other way: the helper announces its address
-	// up the pipe once connected.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	outsideAddr := ln.Addr().String()
-	helperAddr, stopHelper := startSpliceHelper(t, outsideAddr)
+// The client here sets no ProxyReturnAddr and is told nothing. That is the
+// whole assertion: nothing about it knows a helper exists.
+func TestCarrierContactMakesAnOrdinaryClientStream(t *testing.T) {
+	publicAddr, carrierAddr, stopBroker := startCarrierBroker(t)
+	defer stopBroker()
+
+	helperAddr, stopHelper := startSpliceHelper(t, carrierAddr)
 	defer stopHelper()
 
-	srv, err := New(Config{
-		PublicAddress:         outsideAddr,
-		ReverseConnectAddress: helperAddr,
-		Security:              plaintextSec(),
-		RequestTimeout:        5 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srvCtx, stopOut := context.WithCancel(context.Background())
-	defer stopOut()
-	go func() { _ = srv.Serve(srvCtx, ln) }()
-
 	served := make(chan struct{}, 1)
-	refused := make(chan string, 4)
-	epContact, stopEP := startWalledEP(t, helperAddr, helperAddr, served, refused)
+	epContact, stopEP := startHelperEP(t, helperAddr, served)
 	defer stopEP()
 
-	t.Logf("ep_contact=%s  (outside=%s helper=%s)", epContact, outsideAddr, helperAddr)
-	if strings.Count(epContact, "#") != 1 {
-		t.Errorf("contact %q should be FLAT (<outside>#<id>) in the splice model", epContact)
+	t.Logf("ep_contact=%s  (public=%s carrier=%s helper=%s)", epContact, publicAddr, carrierAddr, helperAddr)
+	if got := strings.Count(epContact, "#"); got != 2 {
+		t.Fatalf("contact %q has %d '#'; a carrier-attached target must nest once "+
+			"(<public>#P#T) or an ordinary client will take dialStandard", epContact, got)
+	}
+	if !strings.HasPrefix(epContact, publicAddr) {
+		t.Errorf("contact %q should be rooted at the PUBLIC address %q, which is what a client can reach",
+			epContact, publicAddr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	conn, err := ccb.Dial(ctx, contactsFor(t, epContact), ccb.DialOptions{
 		Security:   plaintextSec(),
-		TargetDesc: "walled-ep",
+		TargetDesc: "helper-ep",
 		Timeout:    10 * time.Second,
-		// Force the streaming path. A flat contact gives a direct client no
-		// reason to choose it (dialOne takes dialStandard), and the broker
-		// cannot upgrade the mode on its own -- dialStandard is already waiting
-		// on its own listener. Isolating that here so this test answers only
-		// "does the spliced data path work"; the signalling is design work.
-		ProxyReturnAddr: "<0.0.0.0:0>",
+		// Deliberately absent: ProxyReturnAddr. The contact alone must be
+		// enough to put an unmodified client on the streaming path.
 	})
 	if err != nil {
-		select {
-		case addr := <-refused:
-			t.Fatalf("CONFIRMED: the EP was told to reverse-connect to %s, which it cannot reach.\n"+
-				"The broker mints its own address as MyAddress; on a restricted node only the\n"+
-				"helper's address is dialable. Dial error: %v", addr, err)
-		default:
-			t.Fatalf("Dial %q failed, but the EP never refused a reverse-connect dial: %v", epContact, err)
-		}
+		t.Fatalf("an ordinary client could not reach a carrier-attached target: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
 	if err := endToEndDCNop(ctx, conn, epContact); err != nil {
-		t.Fatalf("end-to-end DC_NOP through the splice helper: %v", err)
+		t.Fatalf("end-to-end DC_NOP through the carrier: %v", err)
 	}
 	select {
 	case <-served:
 	case <-time.After(5 * time.Second):
-		t.Fatal("EP DC_NOP did not dispatch through the splice")
+		t.Fatal("EP DC_NOP did not dispatch through the collapsed carrier hop")
 	}
 }
 
-// TestSpliceHelperExternalReturnAddress asks Brian's question: does the broker
-// need to mint an address the EP can reach, or is its own external address
-// enough?
-//
-// The claim is that the return address is not routing information at all. The
-// broker already knows, from the CCBID, which carrier a target is behind; and
-// the EP already knows the one address it can reach, because it registered
-// through it. "Reverse-connect to MyAddress" only has to mean "come back to
-// your broker" -- the address is a name for the peer, not a destination to
-// resolve.
-//
-// So: the broker mints its OWN external address, which the walled EP cannot
-// route to, and the EP dials through a carrier that ignores the address and
-// reconnects to its broker. No ReverseConnectAddress, nothing announced up the
-// pipe, no per-carrier state.
-func TestSpliceHelperExternalReturnAddress(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	outsideAddr := ln.Addr().String()
-	helperAddr, stopHelper := startSpliceHelper(t, outsideAddr)
+// TestCarrierHopWillNotReachAnotherCarriersTarget guards the collapse: the
+// route's head must be a target of the carrier named, or any carrier id would
+// serve as a prefix for reaching any target on the broker.
+func TestCarrierHopWillNotReachAnotherCarriersTarget(t *testing.T) {
+	publicAddr, carrierAddr, stopBroker := startCarrierBroker(t)
+	defer stopBroker()
+	helperAddr, stopHelper := startSpliceHelper(t, carrierAddr)
 	defer stopHelper()
 
-	// Note what is NOT set: no ReverseConnectAddress. The broker mints
-	// proxyAddrSinful(), its own external address.
-	srv, err := New(Config{
-		PublicAddress:  outsideAddr,
-		Security:       plaintextSec(),
-		RequestTimeout: 5 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srvCtx, stopOut := context.WithCancel(context.Background())
-	defer stopOut()
-	go func() { _ = srv.Serve(srvCtx, ln) }()
-
 	served := make(chan struct{}, 1)
-	var dialed []string
-	var dialMu sync.Mutex
-
-	cedarSrv := cedarserver.New(plaintextSec())
-	cedarSrv.Handle(commands.DC_NOP, func(_ context.Context, _ *cedarserver.Conn) error {
-		select {
-		case served <- struct{}{}:
-		default:
-		}
-		return cedarserver.KeepOpen()
-	})
-	lis := ccb.NewListener(ccb.ListenerConfig{
-		BrokerAddr:        helperAddr,
-		Security:          plaintextSec(),
-		Name:              "carrier-ep",
-		HeartbeatInterval: 30 * time.Second,
-		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = cedarSrv.ServeConn(context.Background(), conn) },
-		// The whole hypothesis, in one function: whatever address the broker
-		// names, go back to the broker. A real EP on a restricted node has
-		// exactly one way out, and this is it.
-		Dial: func(ctx context.Context, brokerAddr string) (net.Conn, error) {
-			dialMu.Lock()
-			dialed = append(dialed, brokerAddr)
-			dialMu.Unlock()
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", helperAddr)
-		},
-	})
-	epCtx, stopEP := context.WithCancel(context.Background())
+	epContact, stopEP := startHelperEP(t, helperAddr, served)
 	defer stopEP()
-	go func() { _ = lis.Run(epCtx) }()
 
-	var epContact string
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if epContact = lis.Contact(); epContact != "" {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	// epContact is "<public>#P#T". Forge "<public>#Q#T" for some carrier id Q
+	// that is not P -- here P+1000, which no carrier ever took.
+	_, ids, ok := strings.Cut(strings.TrimPrefix(epContact, publicAddr), "#")
+	if !ok {
+		t.Fatalf("unexpected contact shape %q", epContact)
 	}
-	if epContact == "" {
-		t.Fatal("EP did not register through the splice helper")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-	conn, err := ccb.Dial(ctx, contactsFor(t, epContact), ccb.DialOptions{
-		Security:        plaintextSec(),
-		TargetDesc:      "carrier-ep",
-		Timeout:         10 * time.Second,
-		ProxyReturnAddr: "<0.0.0.0:0>", // mode signalling is a separate question (§3.3)
-	})
+	pStr, tStr, _ := strings.Cut(ids, "#")
+	p, err := strconv.ParseUint(pStr, 10, 64)
 	if err != nil {
-		t.Fatalf("Dial %q with an EXTERNAL return address: %v", epContact, err)
+		t.Fatalf("carrier id in %q: %v", epContact, err)
 	}
-	defer func() { _ = conn.Close() }()
+	forged := publicAddr + "#" + strconv.FormatUint(p+1000, 10) + "#" + tStr
+	t.Logf("real=%s forged=%s", epContact, forged)
 
-	if err := endToEndDCNop(ctx, conn, epContact); err != nil {
-		t.Fatalf("end-to-end DC_NOP: %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := ccb.Dial(ctx, contactsFor(t, forged), ccb.DialOptions{
+		Security:   plaintextSec(),
+		TargetDesc: "forged",
+		Timeout:    6 * time.Second,
+	})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("a contact naming a carrier that does not own the target was accepted")
 	}
 	select {
 	case <-served:
-	case <-time.After(5 * time.Second):
-		t.Fatal("EP DC_NOP did not dispatch")
-	}
-
-	dialMu.Lock()
-	defer dialMu.Unlock()
-	t.Logf("addresses the broker named, all ignored by the EP: %v", dialed)
-	var sawExternal bool
-	for _, a := range dialed {
-		if strings.Contains(a, strings.Trim(outsideAddr, "<>")) {
-			sawExternal = true
-		}
-	}
-	if !sawExternal {
-		t.Errorf("the EP was never handed the broker's external address %q (saw %v), "+
-			"so this test did not exercise the claim", outsideAddr, dialed)
+		t.Fatal("the EP served a connection reached through a carrier it is not on")
+	default:
 	}
 }
