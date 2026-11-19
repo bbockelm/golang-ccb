@@ -3,6 +3,7 @@ package cmdcarrier
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -29,11 +30,13 @@ type pipeConn struct {
 	// onClose runs after both descriptors are closed -- reaping a child
 	// process, restoring a descriptor. May be nil.
 	onClose func() error
-	// annotate turns a bare I/O error into one naming the cause. A carrier
-	// backed by a child process dies as an unexplained EOF otherwise, and the
-	// explanation (ssh's "Permission denied (publickey)") is the whole
-	// diagnosis. May be nil.
+	// annotate turns a genuine I/O error into one naming the cause. May be nil.
 	annotate func(error) error
+
+	// settle waits, briefly, for the child's exit status and last stderr to be
+	// recorded. It runs when the stream reaches EOF, so that whoever asks for
+	// Diagnostics next gets a settled answer rather than racing the child.
+	settle func()
 
 	closed    atomic.Bool
 	closeOnce sync.Once
@@ -58,10 +61,30 @@ func (c *pipeConn) Write(p []byte) (int, error) {
 	return n, c.filter(err)
 }
 
-// filter annotates an I/O error with why the peer went away, except when we are
-// the ones who closed it: a Close we asked for is not a diagnosis.
+// filter annotates a genuine I/O error with why the peer went away -- except
+// when we are the ones who closed it, since a Close we asked for is not a
+// diagnosis, and except for io.EOF.
+//
+// io.EOF must be passed through untouched. It is how a reader signals a normal
+// end of stream, and io.Copy and io.ReadAll recognise it by comparing against
+// io.EOF rather than unwrapping, so a wrapped one reads as a failure and the
+// copy reports an error where the stream simply ended. Annotating it here made
+// this type violate the net.Conn contract: harmless where the pipe only ever
+// feeds yamux, and a trap for anything else that reads it.
+//
+// Why the child went away is still available, through Diagnostics -- which is
+// what the staged carrier check reports and where an operator reads it.
 func (c *pipeConn) filter(err error) error {
-	if err == nil || c.closed.Load() || c.annotate == nil {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.EOF) {
+		if c.settle != nil && !c.closed.Load() {
+			c.settle()
+		}
+		return err
+	}
+	if c.closed.Load() || c.annotate == nil {
 		return err
 	}
 	return c.annotate(err)

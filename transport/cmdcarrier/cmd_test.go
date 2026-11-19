@@ -58,22 +58,44 @@ func TestDeadlinesWork(t *testing.T) {
 	}
 }
 
-// The failure that matters: the command starts fine and then dies. Without the
-// exit status and the child's own stderr this reaches the operator as a bare
-// EOF, which says nothing about an ssh that was refused.
-func TestReadErrorNamesExitStatusAndStderr(t *testing.T) {
+// The failure that matters: the command starts fine and then dies. The
+// explanation -- the exit status and what ssh said -- must survive, but it
+// cannot be smuggled out through the read error.
+//
+// io.Copy and io.ReadAll recognise the end of a stream by comparing against
+// io.EOF rather than unwrapping it, so a wrapped EOF reads as a failure and a
+// copy reports an error where the stream merely ended. The diagnosis goes
+// through Diagnostics instead, which is what the staged carrier check reports.
+func TestDeadChildEndsCleanlyAndExplainsItself(t *testing.T) {
 	c := dialArgv(t, "/bin/sh", "-c", "echo 'Permission denied (publickey).' >&2; exit 255")
-	_, err := io.ReadAll(c)
-	if err == nil {
-		t.Fatal("reading from a pipe whose child died returned no error")
+
+	if _, err := io.ReadAll(c); err != nil {
+		t.Fatalf("reading to the end returned %v; a stream that ended must look ended", err)
 	}
-	for _, want := range []string{"exit status 255", "Permission denied (publickey).", "carrier command"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not mention %q", err, want)
-		}
+
+	d, ok := any(c).(Diagnostics)
+	if !ok {
+		t.Fatalf("pipe (%T) does not implement Diagnostics", c)
 	}
-	if !errors.Is(err, io.EOF) {
-		t.Errorf("annotating the error lost the underlying io.EOF: %v", err)
+	if got := d.Stderr(); !strings.Contains(got, "Permission denied (publickey).") {
+		t.Errorf("Stderr() = %q; the diagnosis did not survive the clean EOF", got)
+	}
+	exitErr, exited := d.Exited()
+	if !exited {
+		t.Fatal("the child was not reported as exited; EOF arrived before its status was recorded")
+	}
+	if exitErr == nil || !strings.Contains(exitErr.Error(), "exit status 255") {
+		t.Errorf("Exited() = %v, want exit status 255", exitErr)
+	}
+}
+
+// The contract, stated plainly: a carrier whose child exited cleanly is
+// indistinguishable from any other stream that ended.
+func TestCleanEOFIsIoEOF(t *testing.T) {
+	c := dialArgv(t, "true")
+	n, err := io.Copy(io.Discard, c)
+	if err != nil {
+		t.Fatalf("io.Copy over a cleanly-closed carrier returned %v (after %d bytes); it must be a clean end", err, n)
 	}
 }
 
@@ -89,19 +111,6 @@ func TestExitedAndStderrAreReadable(t *testing.T) {
 	}
 	if got := c.Stderr(); got != "first; second" {
 		t.Errorf("Stderr() = %q, want %q", got, "first; second")
-	}
-}
-
-// A clean exit is reported as such rather than as a failure, so an operator is
-// not sent hunting for an error that does not exist.
-func TestCleanExitIsNotReportedAsFailure(t *testing.T) {
-	c := dialArgv(t, "true")
-	_, err := io.ReadAll(c)
-	if err == nil {
-		t.Fatal("want an error explaining the carrier closed")
-	}
-	if !strings.Contains(err.Error(), "exited cleanly") {
-		t.Errorf("error %q does not say the child exited cleanly", err)
 	}
 }
 
@@ -179,17 +188,25 @@ func TestDialContextDoesNotOwnThePipe(t *testing.T) {
 	}
 }
 
-// The annotated error keeps both of its causes reachable: the I/O error that
-// ended the read, and the child's exit status. Scraping either out of the
-// message text would be the alternative.
-func TestAnnotatedErrorUnwrapsToBothCauses(t *testing.T) {
+// A genuine I/O error -- not an end of stream -- still carries both of its
+// causes: the underlying error and the child's exit status. Writing to a child
+// that has exited is EPIPE, which is a failure rather than a clean end.
+func TestRealIOErrorUnwrapsToBothCauses(t *testing.T) {
 	c := dialArgv(t, "/bin/sh", "-c", "echo nope >&2; exit 42")
-	_, err := io.ReadAll(c)
-	if err == nil {
-		t.Fatal("reading from a pipe whose child died returned no error")
+
+	// Let the child exit and the pipe tear down.
+	_, _ = io.ReadAll(c)
+
+	var err error
+	for i := 0; i < 100 && err == nil; i++ {
+		_, err = c.Write([]byte("x"))
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !errors.Is(err, io.EOF) {
-		t.Errorf("errors.Is(err, io.EOF) = false; the underlying read error was lost: %v", err)
+	if err == nil {
+		t.Skip("writing to the dead child never failed on this platform")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("a write failure was reported as an end of stream: %v", err)
 	}
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
