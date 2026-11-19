@@ -248,12 +248,12 @@ func startStaged(ctx context.Context, client *ssh.Client, cfg Config, stage Stag
 	if stage.Logger == nil {
 		stage.Logger = cfg.Logger
 	}
-	remote, err := Stage(ctx, client, stage)
+	staged, err := Stage(ctx, client, stage)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Command == "" {
-		cfg.Command = shellQuote(remote) + " " + StdioFlag
+		cfg.Command = remoteCommand(staged)
 	}
 	return Start(client, cfg)
 }
@@ -261,6 +261,28 @@ func startStaged(ctx context.Context, client *ssh.Client, cfg Config, stage Stag
 // StdioFlag is what the staged broker is told to be: the far end of this
 // carrier, taking the pipe it was started with.
 const StdioFlag = "-carrier-stdio"
+
+// remoteCommand builds what runs on the far host.
+//
+// With a staged configuration the broker is started in a controlled
+// environment -- `env -i` with only CONDOR_CONFIG, HOME and PATH -- so nothing
+// the login host puts in a shell profile reaches it. That matters beyond
+// tidiness: HTCondor reads _CONDOR_<PARAM> from the environment and lets it
+// override the configuration file, so a stray _CONDOR_SEC_DEFAULT_AUTHENTICATION
+// on the remote host would quietly reconfigure the broker's security. HOME and
+// PATH are carried across from the login shell, because dropping those breaks
+// more than it protects.
+//
+// Without a staged configuration the broker is run plainly: the operator is
+// relying on the far host's own configuration deliberately, and clearing the
+// environment would take CONDOR_CONFIG with it.
+func remoteCommand(s StagedPaths) string {
+	if s.Config == "" {
+		return shellQuote(s.Binary) + " " + StdioFlag
+	}
+	return "env -i CONDOR_CONFIG=" + shellQuote(s.Config) +
+		` HOME="$HOME" PATH="$PATH" ` + shellQuote(s.Binary) + " " + StdioFlag
+}
 
 // Connect performs the TCP connect, the host-key check and authentication,
 // and returns the live client.

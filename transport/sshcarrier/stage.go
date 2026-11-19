@@ -85,7 +85,25 @@ type StageConfig struct {
 	LocalPlatform Platform
 	// RemoteDir is where the binary goes; empty uses DefaultRemoteDir.
 	RemoteDir string
-	Logger    *slog.Logger
+
+	// CondorConfig is a local configuration file to stage beside the binary
+	// and point the remote broker at.
+	//
+	// Without it the staged broker reads whatever configuration the far host
+	// happens to have, which on a login node is either nothing or -- worse --
+	// another pool's: its security settings, its trust domain, its token
+	// directory. Staging one makes the remote broker depend on nothing it
+	// found there.
+	CondorConfig string
+
+	Logger *slog.Logger
+}
+
+// StagedPaths is what a stage left on the far host.
+type StagedPaths struct {
+	Binary string
+	// Config is empty when none was staged.
+	Config string
 }
 
 // Stage puts the binary on the far host if it is not already there, and returns
@@ -96,18 +114,18 @@ type StageConfig struct {
 // a hundred times, and two brokers staging at once cannot write each other's
 // file. The upload is to a temporary name and then renamed, so a half-written
 // binary is never at the path anyone executes.
-func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (string, error) {
+func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPaths, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	if cfg.LocalPlatform != (Platform{}) && cfg.Platform != (Platform{}) && cfg.LocalPlatform != cfg.Platform {
-		return "", fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
+		return StagedPaths{}, fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
 	}
 
 	body, err := os.ReadFile(cfg.Binary)
 	if err != nil {
-		return "", fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
+		return StagedPaths{}, fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
 	}
 	sum := sha256.Sum256(body)
 	digest := hex.EncodeToString(sum[:])
@@ -119,29 +137,51 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (string, er
 	name := "htc-ccb-" + digest[:16]
 	remote := path.Join(dir, name)
 
+	if err := putFile(ctx, client, remote, body, log, "broker binary", cfg.Platform.String()); err != nil {
+		return StagedPaths{}, err
+	}
+	out := StagedPaths{Binary: remote}
+
+	if cfg.CondorConfig != "" {
+		confBody, err := os.ReadFile(cfg.CondorConfig)
+		if err != nil {
+			return StagedPaths{}, fmt.Errorf("sshcarrier: reading %s: %w", cfg.CondorConfig, err)
+		}
+		confSum := sha256.Sum256(confBody)
+		conf := path.Join(dir, "htc-ccb-"+hex.EncodeToString(confSum[:])[:16]+".conf")
+		if err := putFile(ctx, client, conf, confBody, log, "configuration", ""); err != nil {
+			return StagedPaths{}, err
+		}
+		out.Config = conf
+	}
+	return out, nil
+}
+
+// putFile stages one content-addressed file, skipping it when that exact
+// content is already there.
+func putFile(ctx context.Context, client *ssh.Client, remote string, body []byte, log *slog.Logger, what, platform string) error {
 	present, err := alreadyStaged(ctx, client, remote, len(body))
 	if err != nil {
-		return "", err
+		return err
 	}
 	if present {
-		log.Debug("ssh carrier binary already staged", "path", remote, "bytes", len(body))
-		return remote, nil
+		log.Debug("ssh carrier file already staged", "what", what, "path", remote, "bytes", len(body))
+		return nil
 	}
-
-	log.Info("staging the broker binary on the remote host", "path", remote, "bytes", len(body), "platform", cfg.Platform.String())
+	log.Info("staging on the remote host", "what", what, "path", remote, "bytes", len(body), "platform", platform)
 	if err := upload(ctx, client, remote, body); err != nil {
-		return "", err
+		return err
 	}
 	// Confirm what landed, rather than trusting the upload: a truncated binary
 	// would otherwise be discovered as a mystifying exec failure.
 	ok, err := alreadyStaged(ctx, client, remote, len(body))
 	if err != nil {
-		return "", err
+		return err
 	}
 	if !ok {
-		return "", fmt.Errorf("sshcarrier: staged %s but it is not there with the expected size", remote)
+		return fmt.Errorf("sshcarrier: staged %s but it is not there with the expected size", remote)
 	}
-	return remote, nil
+	return nil
 }
 
 // alreadyStaged reports whether the exact binary is in place. The name carries

@@ -276,6 +276,14 @@ type SSHCarrierConfig struct {
 	// under the login account.
 	RemoteDir string
 
+	// StageConfig is a local HTCondor configuration file to stage beside the
+	// binary and point the remote broker at, with a cleared environment.
+	//
+	// Without it the staged broker reads whatever configuration the far host
+	// has -- nothing on a bare login node, or another pool's where one is
+	// installed, bringing that pool's security settings with it.
+	StageConfig string
+
 	// Command overrides what runs on the far host. With StageBinary set it is
 	// derived from where the binary landed, which is what an operator usually
 	// wants; this is for a site that installs the binary its own way.

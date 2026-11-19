@@ -166,8 +166,8 @@ func TestStageUploadsToAContentAddressedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stage: %v", err)
 	}
-	if !strings.HasPrefix(remote, "/home/ccb/.cache/htc-ccb/htc-ccb-") {
-		t.Errorf("staged to %q, which is not under the configured directory", remote)
+	if !strings.HasPrefix(remote.Binary, "/home/ccb/.cache/htc-ccb/htc-ccb-") {
+		t.Errorf("staged to %q, which is not under the configured directory", remote.Binary)
 	}
 	uploads, _ := h.count()
 	if uploads != 1 {
@@ -175,8 +175,8 @@ func TestStageUploadsToAContentAddressedPath(t *testing.T) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if string(h.files[remote]) != "fake htc-ccb binary body" {
-		t.Errorf("remote file is %q", h.files[remote])
+	if string(h.files[remote.Binary]) != "fake htc-ccb binary body" {
+		t.Errorf("remote file is %q", h.files[remote.Binary])
 	}
 }
 
@@ -221,8 +221,8 @@ func TestStageSeparatesDifferentBuilds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a == b {
-		t.Fatalf("two different builds staged to the same path %q", a)
+	if a.Binary == b.Binary {
+		t.Fatalf("two different builds staged to the same path %q", a.Binary)
 	}
 }
 
@@ -365,4 +365,110 @@ func TestDialStagedHonoursAnExplicitCommand(t *testing.T) {
 	if cmd := ran.Load(); cmd == nil || *cmd != want {
 		t.Errorf("ran %v, want %q", cmd, want)
 	}
+}
+
+// A staged configuration is what makes zero touch independent of the far
+// host: without it the broker reads whatever config that host has, which is
+// either nothing or another pool's.
+func TestStageAlsoStagesTheConfiguration(t *testing.T) {
+	h := newFakeHost("Linux x86_64")
+	var ran atomic.Pointer[string]
+	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		if strings.HasPrefix(cmd, "uname") || strings.Contains(cmd, "wc -c <") || strings.Contains(cmd, "cat >") {
+			return h.handle(cmd, stdin, stdout, stderr)
+		}
+		ran.Store(&cmd)
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+
+	conf := t.TempDir() + "/remote.conf"
+	if err := os.WriteFile(conf, []byte("CCB_OUTBOUND_PROXY = TRUE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := DialStaged(ctx, s.config(""), StageConfig{
+		Binary:       localBinary(t, "fake htc-ccb binary body"),
+		CondorConfig: conf,
+		RemoteDir:    "/scratch/ccb",
+	})
+	if err != nil {
+		t.Fatalf("DialStaged: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cmd := ran.Load()
+	if cmd == nil {
+		t.Fatal("the broker was never run")
+	}
+	// The environment must be controlled: HTCondor reads _CONDOR_<PARAM> from
+	// it and lets those override the file, so a login host's shell profile
+	// could otherwise reconfigure the broker's security.
+	if !strings.HasPrefix(*cmd, "env -i ") {
+		t.Errorf("the broker was not started in a controlled environment: %q", *cmd)
+	}
+	if !strings.Contains(*cmd, "CONDOR_CONFIG='/scratch/ccb/htc-ccb-") || !strings.Contains(*cmd, ".conf'") {
+		t.Errorf("the command does not point the broker at the staged config: %q", *cmd)
+	}
+	// HOME and PATH still come across; dropping them breaks more than it
+	// protects.
+	for _, keep := range []string{`HOME="$HOME"`, `PATH="$PATH"`} {
+		if !strings.Contains(*cmd, keep) {
+			t.Errorf("the command drops %s: %q", keep, *cmd)
+		}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var sawConf bool
+	for p, body := range h.files {
+		if strings.HasSuffix(p, ".conf") && string(body) == "CCB_OUTBOUND_PROXY = TRUE\n" {
+			sawConf = true
+		}
+	}
+	if !sawConf {
+		t.Errorf("the configuration was not staged; files are %v", keysOf(h.files))
+	}
+}
+
+// Without a staged configuration the broker is run plainly: clearing the
+// environment would take CONDOR_CONFIG with it, and the operator is relying on
+// the far host's own configuration on purpose.
+func TestNoStagedConfigLeavesTheEnvironmentAlone(t *testing.T) {
+	h := newFakeHost("Linux x86_64")
+	var ran atomic.Pointer[string]
+	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		if strings.HasPrefix(cmd, "uname") || strings.Contains(cmd, "wc -c <") || strings.Contains(cmd, "cat >") {
+			return h.handle(cmd, stdin, stdout, stderr)
+		}
+		ran.Store(&cmd)
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := DialStaged(ctx, s.config(""), StageConfig{Binary: localBinary(t, "body")})
+	if err != nil {
+		t.Fatalf("DialStaged: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := ran.Load(); cmd == nil || strings.Contains(*cmd, "env -i") {
+		t.Errorf("ran %v; with no staged config the environment should be left alone", cmd)
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
