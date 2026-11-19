@@ -309,8 +309,10 @@ func TestUnknownHostKeyAdviceIsFactual(t *testing.T) {
 	if !strings.Contains(help, "Verify that fingerprint against a source you trust") {
 		t.Errorf("the advice does not ask for the one manual step:\n%s", help)
 	}
-	if !strings.Contains(help, "ssh-keyscan") {
-		t.Errorf("the advice does not mention the tool an operator will reach for:\n%s", help)
+	// It gives the command, not just the tool's name: an operator should not
+	// have to work out the flags.
+	if !strings.Contains(help, "ssh-keyscan -t ssh-ed25519 h") {
+		t.Errorf("the advice does not give a runnable ssh-keyscan command:\n%s", help)
 	}
 	// It should describe what the tool does, not tell them off for using it.
 	for _, scold := range []string{"would trust whatever answered", "refusal is for", "Do not ", "must not"} {
@@ -372,4 +374,23 @@ func extractKnownHostsLine(t *testing.T, msg, addr string) string {
 		}
 	}
 	return ""
+}
+
+// The generated ssh-keyscan command has to be runnable as printed: the right
+// key type, and -p only when the port is not the default.
+func TestKeyscanCommandIsRunnable(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+	for _, tc := range []struct{ addr, want string }{
+		{"login.cluster.edu:22", "ssh-keyscan -t ssh-ed25519 login.cluster.edu"},
+		{"login.cluster.edu:2222", "ssh-keyscan -t ssh-ed25519 -p 2222 login.cluster.edu"},
+	} {
+		e := &HostKeyError{Addr: tc.addr, Err: errors.New("x"), Offered: s.hostKey}
+		if got := e.Help(); !strings.Contains(got, tc.want) {
+			t.Errorf("for %s the advice lacks %q:\n%s", tc.addr, tc.want, got)
+		}
+		// -p 22 is noise; ssh-keyscan defaults to it.
+		if tc.addr == "login.cluster.edu:22" && strings.Contains(e.Help(), "-p 22") {
+			t.Errorf("the command spells out the default port:\n%s", e.Help())
+		}
+	}
 }
