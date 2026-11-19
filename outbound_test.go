@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -82,12 +83,25 @@ func startCedarDialTarget(t *testing.T, listenIP string, served chan<- struct{})
 		case served <- struct{}{}:
 		default:
 		}
-		// KeepOpen, not nil. Returning nil lets ServeConn close the socket in
-		// the same breath as its reply, and on macOS closing a socket with
-		// unread data discards the send buffer -- so the client sees EOF
-		// instead of the response it was given. That is the long-standing
-		// flake in this suite: it needs load to lose the race, so it bites in
-		// a full run and never in isolation.
+		// KeepOpen, not nil -- and this is load-bearing.
+		//
+		// Returning nil makes ServeConn close the connection the instant the
+		// handler returns: in the same breath as the reply it has just
+		// written. On macOS that close discards what is still in the send
+		// buffer, so the reply never reaches the wire. This side's Write
+		// reports 550 bytes and no error; the relay's first read of the same
+		// socket returns a clean (0, io.EOF); and the requester's handshake
+		// fails with "failed to read frame header: EOF".
+		//
+		// Measured at 50-60% of connections with one broker and one target
+		// driven in a loop, and it is what made every TestOutboundProxy*
+		// test intermittent -- on clean main, six full-suite runs in eight.
+		// Delaying this close by 20ms takes the same loop to zero failures,
+		// which is what identifies it.
+		//
+		// A real daemon does not slam the socket shut on a peer still reading
+		// its answer, and neither should this stand-in. The returned cancel
+		// closes the connections instead.
 		return cedarserver.KeepOpen()
 	})
 	ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
@@ -95,16 +109,30 @@ func startCedarDialTarget(t *testing.T, listenIP string, served chan<- struct{})
 		t.Fatal(err)
 	}
 	ctx, c := context.WithCancel(context.Background())
+	// KeepOpen above means nothing closes these, so the fixture must.
+	var mu sync.Mutex
+	var conns []net.Conn
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
 			go func() { _ = srv.ServeConn(ctx, conn) }()
 		}
 	}()
-	return ln.Addr().String(), func() { c(); _ = ln.Close() }
+	return ln.Addr().String(), func() {
+		c()
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}
 }
 
 // outboundDCNop runs the requester side of an outbound tunnel: OutboundConnect to
@@ -218,6 +246,8 @@ func TestOutboundProxyTwoCCB(t *testing.T) {
 	defer cancel()
 
 	if err := outboundDCNop(ctx, insideAddr, "<"+targetAddr+">"); err != nil {
+		insideRec.dump(t, "inside broker")
+		outsideRec.dump(t, "outside broker")
 		t.Fatalf("outbound DC_NOP through two CCBs: %v", err)
 	}
 	select {
@@ -450,7 +480,7 @@ func TestOutboundProxyReachesTargetBehindSharedPort(t *testing.T) {
 	defer stopSrv()
 
 	target := fmt.Sprintf("<%s?sock=%s>", sp.addr(), sock)
-	if err := outboundDCNopRetrying(t, brokerAddr, target); err != nil {
+	if err := outboundDCNopOnce(t, brokerAddr, target); err != nil {
 		t.Fatalf("outbound DC_NOP to a shared-port target: %v", err)
 	}
 	select {
@@ -523,34 +553,26 @@ func TestOutboundTargetAllowedKeepsSharedPortID(t *testing.T) {
 	}
 }
 
-// outboundDCNopRetrying runs an outbound proxy connection, retrying a failed
-// attempt with a fresh deadline.
+// outboundDCNopOnce runs one outbound proxy connection with a fresh deadline.
 //
-// Every test here that needs a non-loopback target -- the outbound proxy
-// refuses loopback, so they all do -- is intermittently unreliable on a host
-// whose non-loopback address belongs to a VPN or overlay interface: a
-// connection to the host's own address stalls or resets for no reason the test
-// can see. Observed on this suite as TestOutboundProxyTwoCCB failing in three
-// of four full-suite runs while everything around it passed.
+// This replaces an outboundDCNopRetrying that tried three times. The retry was
+// added for an intermittent failure attributed to "a host whose non-loopback
+// address belongs to a VPN or overlay interface", where "a connection to the
+// host's own address stalls or resets for no reason the test can see".
 //
-// The retry does not weaken what the test proves. Without the shared-port
-// handoff the remote shared-port server closes every connection that does not
-// begin with SHARED_PORT_CONNECT, so all three attempts fail, every run --
-// which is exactly what the pre-fix check confirms.
-func outboundDCNopRetrying(t *testing.T, brokerAddr, target string) error {
+// That attribution was wrong. The cause was startCedarDialTarget closing the
+// connection in the same breath as its reply, which on macOS discards the
+// reply (see the KeepOpen comment there). Both addresses on the machine where
+// this was diagnosed carry a connection to themselves perfectly well, and the
+// failing runs were using the ordinary LAN address, not the overlay one.
+//
+// With the target fixed, one attempt is enough: the two tests that used the
+// retry pass 12/12 and 10/10 with a single attempt, where the family as a
+// whole failed six full-suite runs in eight on clean main. A retry kept now
+// would only hide the next regression.
+func outboundDCNopOnce(t *testing.T, brokerAddr, target string) error {
 	t.Helper()
-	var err error
-	for attempt := 1; attempt <= 3; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err = outboundDCNop(ctx, brokerAddr, target)
-		cancel()
-		if err == nil {
-			if attempt > 1 {
-				t.Logf("the outbound connection succeeded on attempt %d", attempt)
-			}
-			return nil
-		}
-		t.Logf("attempt %d failed: %v", attempt, err)
-	}
-	return fmt.Errorf("three attempts failed, last: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return outboundDCNop(ctx, brokerAddr, target)
 }
