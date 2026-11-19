@@ -785,17 +785,35 @@ Three things the spawned `ssh` cannot do:
   a binary over.
 - **Finish a login that needs a person.** The client's auth callbacks are
   reachable, so a password or one-time code can be routed to an administrator
-  and answered (§6.4). The spawned `ssh` talks to a terminal the broker does
+  and answered (§6.6). The spawned `ssh` talks to a terminal the broker does
   not have.
 - **Watch startup step by step.** Connect, platform, stage, exec are separate
   and separately reportable, rather than inferred from an exit status and
   whatever `ssh` chose to print.
 
-What it costs is everything `ssh_config` does for free: `ProxyJump`,
-`ProxyCommand`, `ControlMaster`, `Match` blocks, certificates, GSSAPI, and
-every per-host option a site already maintains. **A site that needs those and
-does not need the three above should use `cmd:`** — it is not a lesser option,
-and reimplementing `ssh_config` here is explicitly not a goal.
+What it costs is everything `ssh_config` does for free: `ProxyCommand`,
+`ControlMaster`, `Match` blocks, certificates, GSSAPI, and every per-host
+option a site already maintains. **A site that needs those and does not need
+the three above should use `cmd:`** — it is not a lesser option, and
+reimplementing `ssh_config` here is explicitly not a goal.
+
+`ProxyJump` is the one exception, implemented here rather than deferred to
+`cmd:` (§6.4). A bastion is not an optional convenience for this carrier: the
+clusters worth staging onto are largely the ones you cannot reach directly, so
+a carrier that cannot cross a bastion cannot reach its own best case.
+
+```mermaid
+flowchart LR
+    OUT["htc-ccb<br/>outside broker"]
+    B["bastion<br/>login.example.edu"]
+    T["login node<br/>no htc-ccb installed"]
+    IN["htc-ccb -carrier-stdio<br/>staged, inside broker"]
+
+    OUT -->|"ssh, hop 1"| B
+    B -.->|"direct-tcpip<br/>inside hop 1"| T
+    T --> IN
+    IN -->|"yamux over the session's stdio"| OUT
+```
 
 ### 6.2 Host keys
 
@@ -853,11 +871,120 @@ a host and a binary rather than a path they would otherwise have to keep in
 step with the install. `CCB_CARRIER_SSH_COMMAND` overrides it for a site that
 installs the binary its own way.
 
-### 6.4 A login only a person can finish
+```mermaid
+sequenceDiagram
+    participant OUT as outside broker
+    participant SSH as sshd on the far host
+    participant FAR as staged htc-ccb
+
+    OUT->>SSH: connect, verify host key, authenticate
+    OUT->>SSH: uname -s -m
+    SSH-->>OUT: Linux aarch64  →  linux/arm64
+    Note over OUT: pick the linux/arm64 build:<br/>named file, directory, or compiled in
+    OUT->>SSH: test -x ~/.cache/htc-ccb/htc-ccb-<hash>
+    alt not there
+        OUT->>SSH: upload to a temp name, rename, re-check the size
+    else already there
+        Note over OUT,SSH: nothing moves; the hash IS the name
+    end
+    OUT->>SSH: upload the staged configuration (content-addressed too)
+    OUT->>SSH: exec env -i CONDOR_CONFIG=... htc-ccb-<hash> -carrier-stdio
+    FAR-->>OUT: yamux over the session's stdin/stdout
+```
+
+#### 6.3.1 Which build, for which host
+
+The far host's architecture is discovered, not configured, so there are three
+places the matching build can come from. They are tried in the order a site
+would mean them:
+
+| Source | Knob | For |
+|---|---|---|
+| A named file | `CCB_CARRIER_SSH_STAGE_BINARY` | One architecture, or a build you want to pin. Refused if it is for the wrong platform — before the transfer, not after. |
+| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. Files are named `htc-ccb-<os>-<arch>`, as the release tarballs name them. One configuration serves an amd64 login node and an arm64 one. |
+| Compiled into the broker | *(none — a build-time choice)* | A single-file install with nowhere to keep a directory. Only an `htc-ccb` built with `-tags embedremote` carries any. |
+
+The directory wins over a compiled-in copy, so a site that ships its own builds
+keeps control of what lands on its hosts even when both exist.
+
+A platform with no build fails by name, and the error lists what *was*
+available. "No `linux/arm64` build" is not actionable on its own: the usual
+cause is that the build was never made, and that is invisible unless the error
+says which ones were.
+
+**Why the embedded copies are a build tag and not the default.** Each one is
+about 6 MB gzipped, so carrying linux amd64 and arm64 adds roughly 13 MB to
+every `htc-ccb` — including the overwhelming majority that never stage
+anything. A packaged install has a directory for free and should use one;
+`-tags embedremote` is for the case that has no install at all. Build them
+with `scripts/embed-builds.sh`, which compiles `CGO_ENABLED=0` (the far host's
+libc is unknown by definition) and strips symbols with `-s -w`, taking each
+build from about 24 MB to 16 MB before compression. Nothing is committed: a
+binary in git is a 6 MB blob per release, and the release workflow has the
+builds already.
+
+### 6.4 Across a bastion
+
+`CCB_CARRIER_SSH_PROXY_JUMP` takes the hops `ssh -J` takes, nearest first:
+`[user@]host[:port]`, comma-separated. Each hop is reached through the one
+before it over a `direct-tcpip` channel — the same mechanism `ssh -J` uses, not
+a shelled-out `nc`.
+
+**Every hop is verified against the same host-key policy as the destination.**
+A bastion is the host best placed to see everything the carrier carries, so
+there is no mode in which an intermediate hop is trusted more cheaply than the
+endpoint. A jump host missing from `known_hosts` is refused exactly as the
+destination would be, and says so with the hop's own fingerprint.
+
+The same credentials are offered at every hop unless a hop carries its own
+user. One point worth knowing, because it is invisible when it bites: every
+key — agent and file alike — is offered through a *single* publickey method.
+`x/crypto/ssh` tries each method **name** at most once, so a second
+`ssh.PublicKeys` is silently skipped; a list of identity files built as one
+method each would offer only the first key, and a bastion wanting any other
+would fail with `no supported methods remain` and no hint why.
+
+### 6.5 What the staged broker is configured with
+
+A staged broker starts with `env -i`: no environment at all beyond `HOME` and
+`PATH`, and `CONDOR_CONFIG` pointing at a file the outside broker put there.
+
+This is deliberate and it is the main thing staging buys beyond the binary.
+HTCondor reads configuration from the environment — every `_CONDOR_<PARAM>`
+overrides the config files — so a login node that already has a pool on it
+would otherwise hand the staged broker that pool's security settings, trust
+domain and token directory, and the symptom would be an authentication failure
+with nothing in it to suggest where the setting came from. Clearing the
+environment makes the staged broker depend on nothing it found over there.
+
+The consequence is that **the staged configuration file is the only channel to
+the remote process.** There is no command line to edit on a host you do not
+install on, so anything the remote broker needs has to be in that file:
+
+```
+# staged with CCB_CARRIER_SSH_STAGE_CONFIG
+CCB_LISTEN  = 127.0.0.1:9700
+CCB_PUBLIC  = 127.0.0.1:9700
+SEC_DEFAULT_AUTHENTICATION = REQUIRED
+ALLOW_DAEMON = ...
+```
+
+`CCB_LISTEN` and `CCB_PUBLIC` are the config spellings of `-listen` and
+`-public`, and they exist for exactly this. The default `:9618` is the one
+port a login node most likely already has in use, so a staged broker with no
+way to be told otherwise dies at startup with `bind: address already in use` —
+on precisely the hosts staging is for.
+
+Without `CCB_CARRIER_SSH_STAGE_CONFIG` the staged broker reads whatever
+configuration the far host has, which on a bare login node is nothing and
+elsewhere is another pool's. Staging one is strongly preferred; the
+configuration is content-addressed and skipped when unchanged, like the binary.
+
+### 6.6 A login only a person can finish
 
 When the far server asks for a password or a keyboard-interactive answer, the
 carrier asks a `Prompter`. The broker implements that over its own CEDAR
-command surface (§6.5).
+command surface (§6.7).
 
 Two rules shape the behaviour, and the second is the useful one:
 
@@ -874,11 +1001,30 @@ what releases it — not a clock. Everything else is still retried on the
 ordinary backoff, because parking a transient blip behind a human turns a
 network fault into an outage.
 
+```mermaid
+flowchart TD
+    D["dialing"]
+    U["up — carrying the tunnel"]
+    B["backing off"]
+    P["parked"]
+
+    D -->|"authenticated"| U
+    U -->|"the pipe broke"| D
+    D -->|"network fault, host down, refused"| B
+    B -->|"after the backoff"| D
+    D -->|"asked for input, nobody attached"| P
+    P -->|"an operator attached"| D
+```
+
+The only edge out of **parked** is an operator attaching. No timer leads out of
+it, which is the point: every retry from there is a failed login against a
+host that will ask the same question again.
+
 The key methods are offered first, so a host that takes a key never wakes
 anyone, and a server that sends an empty challenge — some do, when they cannot
 tell in advance whether one is needed — summons nobody.
 
-### 6.5 The operator console
+### 6.7 The operator console
 
 ```sh
 htc-ccb -finish-login <broker-address>
@@ -916,7 +1062,7 @@ live command while staying inside the historical numbering — the same move
 htcondordb made with the retired transfer-daemon block at 74000, and a
 different block, so the two do not collide with each other.
 
-### 6.6 Configuration
+### 6.8 Configuration
 
 | Knob | Meaning |
 |---|---|
@@ -926,13 +1072,26 @@ different block, so the two do not collide with each other.
 | `CCB_CARRIER_SSH_HOST_KEY` | `known_hosts` lines inline, comma-separated, for a broker with no durable filesystem. A line contains spaces, which is why the separator is a comma. |
 | `CCB_CARRIER_SSH_IDENTITY` | Private keys to offer, in order. |
 | `CCB_CARRIER_SSH_AGENT` | Consult `SSH_AUTH_SOCK`. |
+| `CCB_CARRIER_SSH_PROXY_JUMP` | Bastion hops, nearest first, comma-separated, as `ssh -J` takes them. Every hop is host-key verified (§6.4). |
 | `CCB_CARRIER_SSH_STAGE_BINARY` | A local `htc-ccb` to put on the far host — the zero-touch install. |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A directory of `htc-ccb-<os>-<arch>` builds, chosen by what the far host reports. For a mixed fleet (§6.3.1). |
+| `CCB_CARRIER_SSH_STAGE_CONFIG` | A local HTCondor configuration file to stage beside the binary and point the remote broker at, with a cleared environment. Strongly preferred (§6.5). |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | Where a staged binary goes (default under the login account). |
 | `CCB_CARRIER_SSH_COMMAND` | Override what runs on the far host. |
 | `CCB_OPERATOR_WAIT` | Seconds an attached administrator waits for a question to arrive (default 120). |
 
-Either `CCB_CARRIER_SSH_STAGE_BINARY` or `CCB_CARRIER_SSH_COMMAND` must be set:
-without one there is nothing to run.
+On the *staged* broker, in the file `CCB_CARRIER_SSH_STAGE_CONFIG` names:
+
+| Knob | Meaning |
+|---|---|
+| `CCB_LISTEN` | The config spelling of `-listen`. A staged broker has no command line to edit, and the default `:9618` collides on most login nodes (§6.5). |
+| `CCB_PUBLIC` | The config spelling of `-public`. |
+
+One of `CCB_CARRIER_SSH_STAGE_BINARY`, `CCB_CARRIER_SSH_STAGE_BINARY_DIR` or
+`CCB_CARRIER_SSH_COMMAND` must be set, unless this `htc-ccb` was built with
+`-tags embedremote` and carries a build for the far host: without one of those
+there is nothing to run, and the refusal says so at startup rather than on the
+first dial.
 
 ---
 

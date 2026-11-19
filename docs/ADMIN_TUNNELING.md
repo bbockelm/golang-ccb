@@ -497,6 +497,92 @@ brokers cannot overwrite each other's copy.
 login account, because the premise is a host where you have an account and
 nothing else.
 
+```mermaid
+flowchart LR
+    subgraph POOL["Your pool"]
+        OUT["htc-ccb<br/>outside broker"]
+    end
+    BAS["bastion<br/>(optional, §Through a bastion)"]
+    subgraph CLUSTER["The cluster — nothing installed"]
+        LOGIN["login.cluster.edu<br/>~/.cache/htc-ccb/htc-ccb-&lt;hash&gt;<br/>+ staged condor_config"]
+        EP["startd / starter"]
+        LOGIN --- EP
+    end
+    OUT -->|"ssh, host key verified"| BAS
+    BAS -->|"direct-tcpip"| LOGIN
+    LOGIN -->|"one yamux tunnel<br/>back over the same session"| OUT
+```
+
+#### Send a configuration too
+
+Name a configuration file to stage alongside the binary. You almost always
+want this:
+
+```condor
+CCB_CARRIER_SSH_STAGE_CONFIG = /etc/condor/ccb/remote-broker.conf
+```
+
+The staged broker is started with its environment cleared — no
+`_CONDOR_*`, nothing inherited from the login shell — so the only thing it
+reads is the file you sent. Without that, a login node that already has
+HTCondor on it hands your broker *that* pool's security settings, trust domain
+and token directory, and the failure looks like an authentication problem with
+no hint where the setting came from.
+
+Because the environment is cleared and there is no command line to edit on a
+host you do not install on, that file is your only channel to the remote
+broker. At minimum give it a port:
+
+```condor
+# /etc/condor/ccb/remote-broker.conf — staged on the login node.
+CCB_LISTEN = 127.0.0.1:9700
+CCB_PUBLIC = 127.0.0.1:9700
+```
+
+The default is `:9618`, which is the port a login node running HTCondor
+already has. Without `CCB_LISTEN` the staged broker exits at startup with
+`bind: address already in use`, and the line appears in your broker's log as
+remote stderr.
+
+#### A cluster whose nodes are not all the same architecture
+
+Name a directory instead of a file and the broker picks the build that matches
+what the host reports:
+
+```condor
+CCB_CARRIER_SSH_STAGE_BINARY_DIR = /usr/share/htc-ccb/remote
+```
+
+with files named as the release tarballs name them:
+
+```
+/usr/share/htc-ccb/remote/htc-ccb-linux-amd64
+/usr/share/htc-ccb/remote/htc-ccb-linux-arm64
+```
+
+A host whose platform has no build there fails by name, and the message lists
+the builds that *were* available — usually the answer is that one was never
+made.
+
+If you are running an `htc-ccb` built with `-tags embedremote`, it carries
+Linux amd64 and arm64 builds inside itself and needs neither knob. That build
+is about 13 MB larger, which is why it is not the default; a packaged install
+has the directory for free and should use it.
+
+#### Through a bastion
+
+If the login host is only reachable through a jump host, give the hops the way
+`ssh -J` takes them, nearest first:
+
+```condor
+CCB_CARRIER_SSH_PROXY_JUMP = ccb@bastion.cluster.edu
+```
+
+Every hop is verified against `known_hosts` exactly as the destination is, so
+add the bastion's key there too. There is no setting that trusts a jump host
+more cheaply than the endpoint — a bastion sees everything the carrier
+carries.
+
 #### The host key, and what to do when it is refused
 
 An `ssh://` carrier will not connect to a host it cannot verify, and there is
@@ -812,6 +898,16 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_LISTEN = tcp://…` | a raw carrier pipe rather than a WebSocket, for a relayed tunnel (§4.5 shape B). No TLS and no transport credential — keep it reachable only from the relay host |
 | `CCB_CARRIER_LISTEN = cmd:…` | reach *into* the restricted network by running a command, the broker it starts playing the inside role (§4.5 shape A) |
 | `CCB_CARRIER_RETRY_INITIAL` / `CCB_CARRIER_RETRY_MAX` | seconds before, and the ceiling on, retrying a `cmd:` carrier (1 / 60) |
+| `CCB_CARRIER_LISTEN = ssh://…` | the same, with SSH spoken in-process, so the broker can install itself on a host that has nothing (§4.6) |
+| `CCB_CARRIER_SSH_KNOWN_HOSTS` / `CCB_CARRIER_SSH_HOST_KEY` | host keys, as a file or inline. **One is required** — there is no setting that accepts an unverified key |
+| `CCB_CARRIER_SSH_USER` / `CCB_CARRIER_SSH_IDENTITY` / `CCB_CARRIER_SSH_AGENT` | login name, private keys to offer, and whether to consult `SSH_AUTH_SOCK` |
+| `CCB_CARRIER_SSH_PROXY_JUMP` | bastion hops, nearest first, as `ssh -J` takes them. Every hop is host-key verified |
+| `CCB_CARRIER_SSH_STAGE_BINARY` | a local `htc-ccb` to put on the far host — the zero-touch install |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-<os>-<arch>` builds instead, chosen by what the far host reports |
+| `CCB_CARRIER_SSH_STAGE_CONFIG` | the configuration the staged broker runs with, its environment cleared. You want this |
+| `CCB_CARRIER_SSH_REMOTE_DIR` | where a staged binary goes (default under the login account) |
+| `CCB_CARRIER_SSH_COMMAND` | run a binary the site installed its own way, instead of staging |
+| `CCB_OPERATOR_WAIT` | seconds an attached administrator waits for a question to arrive (120) |
 
 ### Inside broker
 
@@ -830,6 +926,8 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_READY_TIMEOUT` | seconds to wait for the tunnel before reporting ready (120) |
 | `CCB_TUNNEL_READY_FILE` | written once registered; a barrier for wrappers outside the master |
 | `CCB_OUTBOUND_PROXY` | enable relaying the local daemons' outbound connections |
+| `CCB_LISTEN` | the config spelling of `-listen`. Needed in a *staged* broker's configuration, which is the only channel to a process on a host you do not install on, and where the default `:9618` usually collides (§4.6) |
+| `CCB_PUBLIC` | the config spelling of `-public` |
 
 ### Execution point daemons
 
