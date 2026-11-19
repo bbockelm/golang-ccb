@@ -114,18 +114,79 @@ func (e *HostKeyError) NeedsHuman() bool { return true }
 // ctx bounds establishing the session, not its life: the returned pipe outlives
 // ctx and is torn down by Close, matching the carrier contract.
 func Dial(ctx context.Context, cfg Config) (net.Conn, error) {
-	log := cfg.Logger
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
+	client, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
-	addr, err := normalizeAddr(cfg.Addr)
+	conn, err := Start(client, cfg)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// DialStaged is Dial with a zero-touch install in between: it connects, asks
+// the far host what it is, puts the binary there if it is not already, and runs
+// the staged copy.
+//
+// The command is derived from where the binary landed, so an operator
+// configures a host and a binary rather than a path they would otherwise have
+// to keep in step with the install. An explicit cfg.Command still wins, for a
+// site that puts the binary somewhere itself.
+//
+// Closing the returned pipe closes the SSH connection with it; the staged file
+// stays, which is the point -- the next broker to arrive finds it already
+// there.
+func DialStaged(ctx context.Context, cfg Config, stage StageConfig) (net.Conn, error) {
+	client, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := startStaged(ctx, client, cfg, stage)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func startStaged(ctx context.Context, client *ssh.Client, cfg Config, stage StageConfig) (net.Conn, error) {
+	if stage.Platform == (Platform{}) {
+		p, err := DetectPlatform(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		stage.Platform = p
+	}
+	if stage.Logger == nil {
+		stage.Logger = cfg.Logger
+	}
+	remote, err := Stage(ctx, client, stage)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Command == "" {
-		return nil, fmt.Errorf("sshcarrier: no remote command configured for %s", addr)
+		cfg.Command = shellQuote(remote) + " " + StdioFlag
 	}
+	return Start(client, cfg)
+}
 
+// StdioFlag is what the staged broker is told to be: the far end of this
+// carrier, taking the pipe it was started with.
+const StdioFlag = "-carrier-stdio"
+
+// Connect performs the TCP connect, the host-key check and authentication,
+// and returns the live client.
+//
+// It is separate from Start because a zero-touch install has to happen in
+// between: the binary is put there over this same connection, before anything
+// is run.
+func Connect(ctx context.Context, cfg Config) (*ssh.Client, error) {
+	addr, err := normalizeAddr(cfg.Addr)
+	if err != nil {
+		return nil, err
+	}
 	hostKey, err := cfg.hostKeyCallback()
 	if err != nil {
 		return nil, err
@@ -148,12 +209,10 @@ func Dial(ctx context.Context, cfg Config) (net.Conn, error) {
 			return nil, fmt.Errorf("sshcarrier: no user configured for %s and USER is unset", addr)
 		}
 	}
-
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-
 	client, err := dialClient(ctx, addr, &ssh.ClientConfig{
 		User:            user,
 		Auth:            auths,
@@ -163,13 +222,28 @@ func Dial(ctx context.Context, cfg Config) (net.Conn, error) {
 	if err != nil {
 		return nil, st.classify(err)
 	}
+	return client, nil
+}
 
-	conn, err := startSession(client, cfg, addr, log)
+// Start opens the session, wires stderr to the log, and runs cfg.Command. It
+// takes ownership of client: closing the returned pipe closes the connection.
+func Start(client *ssh.Client, cfg Config) (net.Conn, error) {
+	log := cfg.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	addr, err := normalizeAddr(cfg.Addr)
 	if err != nil {
-		_ = client.Close()
 		return nil, err
 	}
-	log.Debug("ssh carrier session started", "addr", addr, "user", user, "command", cfg.Command)
+	if cfg.Command == "" {
+		return nil, fmt.Errorf("sshcarrier: no remote command configured for %s", addr)
+	}
+	conn, err := startSession(client, cfg, addr, log)
+	if err != nil {
+		return nil, err
+	}
+	log.Debug("ssh carrier session started", "addr", addr, "command", cfg.Command)
 	return conn, nil
 }
 
