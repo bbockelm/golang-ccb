@@ -18,16 +18,41 @@ import (
 // the broker actually established a streaming splice (rather than inferring it
 // from configuration).
 type logCatcher struct {
-	mu   sync.Mutex
-	msgs []string
+	mu    sync.Mutex
+	msgs  []string
+	lines []string // the same records with their attributes, for dump
 }
 
 func (l *logCatcher) Enabled(context.Context, slog.Level) bool { return true }
 func (l *logCatcher) Handle(_ context.Context, r slog.Record) error {
+	// Attributes are kept separately from messages because saw() matches on
+	// the message alone, but a failure needs the attributes: a broker that
+	// refused a dial says why in an "error" attribute, and a test that keeps
+	// only "proxy-connect failed" reports an EOF with the explanation
+	// discarded.
+	line := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		line += " " + a.Key + "=" + a.Value.String()
+		return true
+	})
 	l.mu.Lock()
 	l.msgs = append(l.msgs, r.Message)
+	l.lines = append(l.lines, line)
 	l.mu.Unlock()
 	return nil
+}
+
+// dump writes everything this broker logged to the test's output. Call it
+// from a failure path: without it the only evidence is whatever the client
+// end saw, which for a connection the far end closed is "EOF".
+func (l *logCatcher) dump(t *testing.T, who string) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t.Logf("--- %s logged %d records:", who, len(l.lines))
+	for _, line := range l.lines {
+		t.Logf("    %s", line)
+	}
 }
 func (l *logCatcher) WithAttrs([]slog.Attr) slog.Handler { return l }
 func (l *logCatcher) WithGroup(string) slog.Handler      { return l }

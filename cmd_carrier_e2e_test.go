@@ -557,7 +557,7 @@ func TestOutboundThroughCmdStdioCarrierInverted(t *testing.T) {
 	t.Logf("login-host broker (started from outside) serves the cluster at %s", insideAddr)
 
 	// A job on a compute node: it can reach the login host and nothing else.
-	if err := outboundDCNopRetrying(t, insideAddr, "<"+targetAddr+">"); err != nil {
+	if err := outboundDCNopOnce(t, insideAddr, "<"+targetAddr+">"); err != nil {
 		t.Fatalf("a job's outbound connection through the SSH-opened tunnel: %v", err)
 	}
 	select {
@@ -624,13 +624,15 @@ func TestOutboundAllowlistAppliesThroughCmdStdioCarrier(t *testing.T) {
 // not work: a VPN or overlay interface (Tailscale's 100.64/10 is global
 // unicast as far as net.IP is concerned) can be listed, accepted by bind, and
 // still not carry a connection back to itself. nonLoopbackIPv4 returns the
-// first candidate it sees, so on such a host it hands the test a dud and the
-// failure arrives much later, as a proxy-connect that never answers.
+// first candidate it sees, so on such a host it would hand the test a dud.
 //
-// Binding and dialing each candidate costs milliseconds and removes that whole
-// class. It does NOT fix everything: on the same host an address that passes
-// this check can still stall a connection made a moment later, which is what
-// outboundDCNopRetrying below exists for.
+// Binding and dialing each candidate costs milliseconds and removes that
+// class. It is worth keeping for the host that really does have one, but note
+// that it was NOT the cause of this suite's long-standing intermittent
+// outbound-proxy failures: on the machine where those were diagnosed both
+// candidate addresses round-trip, the failing runs used the LAN address, and
+// the cause was the test target discarding its own reply by closing too
+// early (see startCedarDialTarget).
 func reachableNonLoopbackIPv4(t *testing.T) string {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()
