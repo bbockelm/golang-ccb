@@ -189,3 +189,123 @@ func TestSpliceHelperInboundRendezvous(t *testing.T) {
 		t.Fatal("EP DC_NOP did not dispatch through the splice")
 	}
 }
+
+// TestSpliceHelperExternalReturnAddress asks Brian's question: does the broker
+// need to mint an address the EP can reach, or is its own external address
+// enough?
+//
+// The claim is that the return address is not routing information at all. The
+// broker already knows, from the CCBID, which carrier a target is behind; and
+// the EP already knows the one address it can reach, because it registered
+// through it. "Reverse-connect to MyAddress" only has to mean "come back to
+// your broker" -- the address is a name for the peer, not a destination to
+// resolve.
+//
+// So: the broker mints its OWN external address, which the walled EP cannot
+// route to, and the EP dials through a carrier that ignores the address and
+// reconnects to its broker. No ReverseConnectAddress, nothing announced up the
+// pipe, no per-carrier state.
+func TestSpliceHelperExternalReturnAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideAddr := ln.Addr().String()
+	helperAddr, stopHelper := startSpliceHelper(t, outsideAddr)
+	defer stopHelper()
+
+	// Note what is NOT set: no ReverseConnectAddress. The broker mints
+	// proxyAddrSinful(), its own external address.
+	srv, err := New(Config{
+		PublicAddress:  outsideAddr,
+		Security:       plaintextSec(),
+		RequestTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvCtx, stopOut := context.WithCancel(context.Background())
+	defer stopOut()
+	go func() { _ = srv.Serve(srvCtx, ln) }()
+
+	served := make(chan struct{}, 1)
+	var dialed []string
+	var dialMu sync.Mutex
+
+	cedarSrv := cedarserver.New(plaintextSec())
+	cedarSrv.Handle(commands.DC_NOP, func(_ context.Context, _ *cedarserver.Conn) error {
+		select {
+		case served <- struct{}{}:
+		default:
+		}
+		return cedarserver.KeepOpen()
+	})
+	lis := ccb.NewListener(ccb.ListenerConfig{
+		BrokerAddr:        helperAddr,
+		Security:          plaintextSec(),
+		Name:              "carrier-ep",
+		HeartbeatInterval: 30 * time.Second,
+		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = cedarSrv.ServeConn(context.Background(), conn) },
+		// The whole hypothesis, in one function: whatever address the broker
+		// names, go back to the broker. A real EP on a restricted node has
+		// exactly one way out, and this is it.
+		Dial: func(ctx context.Context, brokerAddr string) (net.Conn, error) {
+			dialMu.Lock()
+			dialed = append(dialed, brokerAddr)
+			dialMu.Unlock()
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", helperAddr)
+		},
+	})
+	epCtx, stopEP := context.WithCancel(context.Background())
+	defer stopEP()
+	go func() { _ = lis.Run(epCtx) }()
+
+	var epContact string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if epContact = lis.Contact(); epContact != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if epContact == "" {
+		t.Fatal("EP did not register through the splice helper")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	conn, err := ccb.Dial(ctx, contactsFor(t, epContact), ccb.DialOptions{
+		Security:        plaintextSec(),
+		TargetDesc:      "carrier-ep",
+		Timeout:         10 * time.Second,
+		ProxyReturnAddr: "<0.0.0.0:0>", // mode signalling is a separate question (§3.3)
+	})
+	if err != nil {
+		t.Fatalf("Dial %q with an EXTERNAL return address: %v", epContact, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := endToEndDCNop(ctx, conn, epContact); err != nil {
+		t.Fatalf("end-to-end DC_NOP: %v", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EP DC_NOP did not dispatch")
+	}
+
+	dialMu.Lock()
+	defer dialMu.Unlock()
+	t.Logf("addresses the broker named, all ignored by the EP: %v", dialed)
+	var sawExternal bool
+	for _, a := range dialed {
+		if strings.Contains(a, strings.Trim(outsideAddr, "<>")) {
+			sawExternal = true
+		}
+	}
+	if !sawExternal {
+		t.Errorf("the EP was never handed the broker's external address %q (saw %v), "+
+			"so this test did not exercise the claim", outsideAddr, dialed)
+	}
+}

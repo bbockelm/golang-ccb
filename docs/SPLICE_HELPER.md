@@ -68,35 +68,55 @@ The EP cannot tell a spliced broker from a local one, and does not need to. It
 dials a TCP address and speaks CEDAR to whatever answers. No change is required
 anywhere for this half.
 
-### 3.2 The return address must be minted on the far side
+### 3.2 The return address is a name, not a destination
 
-This is the constraint that decides the model.
+The first reading of this was wrong, and the correction is the most useful
+result here.
 
-CCB's inbound rendezvous works by telling the target to reverse-connect to
-`MyAddress`. In streaming mode that is **the broker's own address**
-(`proxy.go`, `proxyAddrSinful`), and cedar's registrant side says so outright:
+CCB's inbound rendezvous tells the target to reverse-connect to `MyAddress`,
+and in streaming mode that is the broker's own address. It looks as though a
+restricted node therefore needs the broker to mint an address *it* can reach --
+which would mean the helper announcing its address up the carrier, and the
+broker holding one per pipe.
 
-> The reverse-connect target is usually the requester's own (directly dialable)
-> address, but in streaming/proxy mode it is the broker's own address so the
-> broker can splice us to the requester.
+It does not. **The broker already knows, from the CCBID, which carrier a target
+is behind, and the EP already knows the one address it can reach, because it
+registered through it.** "Reverse-connect to MyAddress" only has to mean "come
+back to your broker". The address is a name for the peer, not a destination to
+resolve, and nothing has to agree on its value.
 
-A restricted node can dial exactly one address: the helper on its own side of
-the carrier. So the broker has to mint an address **in a space it does not
-own**, and the helper is the only party that knows what that space looks like.
+`TestSpliceHelperExternalReturnAddress` proves it: the broker mints its own
+external address, which the EP cannot route to, the EP dials through its
+carrier instead, and the rendezvous completes. cedar already has the hook --
+`ListenerConfig.Dial` receives the address and is free to ignore it, which is
+what its own doc comment describes for a carrier-dialing EP:
 
-The helper cannot patch the address in flight. That control ad rides inside the
-EP↔broker CEDAR session, which is authenticated and usually encrypted. A byte
-relay cannot rewrite what it is designed to be unable to read — and should not
-be able to.
+> It is used for BOTH the persistent registration dial and the reverse-connect
+> dials the broker asks for (in streaming mode those target the broker's own
+> address, i.e. the same carrier peer).
 
-Two consequences:
+So `Config.ReverseConnectAddress` is scaffolding to delete, and §4 below is
+moot, **provided the EP goes back through its carrier**.
 
-- The helper **announces its reachable address up the carrier** when the pipe
-  comes up. One message, no CEDAR, no ClassAds. This is the only protocol the
-  helper needs, and it is what keeps it a byte relay everywhere else.
-- A target reached this way is **always proxied**. Standard mode would send it
-  to the requester, which is further away than the broker it already cannot
-  reach, so the standard path can never succeed for such a target.
+#### What this costs instead
+
+The requirement moves to the EP rather than vanishing. An EP that resolves
+`MyAddress` literally -- a plain TCP dial, no carrier hook -- still dials an
+address it cannot reach.
+
+That matters for exactly one question: whether an **unmodified C++ HTCondor EP**
+is a target for this model. Today's inside-CCB model works with one, but only
+because the address it is handed happens to be locally reachable -- the inside
+broker is next door. Under the carrier convention, a C++ EP would dial the
+broker's external address and fail.
+
+- EPs that dial through a carrier (any golang EP, and the staged case): the
+  external address is enough. Nothing to configure.
+- Unmodified C++ EPs: still need a reachable address. It need not be announced
+  up the pipe, though -- the operator configuring the carrier can state it once,
+  which is configuration rather than protocol.
+
+Settle that question first; it decides whether any of §4 survives.
 
 ### 3.3 The requester picks the mode, and the broker cannot upgrade it
 
@@ -123,7 +143,7 @@ This is the part to design next, and it has to be settled before anything else
 is built. `ProxyReturnAddr` is forced in the test purely to isolate the data
 path from this question.
 
-## 4. Determining the internal address
+## 4. Determining the internal address (only if §3.2's EP question says yes)
 
 Two separate things, easily conflated:
 
@@ -158,6 +178,8 @@ configuration and falls through to loopback.
 
 ## 6. Status
 
-Proven: the data path, and the return-address constraint.
-Unresolved: how a client learns to stream (§3.3), and per-carrier address state.
+Proven: the data path (§2), and that an external return address suffices for a
+carrier-dialing EP (§3.2).
+Unresolved: how a client learns to stream (§3.3), and whether unmodified C++ EPs
+are a target -- which decides whether any address needs configuring at all.
 Not started: everything else.
