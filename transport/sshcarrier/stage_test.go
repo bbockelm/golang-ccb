@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -274,5 +275,94 @@ func TestShellQuote(t *testing.T) {
 		if got := shellQuote(in); got != want {
 			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Zero touch end to end: a host with nothing on it gets the binary and then
+// runs it as the carrier, with the command derived from where it landed. An
+// operator configures a host and a binary; the path is not theirs to track.
+func TestDialStagedInstallsThenRunsTheStagedCopy(t *testing.T) {
+	h := newFakeHost("Linux x86_64")
+	var ran atomic.Pointer[string]
+	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		// Staging commands go to the fake host; anything else is the carrier.
+		if strings.HasPrefix(cmd, "uname") || strings.Contains(cmd, "wc -c <") || strings.Contains(cmd, "cat >") {
+			return h.handle(cmd, stdin, stdout, stderr)
+		}
+		ran.Store(&cmd)
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+
+	cfg := s.config("") // no explicit command: it must be derived
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c, err := DialStaged(ctx, cfg, StageConfig{
+		Binary:    localBinary(t, "fake htc-ccb binary body"),
+		RemoteDir: "/home/ccb/.cache/htc-ccb",
+	})
+	if err != nil {
+		t.Fatalf("DialStaged: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// The pipe works.
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	cmd := ran.Load()
+	if cmd == nil {
+		t.Fatal("the staged binary was never run")
+	}
+	if !strings.Contains(*cmd, "/home/ccb/.cache/htc-ccb/htc-ccb-") {
+		t.Errorf("ran %q; it does not name the staged path", *cmd)
+	}
+	if !strings.Contains(*cmd, StdioFlag) {
+		t.Errorf("ran %q; it does not tell the far broker to be the stdio end", *cmd)
+	}
+	if uploads, _ := h.count(); uploads != 1 {
+		t.Errorf("uploaded %d times, want 1", uploads)
+	}
+}
+
+// An explicit command still wins, for a site that installs the binary itself.
+func TestDialStagedHonoursAnExplicitCommand(t *testing.T) {
+	h := newFakeHost("Linux x86_64")
+	var ran atomic.Pointer[string]
+	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		if strings.HasPrefix(cmd, "uname") || strings.Contains(cmd, "wc -c <") || strings.Contains(cmd, "cat >") {
+			return h.handle(cmd, stdin, stdout, stderr)
+		}
+		ran.Store(&cmd)
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+
+	const want = "/usr/sbin/htc-ccb -carrier-stdio -listen 0.0.0.0:9618"
+	cfg := s.config(want)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c, err := DialStaged(ctx, cfg, StageConfig{Binary: localBinary(t, "body")})
+	if err != nil {
+		t.Fatalf("DialStaged: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && ran.Load() == nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if cmd := ran.Load(); cmd == nil || *cmd != want {
+		t.Errorf("ran %v, want %q", cmd, want)
 	}
 }
