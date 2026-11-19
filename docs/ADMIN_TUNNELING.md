@@ -21,6 +21,7 @@ component is a second `htc-ccb`, one on each side.
 | open outbound TCP, but too few sockets | this guide; the whole node collapses to one connection |
 | reach only an HTTP proxy, to approved destinations | this guide |
 | reach nothing, but you can `ssh` **in** to the cluster's login host | this guide — §4.5 shape A, the usual cluster |
+| the same, and you cannot install anything on the login host | this guide — §4.6, the broker stages itself |
 | `ssh` **out** to a bastion and nothing else | this guide — §4.5 shape B |
 | reach nothing at all, but share a filesystem with the pool | the filesystem carrier in [TRANSPORTS.md](TRANSPORTS.md) §4 |
 
@@ -460,6 +461,113 @@ An unknown host key is the most common first failure, because a non-interactive
 `ssh` cannot answer the prompt. Pre-populate that account's `known_hosts`.
 Whatever goes wrong, `ssh` says so on stderr and `-carrier-check` repeats it
 verbatim (§6) — the diagnosis is almost always in that one line.
+
+---
+
+### 4.6 Zero touch: nothing installed on the cluster
+
+Shape A (§4.5) needs `htc-ccb` already on the login host. If getting it there
+is the hard part — a cluster you have an account on and no package manager
+rights — the broker can put it there itself.
+
+Replace the `cmd:ssh …` carrier with `ssh://`, and name the binary to stage:
+
+```condor
+# On the outside broker.
+CCB_CARRIER_LISTEN           = ssh://ccb@login.cluster.edu
+CCB_CARRIER_SSH_KNOWN_HOSTS  = /etc/condor/ccb/known_hosts
+CCB_CARRIER_SSH_IDENTITY     = /etc/condor/ccb/id_ed25519
+CCB_CARRIER_SSH_STAGE_BINARY = /usr/sbin/htc-ccb
+
+CCB_OUTBOUND_PROXY            = TRUE
+CCB_OUTBOUND_TARGET_ALLOWLIST = collector.example.org, *.ap.example.org
+```
+
+The broker connects, asks the login host what it is, copies the binary there
+if that exact build is not already present, and runs it. Nothing needs to be
+installed on the cluster, and nothing needs a configuration file there — the
+command is derived from where the binary landed.
+
+The binary is static and about 22 MB, which it does **not** re-send on every
+reconnect: the remote name contains the build's content hash, so a host that
+already has it is left alone. A different build gets a different name, so two
+brokers cannot overwrite each other's copy.
+
+`CCB_CARRIER_SSH_REMOTE_DIR` chooses where it goes; the default is under the
+login account, because the premise is a host where you have an account and
+nothing else.
+
+#### The host key, and what to do when it is refused
+
+An `ssh://` carrier will not connect to a host it cannot verify, and there is
+no setting that turns that off. The first attempt against a host you have not
+recorded fails, and says what to do:
+
+```
+sshcarrier: the host key for login.cluster.edu:22 is not in known_hosts: ...
+The server offered ssh-ed25519 SHA256:L4Z1Oqrgc426PyFXdItTZ4Jp581phNs8JXJ64E...
+Verify that fingerprint against a source you trust, then add this line to
+/etc/condor/ccb/known_hosts (or set it as CCB_CARRIER_SSH_HOST_KEY):
+
+  login.cluster.edu ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF1siF7u6zeE0bySpK2...
+
+To produce the same line yourself:
+
+  ssh-keyscan -t ssh-ed25519 login.cluster.edu
+
+It reads the key from the host, so it shows what is answering that address
+rather than confirming which host that is.
+```
+
+In a container, or anywhere without a durable filesystem for a `known_hosts`
+file, put the same line in the configuration instead:
+
+```condor
+CCB_CARRIER_SSH_HOST_KEY = login.cluster.edu ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...
+```
+
+That is also the answer for a fleet: one configuration change, pushed by
+whatever already distributes your pool configuration, rather than a file to
+edit on every broker.
+
+#### Logins that need a person
+
+Some sites will not let a daemon log in with a key alone — a one-time code, or
+a password. The broker can still use such a host, but it cannot answer the
+question by itself, so it stops and waits for you:
+
+```
+WARN carrier is waiting for an operator; it will not retry on its own
+     carrier=ssh://ccb@login.cluster.edu reason="the server asked for input and no operator is attached"
+```
+
+It stops on purpose. The server would ask the same question on every attempt,
+and at a site that counts failed logins a broker retrying on a timer is a
+broker that gets the account locked.
+
+When you are ready, attach:
+
+```sh
+htc-ccb -finish-login ccb.example.org:9618
+```
+
+```
+Attached to ccb.example.org:9618; waiting for a login to finish.
+
+The broker is logging in to login.cluster.edu:22 as ccb.
+Two-factor required
+Verification code: ******
+The broker accepted the answer.
+```
+
+Attaching is itself what tells the broker to try again, so the question
+normally appears within a second or two of connecting. The answer is not
+echoed when the server marks it secret. If nothing is waiting, the command
+says so and exits — having released anything that had parked.
+
+This needs `ADMINISTRATOR` authorization, because whoever can answer a
+password prompt from a host the broker logs into holds something as
+privileged as the broker's own credentials.
 
 ---
 

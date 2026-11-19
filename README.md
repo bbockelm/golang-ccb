@@ -27,6 +27,7 @@ someone wants to reach it the broker tells it to dial *back*.
 | Worker nodes with no network path at all, but a shared filesystem | **this** — see [docs/TRANSPORTS.md](docs/TRANSPORTS.md) |
 | A cluster you can `ssh` **in** to, whose nodes dial nothing | **this** — the broker reaches in and serves the cluster from its login host, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
 | Nodes that may `ssh` **out** to a bastion and nothing else | **this** — the carrier can be `ssh` itself, see [docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md) |
+| Either of those, and you cannot install anything on the far host | **this** — the broker stages itself over SSH, see [docs/ADMIN_TUNNELING.md §4.6](docs/ADMIN_TUNNELING.md) |
 
 If the collector's built-in CCB already works for you, there is no reason to
 change. What you get here is a broker you can put on its own host, restart
@@ -251,6 +252,7 @@ and `<local-name>.CCB_SESSION_CACHE_FILE` beat the bare name.
 | `-listen <addr>` | the public TCP port peers connect to. Under `condor_master` this is bound *in addition* to the inherited command socket |
 | `-public <host:port>` | the address advertised in contacts. Defaults to the listen address, which is wrong whenever that is a wildcard or behind a NAT |
 | `-carrier-check` | run the tunnel diagnostic and exit; starts no daemon ([§7](#7-execution-points-with-no-outbound-network)) |
+| `-finish-login <address>` | attach to that broker's operator console and finish a login it is waiting on — a password or a one-time code its `ssh` carrier cannot answer by itself ([docs/ADMIN_TUNNELING.md §4.6](docs/ADMIN_TUNNELING.md)) |
 | `-carrier-stdio` | take this process's stdin and stdout as the carrier and run as the inside broker over it. What `ssh <node> htc-ccb -carrier-stdio` starts at the far end of a tunnel ([docs/ADMIN_TUNNELING.md §4.5](docs/ADMIN_TUNNELING.md)) |
 
 ### State and policy
