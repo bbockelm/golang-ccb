@@ -850,36 +850,80 @@ sequenceDiagram
     FAR-->>OUT: yamux over the session's stdin/stdout
 ```
 
-#### 6.3.1 Which build, for which host
+#### 6.3.1 What gets staged: `htc-ccb-relay`
 
-The far host's architecture is discovered, not configured, so there are three
-places the matching build can come from. They are tried in the order a site
-would mean them:
+What should cross the network is `cmd/htc-ccb-relay`, not `htc-ccb`.
+
+It is the same broker with the parts a staged process cannot use taken out. It
+keeps what matters on an execute host — the CCB server, upstream registration
+over the carrier, the outbound proxy, and HTCondor's own authorization policy
+— and drops the two things whose state cannot outlive the process:
+
+- **The session cache.** Its purpose is to let clients resume across a restart.
+  A process whose carrier is its own stdin does not restart: it exits when the
+  ssh session ends and is staged afresh next time.
+- **The shared reconnect store**, for the same reason — a CCBID kept across a
+  restart that never happens.
+
+Both are SQLite, and that is most of the difference:
+
+| linux/amd64, stripped | raw | gzipped |
+|---|---|---|
+| `htc-ccb` | 16.0 MiB | 6.59 MiB |
+| `htc-ccb-relay`, ordinary build | 15.9 MiB | 6.53 MiB |
+| **`htc-ccb-relay -tags condor_nosqlite`** | **11.7 MiB** | **4.70 MiB** |
+
+The middle row is the point of the third: `golang-htcondor/daemon` links the
+SQLite session store unconditionally, so until that dependency is optional the
+relay saves almost nothing. `-tags condor_nosqlite` is what makes it optional
+(it leaves out the daemon's default store registration, and a daemon built
+that way *refuses* `SEC_PERSIST_SESSIONS` rather than ignoring it). Whether
+the tag took effect is invisible in behaviour, only in size, so
+`scripts/embed-builds.sh` asserts the dependency is actually gone rather than
+trusting the flag.
+
+The relay is deliberately not a smaller `htc-ccb` for general use: it has one
+role and one carrier and refuses anything else, because a broker that silently
+ran without configured persistence would be worse than one that would not
+start.
+
+#### 6.3.2 Which build, for which host
+
+The far host's architecture is discovered, not configured, so there are four
+places the matching build can come from, tried in this order:
 
 | Source | Knob | For |
 |---|---|---|
 | A named file | `CCB_CARRIER_SSH_STAGE_BINARY` | One architecture, or a build you want to pin. Refused if it is for the wrong platform — before the transfer, not after. |
-| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. Files are named `htc-ccb-<os>-<arch>`, as the release tarballs name them. One configuration serves an amd64 login node and an arm64 one. |
-| Compiled into the broker | *(none — a build-time choice)* | A single-file install with nowhere to keep a directory. Only an `htc-ccb` built with `-tags embedremote` carries any. |
+| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. `htc-ccb-relay-<os>-<arch>`, or `htc-ccb-<os>-<arch>` — the relay is preferred when both are there. |
+| Compiled into the broker | *(a build-time choice)* | A single-file install with nowhere to keep a directory. Only an `htc-ccb` built with `-tags embedremote` carries any. |
+| **This running binary** | *(nothing to configure)* | A far host of the broker's own platform. |
 
-The directory wins over a compiled-in copy, so a site that ships its own builds
+The directory outranks a compiled-in copy, so a site that ships its own builds
 keeps control of what lands on its hosts even when both exist.
 
-A platform with no build fails by name, and the error lists what *was*
-available. "No `linux/arm64` build" is not actionable on its own: the usual
-cause is that the build was never made, and that is invisible unless the error
-says which ones were.
+**A broker never needs to carry a copy of itself.** A linux/amd64 `htc-ccb`
+staging onto a linux/amd64 host already has a binary that runs the role, on
+disk, so it sends that. Self-staging is last because it is the largest of the
+four — the running binary is the full `htc-ccb` where the other sources would
+be the smaller relay — but it means staging always works, for that platform,
+with nothing configured at all.
 
-**Why the embedded copies are a build tag and not the default.** Each one is
-about 6 MB gzipped, so carrying linux amd64 and arm64 adds roughly 13 MB to
-every `htc-ccb` — including the overwhelming majority that never stage
-anything. A packaged install has a directory for free and should use one;
-`-tags embedremote` is for the case that has no install at all. Build them
-with `scripts/embed-builds.sh`, which compiles `CGO_ENABLED=0` (the far host's
-libc is unknown by definition) and strips symbols with `-s -w`, taking each
-build from about 24 MB to 16 MB before compression. Nothing is committed: a
-binary in git is a 6 MB blob per release, and the release workflow has the
-builds already.
+The consequence is that an embedded set only ever needs the *other* platforms.
+For the usual linux/amd64 release that is linux/arm64 alone, so `-tags
+embedremote` costs about 4.7 MB rather than the ~13 MB two full binaries would.
+`scripts/embed-builds.sh` skips the platform it is building for; `SELF=` turns
+that off for a binary embedded into releases for several.
+
+A platform with no build at all fails by name, and the error lists what *was*
+available and both ways to make one. "No `linux/arm64` build" is not
+actionable on its own: the usual cause is that the build was never made, and
+that is invisible unless the error says which ones were.
+
+Nothing is committed under `remotebin/builds/`: a binary in git is a multi-MB
+blob per release, and the release workflow has the builds already. The script
+compiles `CGO_ENABLED=0` (the far host's libc is unknown by definition) and
+strips symbols with `-s -w`.
 
 ### 6.4 Across a bastion
 
@@ -1032,7 +1076,7 @@ different block, so the two do not collide with each other.
 | `CCB_CARRIER_SSH_AGENT` | Consult `SSH_AUTH_SOCK`. |
 | `CCB_CARRIER_SSH_PROXY_JUMP` | Bastion hops, nearest first, comma-separated, as `ssh -J` takes them. Every hop is host-key verified (§6.4). |
 | `CCB_CARRIER_SSH_STAGE_BINARY` | A local `htc-ccb` to put on the far host — the zero-touch install. |
-| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A directory of `htc-ccb-<os>-<arch>` builds, chosen by what the far host reports. For a mixed fleet (§6.3.1). |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A directory of `htc-ccb-relay-<os>-<arch>` builds, chosen by what the far host reports. For a mixed fleet (§6.3.2). |
 | `CCB_CARRIER_SSH_STAGE_CONFIG` | A local HTCondor configuration file to stage beside the binary and point the remote broker at, with a cleared environment. Strongly preferred (§6.5). |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | Where a staged binary goes (default under the login account). |
 | `CCB_CARRIER_SSH_COMMAND` | Override what runs on the far host. |

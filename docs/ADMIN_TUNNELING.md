@@ -546,6 +546,10 @@ remote stderr.
 
 #### A cluster whose nodes are not all the same architecture
 
+If the login host has the same OS and architecture as your broker, you need
+none of this: the broker stages the binary it is running. The rest of this
+section is for a far host that differs.
+
 Name a directory instead of a file and the broker picks the build that matches
 what the host reports:
 
@@ -556,18 +560,26 @@ CCB_CARRIER_SSH_STAGE_BINARY_DIR = /usr/share/htc-ccb/remote
 with files named as the release tarballs name them:
 
 ```
-/usr/share/htc-ccb/remote/htc-ccb-linux-amd64
-/usr/share/htc-ccb/remote/htc-ccb-linux-arm64
+/usr/share/htc-ccb/remote/htc-ccb-relay-linux-amd64
+/usr/share/htc-ccb/remote/htc-ccb-relay-linux-arm64
 ```
+
+`htc-ccb-relay` is the binary meant to cross the network: the same broker
+without the session cache and reconnect store, which a staged process cannot
+use anyway because it does not outlive the ssh session that started it. On
+linux/amd64 it is 4.7 MB gzipped against the full binary's 6.6 MB. A directory
+holding `htc-ccb-<os>-<arch>` instead still works — it is a complete broker
+and runs the same role — and if both are present the relay is sent.
 
 A host whose platform has no build there fails by name, and the message lists
 the builds that *were* available — usually the answer is that one was never
 made.
 
 If you are running an `htc-ccb` built with `-tags embedremote`, it carries
-Linux amd64 and arm64 builds inside itself and needs neither knob. That build
-is about 13 MB larger, which is why it is not the default; a packaged install
-has the directory for free and should use it.
+builds for the *other* platforms inside itself and needs neither knob. For a
+linux/amd64 broker that means one arm64 relay, about 4.7 MB; it is not the
+default because a packaged install has the directory for free and should use
+it.
 
 #### Through a bastion
 
@@ -903,7 +915,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_SSH_USER` / `CCB_CARRIER_SSH_IDENTITY` / `CCB_CARRIER_SSH_AGENT` | login name, private keys to offer, and whether to consult `SSH_AUTH_SOCK` |
 | `CCB_CARRIER_SSH_PROXY_JUMP` | bastion hops, nearest first, as `ssh -J` takes them. Every hop is host-key verified |
 | `CCB_CARRIER_SSH_STAGE_BINARY` | a local `htc-ccb` to put on the far host — the zero-touch install |
-| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-<os>-<arch>` builds instead, chosen by what the far host reports |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-relay-<os>-<arch>` builds instead, chosen by what the far host reports. Unneeded when the far host matches this broker's own platform, which it stages itself |
 | `CCB_CARRIER_SSH_STAGE_CONFIG` | the configuration the staged broker runs with, its environment cleared. You want this |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | where a staged binary goes (default under the login account) |
 | `CCB_CARRIER_SSH_COMMAND` | run a binary the site installed its own way, instead of staging |
