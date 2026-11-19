@@ -122,6 +122,25 @@ jobs:
       # losing CGO_ENABLED=0 above fails here rather than on a worker node.
       run: ./packaging/check-static.sh htc-ccb
 
+    - name: Build and test with embedded remote binaries
+      # `-tags embedremote` compiles per-platform htc-ccb copies into the
+      # binary so an SSH carrier can stage onto a host it has never seen with
+      # no directory of builds to install. Nothing in a default build
+      # compiles that code, so without this step the tagged files rot
+      # unnoticed -- and the one that would break is the one a single-file
+      # install depends on.
+      #
+      # A small stand-in is seeded rather than two real 6 MB builds: what
+      # needs proving here is that the lookup, the decompression and the
+      # directory-wins ordering work, and a real build proves none of that
+      # any better. scripts/embed-builds.sh makes the real ones.
+      run: |
+        printf 'stand-in for a real build' | gzip -9 \
+          > transport/sshcarrier/remotebin/builds/htc-ccb-linux-amd64.gz
+        go build -tags embedremote -v ./...
+        go vet -tags embedremote ./...
+        go test -tags embedremote -count=1 ./transport/sshcarrier/...
+
   container:
     name: Container image
     runs-on: ubuntu-latest

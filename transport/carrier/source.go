@@ -204,6 +204,12 @@ type SourceListener struct {
 	// only once the last has closed.
 	token chan struct{}
 
+	// gate holds attempts that failed for a reason only a person can clear.
+	// needsHuman decides which failures those are; without both, every failure
+	// is treated as transient and retried on the backoff schedule.
+	gate       *HumanGate
+	needsHuman NeedsHumanFunc
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
@@ -267,6 +273,20 @@ func (l *SourceListener) Accept() (net.Conn, error) {
 		case l.ctx.Err() != nil:
 			return nil, net.ErrClosed
 		}
+		// A failure only a person can clear does not belong on a timer. Park
+		// and wait for an operator instead; the backoff is reset so that when
+		// one arrives the retry is immediate rather than an hour late.
+		if l.gate != nil && l.needsHuman != nil && l.needsHuman(err) {
+			l.gate.Park(err)
+			logParked(l.log, l.src.Describe(), err)
+			if werr := l.gate.Wait(l.ctx); werr != nil {
+				return nil, net.ErrClosed
+			}
+			l.log.Info("an operator released the carrier; retrying now", "carrier", l.src.Describe())
+			delay = 0
+			continue
+		}
+
 		delay = l.backoff.next(delay)
 		wait := jitter(delay)
 		l.log.Warn("carrier pipe unavailable; retrying",

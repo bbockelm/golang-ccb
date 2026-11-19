@@ -55,6 +55,37 @@ the binary instead: the `CGO_ENABLED` build setting recorded by the toolchain
 workflow on every artifact, and the Dockerfile on the binary it is about to put
 on a `distroless/static` base.
 
+### htc-ccb-relay, and builds for other hosts
+
+`cmd/htc-ccb-relay` is what an SSH carrier stages: the broker with the session
+cache and reconnect store removed, neither of which a process whose carrier is
+its own stdin can use (`docs/TRANSPORTS.md` §6.3.1). Built with
+`-tags condor_nosqlite` it is 4.7 MB gzipped against `htc-ccb`'s 6.6 MB; built
+without it, almost the same size, because `golang-htcondor/daemon` links
+SQLite unconditionally otherwise.
+
+A broker stages the binary it is *running* when the far host shares its
+platform, so builds are only ever needed for other platforms:
+
+```sh
+scripts/embed-builds.sh                      # skips this build's own platform
+go build -tags embedremote -o htc-ccb ./cmd/htc-ccb
+```
+
+For the usual linux/amd64 release that carries one arm64 relay, about 4.7 MB.
+`SELF=` turns the skip off; `OUT=<dir>` writes a directory for
+`CCB_CARRIER_SSH_STAGE_BINARY_DIR` instead of the embed directory; `TAGS=`
+builds without `condor_nosqlite`. The script refuses to build a tagged relay
+that still links SQLite, because that only shows up as size, never as
+behaviour.
+
+`transport/sshcarrier/remotebin/builds/` holds the embedded copies and is
+gitignored: a binary in git would be a blob per release, and the release
+workflow has the builds already. Nothing in a default build compiles the
+tagged files, so CI builds, vets and tests the tagged variant too — otherwise
+the one path a single-file install depends on is the one path nothing
+exercises.
+
 ---
 
 ## 3. Testing
@@ -72,7 +103,20 @@ Four tiers, in ascending cost:
 | unit | `*_test.go` beside the code | nothing | every push |
 | in-process end-to-end | `carrier_e2e_test.go`, `carrier_proxy_e2e_test.go`, `outbound_test.go` | nothing — the `CONNECT` proxy is `internal/proxytest` | every push |
 | pool integration | `ccb_master_integration_test.go`, `binary_e2e_test.go` | `condor_master`, `condor_submit`, `condor_wait` on `PATH` | every push in CI, which installs HTCondor |
+| SSH carrier | `ssh_integration_test.go` | nothing — the sshd is `internal/sshtest`, in-process | every push |
+| relay staging | `ssh_integration_test.go` | nothing; builds `cmd/htc-ccb-relay` once per run | every push |
 | container | `test/e2e-squid/` | Docker, a real squid | nightly, on push, or on a PR labelled `squid-e2e` |
+
+The SSH tier runs the *real* binary at the far end: an in-process sshd that
+actually execs what the carrier asks for, with the broker staging a build and
+a configuration onto it and the staged process registering back through the
+pipe. It covers key auth, keyboard-interactive, password and a proxy jump.
+`go build` runs **once** for the whole run (`brokerBinary`, behind a
+`sync.Once`); a per-test build would pay several seconds four times over.
+
+It earns its keep: on first run it found two bugs the unit tests could not —
+a nil human-gate that panicked in the outside role, and the gate never being
+wired into the listener's retry loop at all.
 
 The tiers that need something they cannot find **skip** rather than fail, which
 is convenient locally and dangerous in CI: a run that skips the integration

@@ -6,9 +6,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -31,6 +33,8 @@ import (
 	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
+	"golang.org/x/term"
+
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
@@ -65,6 +69,7 @@ func run() error {
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
 	carrierStdio := flag.Bool("carrier-stdio", false, "take this process's stdin and stdout as the carrier to the outside CCB, and run as the inside broker over it. This is what `ssh <node> htc-ccb -carrier-stdio` starts at the far end of a cmd: carrier: the broker joins the pool through the pipe it was started with and binds no port of its own to reach the outside. Equivalent to CCB_OUTBOUND_NEXT_HOP = stdio:.")
+	finishLogin := flag.String("finish-login", "", "attach to the broker at this `address` and finish a login it is waiting on: the broker's ssh carrier asks for a password or a one-time code, this prints the question and sends back the answer. Attaching also releases a carrier that parked for want of a person, so it retries at once. Starts no daemon.")
 	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; a diagnostic to run by hand when a node cannot reach its broker.")
 	flag.Parse()
 
@@ -109,6 +114,23 @@ func run() error {
 	// Route the cedar security/server package's slog output to the daemon log so
 	// handshake diagnostics land in CcbLog rather than a discarded stderr.
 	slog.SetDefault(d.Slog())
+
+	// CCB_LISTEN / CCB_PUBLIC stand in for -listen / -public when the flag was
+	// not given. A staged broker needs them: the SSH carrier starts the remote
+	// process with `env -i` and a configuration file of our choosing, and that
+	// file is the only channel to it -- there is no command line to edit on a
+	// host we do not install on. The default :9618 is also the one port a
+	// login node most likely already has in use, so a staged broker that
+	// cannot be told otherwise fails to start with EADDRINUSE.
+	if !listenExplicit {
+		if v := configString(cfg, "CCB_LISTEN", ""); v != "" {
+			*listen = v
+			listenExplicit = true
+		}
+	}
+	if *public == "" {
+		*public = configString(cfg, "CCB_PUBLIC", "")
+	}
 
 	// Session-cache persistence: open the store *after* New so its database file
 	// is condor-owned (not root-owned), then restore + arrange snapshots. The
@@ -166,27 +188,9 @@ func run() error {
 	}
 
 	// Address advertised inside CCB contact strings ("<public>#<id>").
-	pub := *public
-	if pub == "" {
-		if tcp, ok := directLn.Addr().(*net.TCPAddr); ok {
-			pub = tcp.String()
-			// A wildcard bind (0.0.0.0 / ::) is not a routable contact address; EPs cannot
-			// dial it. Warn so the operator supplies -public (or TCP_FORWARDING_HOST).
-			if tcp.IP == nil || tcp.IP.IsUnspecified() {
-				log.Warn(logging.DestinationGeneral,
-					"advertising a wildcard CCB address; external peers cannot dial it -- pass -public <routable-host:port>",
-					"address", pub)
-			}
-		} else if sinful, ok := d.AdvertisedSinful(); ok {
-			// A shared-port (Unix socket) listener has no routable address of
-			// its own; advertise the broker's shared-port command sinful
-			// (the shared-port server host:port routed to our sock id).
-			pub = sinful
-			log.Info(logging.DestinationGeneral, "advertising shared-port CCB contact",
-				"address", pub, "sock", d.SharedPortName())
-		} else {
-			return fmt.Errorf("running behind shared port but could not derive an advertised address; pass -public <host:port?sock=name>")
-		}
+	pub, err := advertisedAddress(d, directLn, *public, log)
+	if err != nil {
+		return err
 	}
 
 	// Server security policy from the HTCondor configuration (SEC_* knobs), so
@@ -303,6 +307,8 @@ func run() error {
 		CarrierRetryInitial:     cc.retryInitial,
 		CarrierRetryMax:         cc.retryMax,
 		CarrierPipe:             cc.pipe,
+		CarrierSSH:              cc.ssh,
+		OperatorWait:            cc.operatorWait,
 		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
@@ -310,6 +316,9 @@ func run() error {
 		return err
 	}
 
+	if *finishLogin != "" {
+		return runFinishLogin(d, *finishLogin)
+	}
 	if *carrierCheck {
 		return runCarrierCheck(srv)
 	}
@@ -587,6 +596,11 @@ type carrierSettings struct {
 	// pipe is a carrier pipe already claimed before the daemon started
 	// logging, for -carrier-stdio.
 	pipe net.Conn
+	// ssh configures an ssh:// carrier.
+	ssh ccbserver.SSHCarrierConfig
+	// operatorWait bounds how long an attached administrator waits for the
+	// broker to reach the point of asking something.
+	operatorWait time.Duration
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -599,6 +613,8 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 	cc.commandEnv = carrierCommandEnv(cfg)
 	cc.commandGrace = configSeconds(cfg, "CCB_CARRIER_COMMAND_GRACE")
 	cc.retryInitial = configSeconds(cfg, "CCB_CARRIER_RETRY_INITIAL")
+	cc.operatorWait = configSeconds(cfg, "CCB_OPERATOR_WAIT")
+	cc.ssh = sshCarrierSettings(cfg)
 	cc.retryMax = configSeconds(cfg, "CCB_CARRIER_RETRY_MAX")
 	cc.maxSessions = configInt(cfg, "CCB_CARRIER_MAX_SESSIONS", 0)
 	cc.maxPerSource = configInt(cfg, "CCB_CARRIER_MAX_PER_SOURCE", 0)
@@ -920,4 +936,162 @@ func carrierCommandEnv(cfg *config.Config) []string {
 		env = append(env, entry)
 	}
 	return env
+}
+
+// sshCarrierSettings reads the ssh:// carrier knobs.
+//
+// There is deliberately no knob that disables host-key verification. A carrier
+// hands the whole tunnel to whatever answers the address, so an option to skip
+// the check would be an option to hand it to anyone -- and options like that
+// get set in a hurry at 2am and never unset.
+//
+// Host keys stay in known_hosts rather than in the broker's database, even
+// though the broker has one. The list is the administrator's decision about
+// what a host is, not state the broker owns: it has to be legible to the ssh
+// the same administrator will run by hand when a connection fails, and a trust
+// anchor must not quietly regenerate itself when the broker's disposable
+// session database is lost. CCB_CARRIER_SSH_HOST_KEY carries the same lines
+// inline for a broker with no durable filesystem, so config management can
+// push one change to a fleet.
+func sshCarrierSettings(cfg *config.Config) ccbserver.SSHCarrierConfig {
+	return ccbserver.SSHCarrierConfig{
+		User:           configString(cfg, "CCB_CARRIER_SSH_USER", ""),
+		KnownHosts:     configList(cfg, "CCB_CARRIER_SSH_KNOWN_HOSTS"),
+		HostKeys:       configList(cfg, "CCB_CARRIER_SSH_HOST_KEY"),
+		IdentityFiles:  configList(cfg, "CCB_CARRIER_SSH_IDENTITY"),
+		Agent:          configBool(cfg, "CCB_CARRIER_SSH_AGENT", false),
+		ProxyJump:      configList(cfg, "CCB_CARRIER_SSH_PROXY_JUMP"),
+		StageBinary:    configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
+		StageBinaryDir: configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY_DIR", ""),
+		RemoteDir:      configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
+		StageConfig:    configString(cfg, "CCB_CARRIER_SSH_STAGE_CONFIG", ""),
+		Command:        configString(cfg, "CCB_CARRIER_SSH_COMMAND", ""),
+	}
+}
+
+// configList reads a comma-separated setting. Commas rather than spaces
+// because a known_hosts line contains spaces, and a path may.
+func configList(cfg *config.Config, key string) []string {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// runFinishLogin attaches to a broker's operator console and answers whatever
+// login it is stuck on.
+//
+// It waits rather than asking once: attaching is what releases a parked
+// carrier, and the carrier then needs a connect or two to get as far as the
+// question. Asking once would usually report "nothing waiting" a moment
+// before the question appeared.
+func runFinishLogin(d *daemon.Daemon, broker string) error {
+	sec, err := htcondor.GetSecurityConfig(d.Config(), ccbserver.CommandFinishLogin, "CLIENT")
+	if err != nil {
+		return fmt.Errorf("building client security config: %w", err)
+	}
+	sec.RemoteVersion = streamingVersionString
+
+	ctx, cancel := context.WithTimeout(context.Background(), finishLoginTimeout)
+	defer cancel()
+
+	fmt.Fprintf(os.Stderr, "Attached to %s; waiting for a login to finish.\n", broker)
+	err = ccbserver.WaitForLogin(ctx, broker, sec, finishLoginWait, promptOnTerminal)
+	switch {
+	case err == nil:
+		fmt.Fprintln(os.Stderr, "The broker accepted the answer.")
+		return nil
+	case errors.Is(err, ccbserver.ErrNoLoginWaiting):
+		fmt.Fprintln(os.Stderr, "Nothing was waiting. Any carrier that had parked for want of an operator has been released and will retry.")
+		return nil
+	default:
+		return err
+	}
+}
+
+const (
+	// finishLoginTimeout bounds the whole console session, including the
+	// operator's typing.
+	finishLoginTimeout = 15 * time.Minute
+	// finishLoginWait is how long to keep asking a broker that has nothing
+	// waiting yet, while the carrier it just released reconnects.
+	finishLoginWait = 90 * time.Second
+)
+
+// promptOnTerminal puts the broker's question to whoever is sitting here.
+//
+// Echo is honoured: a question whose answer is a password or a one-time code
+// is read without echoing it. A client that ignored that would print the
+// secret into a terminal, a scrollback buffer and very likely a ticket.
+func promptOnTerminal(c ccbserver.OperatorChallenge) ([]string, error) {
+	fmt.Fprintf(os.Stderr, "\nThe broker is logging in to %s", c.Host)
+	if c.User != "" {
+		fmt.Fprintf(os.Stderr, " as %s", c.User)
+	}
+	fmt.Fprintln(os.Stderr, ".")
+	if c.Instruction != "" {
+		fmt.Fprintf(os.Stderr, "%s\n", c.Instruction)
+	}
+
+	answers := make([]string, 0, len(c.Questions))
+	reader := bufio.NewReader(os.Stdin)
+	for _, q := range c.Questions {
+		fmt.Fprintf(os.Stderr, "%s ", q.Prompt)
+		if q.Echo {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return nil, fmt.Errorf("reading the answer: %w", err)
+			}
+			answers = append(answers, strings.TrimRight(line, "\r\n"))
+			continue
+		}
+		secret, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return nil, fmt.Errorf("reading the answer: %w", err)
+		}
+		answers = append(answers, string(secret))
+	}
+	return answers, nil
+}
+
+// advertisedAddress decides what goes inside the CCB contacts this broker
+// hands out -- the "<public>#<id>" an external peer dials.
+//
+// The flag wins. Without it, a TCP listener's own address is the answer,
+// except that a wildcard bind is not an address anyone can dial; behind
+// shared port there is no address of our own, so the daemon's shared-port
+// sinful is used instead.
+func advertisedAddress(d *daemon.Daemon, directLn net.Listener, flagValue string, log *logging.Logger) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	if tcp, ok := directLn.Addr().(*net.TCPAddr); ok {
+		pub := tcp.String()
+		// A wildcard bind (0.0.0.0 / ::) is not a routable contact address; EPs
+		// cannot dial it. Warn so the operator supplies -public (or
+		// TCP_FORWARDING_HOST).
+		if tcp.IP == nil || tcp.IP.IsUnspecified() {
+			log.Warn(logging.DestinationGeneral,
+				"advertising a wildcard CCB address; external peers cannot dial it -- pass -public <routable-host:port>",
+				"address", pub)
+		}
+		return pub, nil
+	}
+	// A shared-port (Unix socket) listener has no routable address of its own;
+	// advertise the broker's shared-port command sinful (the shared-port server
+	// host:port routed to our sock id).
+	if sinful, ok := d.AdvertisedSinful(); ok {
+		log.Info(logging.DestinationGeneral, "advertising shared-port CCB contact",
+			"address", sinful, "sock", d.SharedPortName())
+		return sinful, nil
+	}
+	return "", fmt.Errorf("running behind shared port but could not derive an advertised address; pass -public <host:port?sock=name>")
 }

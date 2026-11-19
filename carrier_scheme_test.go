@@ -2,6 +2,7 @@ package ccbserver
 
 import (
 	"net"
+	"os"
 	"strings"
 	"testing"
 )
@@ -119,4 +120,98 @@ func testPipe(t *testing.T) net.Conn {
 	a, b := net.Pipe()
 	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 	return a
+}
+
+func TestParseSSHCarrierRef(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want carrierRef
+	}{
+		{"ssh://login.cluster.edu", carrierRef{scheme: "ssh", addr: "login.cluster.edu"}},
+		{"ssh://ccb@login.cluster.edu", carrierRef{scheme: "ssh", addr: "login.cluster.edu", user: "ccb"}},
+		{"ssh://ccb@login.cluster.edu:2222", carrierRef{scheme: "ssh", addr: "login.cluster.edu:2222", user: "ccb"}},
+		{"ssh://login.cluster.edu/", carrierRef{scheme: "ssh", addr: "login.cluster.edu"}},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			got, ok := parseCarrierRef(tc.addr)
+			if !ok {
+				t.Fatalf("parseCarrierRef(%q) did not recognize a carrier", tc.addr)
+			}
+			if got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+			// ssh has no listening form: an outside broker using one reaches
+			// out, so its source is presented as a listener.
+			if !got.spawns() {
+				t.Error("an ssh carrier claims to have a listening form")
+			}
+		})
+	}
+}
+
+// A carrier that cannot verify the host it hands the tunnel to is refused at
+// startup, not defaulted into accepting anything.
+func TestSSHCarrierRequiresKnownHosts(t *testing.T) {
+	_, err := New(Config{
+		PublicAddress:           "127.0.0.1:9618",
+		Security:                plaintextSec(),
+		OutboundNextHop:         "ssh://login.cluster.edu",
+		OutboundNextHopSecurity: plaintextSec(),
+		CarrierSSH:              SSHCarrierConfig{StageBinary: "/usr/sbin/htc-ccb"},
+	})
+	if err == nil {
+		t.Fatal("an ssh:// carrier was accepted with no known_hosts")
+	}
+	if !strings.Contains(err.Error(), "KNOWN_HOSTS") {
+		t.Errorf("error %q does not name the missing setting", err)
+	}
+}
+
+// Without a binary to stage there is nothing to run, so one of the two must be
+// configured.
+func TestSSHCarrierNeedsABinaryOrACommand(t *testing.T) {
+	kh := t.TempDir() + "/known_hosts"
+	if err := os.WriteFile(kh, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(Config{
+		PublicAddress:           "127.0.0.1:9618",
+		Security:                plaintextSec(),
+		OutboundNextHop:         "ssh://login.cluster.edu",
+		OutboundNextHopSecurity: plaintextSec(),
+		CarrierSSH:              SSHCarrierConfig{KnownHosts: []string{kh}},
+	})
+	if err == nil {
+		t.Fatal("an ssh:// carrier was accepted with neither a binary nor a command")
+	}
+	if !strings.Contains(err.Error(), "STAGE_BINARY") {
+		t.Errorf("error %q does not say what is missing", err)
+	}
+}
+
+// With both the host-key policy and a binary, the carrier builds.
+func TestSSHCarrierBuilds(t *testing.T) {
+	kh := t.TempDir() + "/known_hosts"
+	if err := os.WriteFile(kh, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		PublicAddress:           "127.0.0.1:9618",
+		Security:                plaintextSec(),
+		OutboundNextHop:         "ssh://ccb@login.cluster.edu",
+		OutboundNextHopSecurity: plaintextSec(),
+		CarrierSSH: SSHCarrierConfig{
+			KnownHosts:  []string{kh},
+			StageBinary: "/usr/sbin/htc-ccb",
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if srv.carrier == nil {
+		t.Fatal("no carrier was built for an ssh:// next hop")
+	}
+	if got := srv.carrier.describe(); got != "ssh://ccb@login.cluster.edu" {
+		t.Errorf("describe() = %q", got)
+	}
 }

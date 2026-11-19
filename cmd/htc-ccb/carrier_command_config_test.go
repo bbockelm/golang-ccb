@@ -86,3 +86,79 @@ func TestCarrierCommandEnv(t *testing.T) {
 		t.Error("the configured entries were not added to the inherited environment")
 	}
 }
+
+func TestSSHCarrierSettingsFromConfig(t *testing.T) {
+	cfg := proxyConfig(t, strings.Join([]string{
+		"CCB_CARRIER_SSH_USER = ccb",
+		"CCB_CARRIER_SSH_KNOWN_HOSTS = /etc/condor/ccb/known_hosts, /etc/ssh/ssh_known_hosts",
+		"CCB_CARRIER_SSH_IDENTITY = /etc/condor/ccb/id_ed25519",
+		"CCB_CARRIER_SSH_AGENT = true",
+		"CCB_CARRIER_SSH_STAGE_BINARY = /usr/sbin/htc-ccb",
+		"CCB_CARRIER_SSH_REMOTE_DIR = /scratch/ccb",
+	}, "\n"))
+
+	got := sshCarrierSettings(cfg)
+	if got.User != "ccb" {
+		t.Errorf("User = %q", got.User)
+	}
+	if len(got.KnownHosts) != 2 || got.KnownHosts[1] != "/etc/ssh/ssh_known_hosts" {
+		t.Errorf("KnownHosts = %q; a comma-separated list must split and trim", got.KnownHosts)
+	}
+	if len(got.IdentityFiles) != 1 {
+		t.Errorf("IdentityFiles = %q", got.IdentityFiles)
+	}
+	if !got.Agent {
+		t.Error("Agent was not read")
+	}
+	if got.StageBinary != "/usr/sbin/htc-ccb" || got.RemoteDir != "/scratch/ccb" {
+		t.Errorf("staging = %q into %q", got.StageBinary, got.RemoteDir)
+	}
+}
+
+// A known_hosts line contains spaces, so the list separator has to be a comma
+// and the line must survive intact.
+func TestInlineHostKeySurvivesConfig(t *testing.T) {
+	const line = "[login.cluster.edu]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample"
+	cfg := proxyConfig(t, "CCB_CARRIER_SSH_HOST_KEY = "+line)
+
+	got := sshCarrierSettings(cfg)
+	if len(got.HostKeys) != 1 {
+		t.Fatalf("HostKeys = %q, want one line", got.HostKeys)
+	}
+	if got.HostKeys[0] != line {
+		t.Errorf("HostKeys[0] = %q, want %q", got.HostKeys[0], line)
+	}
+}
+
+// Two inline keys, for a host that offers more than one algorithm.
+func TestSeveralInlineHostKeys(t *testing.T) {
+	const a = "[h]:22 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOne"
+	const b = "[h]:22 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABTwo"
+	cfg := proxyConfig(t, "CCB_CARRIER_SSH_HOST_KEY = "+a+", "+b)
+
+	got := sshCarrierSettings(cfg)
+	if len(got.HostKeys) != 2 || got.HostKeys[0] != a || got.HostKeys[1] != b {
+		t.Errorf("HostKeys = %q", got.HostKeys)
+	}
+}
+
+// Nothing configured means nothing claimed: an ssh:// carrier then fails at
+// startup rather than silently trusting whatever answers.
+func TestNoSSHSettingsIsEmpty(t *testing.T) {
+	got := sshCarrierSettings(proxyConfig(t, ""))
+	if len(got.KnownHosts) != 0 || len(got.HostKeys) != 0 || got.StageBinary != "" {
+		t.Errorf("unset config produced %+v", got)
+	}
+}
+
+// A chain of jump hosts, nearest first, as ssh -J takes them.
+func TestProxyJumpChainFromConfig(t *testing.T) {
+	cfg := proxyConfig(t, "CCB_CARRIER_SSH_PROXY_JUMP = ops@edge.site.edu, bastion.cluster.edu:2222")
+	got := sshCarrierSettings(cfg)
+	if len(got.ProxyJump) != 2 {
+		t.Fatalf("ProxyJump = %q, want two hops", got.ProxyJump)
+	}
+	if got.ProxyJump[0] != "ops@edge.site.edu" || got.ProxyJump[1] != "bastion.cluster.edu:2222" {
+		t.Errorf("ProxyJump = %q; order is nearest-first and must be preserved", got.ProxyJump)
+	}
+}

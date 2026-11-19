@@ -3,6 +3,7 @@ package carrier
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 func localListener(t *testing.T) net.Listener {
@@ -22,43 +23,60 @@ func TestLimitListenerCapsSessions(t *testing.T) {
 	inner := localListener(t)
 	l := NewLimitListener(inner, nil, 2, 0)
 
+	// Fill the cap.
 	var held []net.Conn
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 2; i++ {
 		c, err := net.Dial("tcp", inner.Addr().String())
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
 		defer func() { _ = c.Close() }()
-		if i < 2 {
-			accepted, err := l.Accept()
-			if err != nil {
-				t.Fatalf("Accept %d: %v", i, err)
-			}
-			held = append(held, accepted)
+		accepted, err := l.Accept()
+		if err != nil {
+			t.Fatalf("Accept %d: %v", i, err)
 		}
+		held = append(held, accepted)
 	}
 	if got := l.Sessions(); got != 2 {
 		t.Fatalf("holding %d sessions, want 2", got)
 	}
 
-	// Over the cap, the listener closes the excess and keeps accepting, so a
-	// third dial yields nothing until a held pipe closes.
-	done := make(chan net.Conn, 1)
+	// One more arrives. Accept must not yield it while the cap is full --
+	// the excess is closed and the loop keeps waiting.
+	extra, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = extra.Close() }()
+
+	got := make(chan net.Conn, 1)
 	go func() {
 		c, err := l.Accept()
 		if err == nil {
-			done <- c
+			got <- c
 		}
 	}()
 	select {
-	case <-done:
+	case <-got:
 		t.Fatal("accepted a pipe beyond the session cap")
-	default:
+	case <-time.After(250 * time.Millisecond):
 	}
 
+	// Freeing a slot lets the waiting Accept through. Asserting that, rather
+	// than a count sampled while that goroutine is racing to re-fill the
+	// slot, is what makes this deterministic.
 	_ = held[0].Close()
-	if got := l.Sessions(); got != 1 {
-		t.Errorf("after closing one pipe, holding %d sessions, want 1", got)
+	again, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = again.Close() }()
+
+	select {
+	case c := <-got:
+		_ = c.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("closing a held pipe did not free a slot for the waiting Accept")
 	}
 }
 
