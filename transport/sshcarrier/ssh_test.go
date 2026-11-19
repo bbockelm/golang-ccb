@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func dialTest(t *testing.T, cfg Config) net.Conn {
@@ -192,4 +193,48 @@ func TestRemoteCommandIsPassedThrough(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the remote command never ran")
 	}
+}
+
+// A broker with no durable filesystem -- a container, a glidein -- can carry
+// its host keys in configuration instead of a file. It is still the operator
+// declaring what the host is, not the broker discovering it.
+func TestInlineHostKeysAreHonoured(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+
+	line := knownHostsLine(t, s.addr, s.hostKey)
+	cfg := s.config("htc-ccb -carrier-stdio")
+	cfg.HostKeyCallback = nil
+	cfg.HostKeys = []string{line}
+
+	c := dialTest(t, cfg)
+	if _, err := c.Write([]byte("up")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// And a wrong inline key is refused, so the inline path is not a way around
+// verification.
+func TestInlineHostKeysStillRefuseAStranger(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+	other := newTestSSHServer(t, echo)
+
+	cfg := s.config("htc-ccb -carrier-stdio")
+	cfg.HostKeyCallback = nil
+	cfg.HostKeys = []string{knownHostsLine(t, s.addr, other.hostKey)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if c, err := Dial(ctx, cfg); err == nil {
+		_ = c.Close()
+		t.Fatal("an inline key that does not match the server was accepted")
+	}
+}
+
+func knownHostsLine(t *testing.T, addr string, key ssh.PublicKey) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return knownhosts.Line([]string{knownhosts.Normalize(net.JoinHostPort(host, port))}, key)
 }

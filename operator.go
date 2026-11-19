@@ -12,14 +12,27 @@ import (
 	"github.com/bbockelm/golang-ccb/transport/sshcarrier"
 )
 
+// CommandBase is the CEDAR command block this broker's own commands occupy.
+//
+// It is HTCondor's retired password-daemon block: condor_commands.h has
+//
+//	//#define PW_BASE 70000  /* Not used */
+//
+// entirely commented out, with every command under it likewise. Reusing a
+// reserved-but-idle range keeps these clear of every live HTCondor command
+// while staying inside the historical numbering, so a future allocation in the
+// low ranges cannot collide. It is the same reasoning htcondordb used when it
+// took the retired transfer-daemon block at 74000 -- a different one, so the two
+// projects do not collide with each other either.
+//
+// The CCB tunneling commands (CCB_REGISTER 67, CCB_PROXY_CONNECT 82,
+// CCB_GET_TUNNEL_ADDRESS 83) are upstream allocations and stay where they are;
+// this block is only for commands htc-ccb defines itself.
+const CommandBase = 70000
+
 // CommandFinishLogin is the operator console: an administrator connects, is
 // handed whatever login the broker is stuck on, and answers it.
-//
-// 84 continues the CCB tunneling block (82 proxy-connect, 83
-// get-tunnel-address). It is NOT allocated upstream: HTCondor's
-// condor_commands.h is the authoritative list, and shipping this needs a
-// number reserved there so a later CCB command cannot collide with it.
-const CommandFinishLogin = 84
+const CommandFinishLogin = CommandBase + 0 // 70000
 
 // Attribute names on the console's wire ads. They are local to this command.
 const (

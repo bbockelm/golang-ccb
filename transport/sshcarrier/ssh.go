@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -36,10 +37,20 @@ type Config struct {
 	// User is the login name. Empty uses the current user.
 	User string
 
-	// KnownHosts are the files to verify the server's host key against,
-	// in the format ssh(1) uses. One of KnownHosts or HostKeyCallback is
+	// KnownHosts are the files to verify the server's host key against, in the
+	// format ssh(1) uses. One of KnownHosts, HostKeys or HostKeyCallback is
 	// REQUIRED: there is no mode that accepts any key.
 	KnownHosts []string
+
+	// HostKeys are known_hosts lines supplied directly, for a broker with no
+	// durable filesystem to keep a file on -- a container, a glidein. They are
+	// combined with KnownHosts.
+	//
+	// This is config, not state the broker discovers: there is no
+	// trust-on-first-use anywhere in this package. A carrier hands the whole
+	// tunnel to whatever answers the address, so the first connection is
+	// exactly the one that must already know what it is talking to.
+	HostKeys []string
 	// HostKeyCallback overrides KnownHosts. Tests use it with a pinned key;
 	// production should not need it.
 	HostKeyCallback ssh.HostKeyCallback
@@ -419,12 +430,24 @@ func (cfg Config) hostKeyCallback() (ssh.HostKeyCallback, error) {
 	if cfg.HostKeyCallback != nil {
 		return cfg.HostKeyCallback, nil
 	}
-	if len(cfg.KnownHosts) == 0 {
+	if len(cfg.KnownHosts) == 0 && len(cfg.HostKeys) == 0 {
 		return nil, fmt.Errorf("sshcarrier: no known_hosts configured; the carrier will not accept an unverified host key")
 	}
-	cb, err := knownhosts.New(cfg.KnownHosts...)
+	files := cfg.KnownHosts
+	if len(cfg.HostKeys) > 0 {
+		// knownhosts only reads files, so inline lines are written to one for
+		// the life of the process. It is 0600 in a temporary directory: the
+		// content is public key material, but a file an attacker could rewrite
+		// would be a way to re-point the trust anchor.
+		f, err := writeInlineHostKeys(cfg.HostKeys)
+		if err != nil {
+			return nil, err
+		}
+		files = append(append([]string{}, files...), f)
+	}
+	cb, err := knownhosts.New(files...)
 	if err != nil {
-		return nil, fmt.Errorf("sshcarrier: reading known_hosts %v: %w", cfg.KnownHosts, err)
+		return nil, fmt.Errorf("sshcarrier: reading known_hosts %v: %w", files, err)
 	}
 	return cb, nil
 }
@@ -457,6 +480,24 @@ func (cfg Config) authMethods() ([]ssh.AuthMethod, error) {
 		return nil, fmt.Errorf("sshcarrier: no credentials configured (no agent, no identity files, no operator prompter)")
 	}
 	return auths, nil
+}
+
+// writeInlineHostKeys materialises configured known_hosts lines as a file,
+// because x/crypto/ssh/knownhosts parses only files. The file lives for the
+// life of the process; the operator's copy of record stays in the
+// configuration, where their config management can push it to a fleet in one
+// change.
+func writeInlineHostKeys(lines []string) (string, error) {
+	dir, err := os.MkdirTemp("", "htc-ccb-known-hosts")
+	if err != nil {
+		return "", fmt.Errorf("sshcarrier: staging inline host keys: %w", err)
+	}
+	path := filepath.Join(dir, "known_hosts")
+	body := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		return "", fmt.Errorf("sshcarrier: writing inline host keys: %w", err)
+	}
+	return path, nil
 }
 
 func normalizeAddr(addr string) (string, error) {

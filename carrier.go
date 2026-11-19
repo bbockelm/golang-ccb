@@ -275,6 +275,7 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 		Addr:          c.ref.addr,
 		User:          c.ref.user,
 		KnownHosts:    cfg.CarrierSSH.KnownHosts,
+		HostKeys:      cfg.CarrierSSH.HostKeys,
 		IdentityFiles: cfg.CarrierSSH.IdentityFiles,
 		Agent:         cfg.CarrierSSH.Agent,
 		Command:       cfg.CarrierSSH.Command,
@@ -285,8 +286,8 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 	}
 	// A carrier that cannot verify the host it is handing the tunnel to is not
 	// a carrier worth having, so this is refused rather than defaulted.
-	if len(sc.KnownHosts) == 0 {
-		return sshcarrier.Config{}, nil, fmt.Errorf("ccbserver: an ssh:// carrier requires CCB_CARRIER_SSH_KNOWN_HOSTS")
+	if len(sc.KnownHosts) == 0 && len(sc.HostKeys) == 0 {
+		return sshcarrier.Config{}, nil, fmt.Errorf("ccbserver: an ssh:// carrier requires CCB_CARRIER_SSH_KNOWN_HOSTS or CCB_CARRIER_SSH_HOST_KEY")
 	}
 	if cfg.CarrierSSH.StageBinary == "" {
 		if sc.Command == "" {
