@@ -100,7 +100,7 @@ func stagingClient(t *testing.T, h *fakeHost) *ssh.Client {
 	defer cancel()
 	client, err := dialClient(ctx, s.addr, &ssh.ClientConfig{
 		User: "tester", Auth: auths, HostKeyCallback: hostKey, Timeout: 20 * time.Second,
-	})
+	}, nil, "")
 	if err != nil {
 		t.Fatalf("dialClient: %v", err)
 	}

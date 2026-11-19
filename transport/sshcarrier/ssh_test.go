@@ -238,3 +238,105 @@ func knownHostsLine(t *testing.T, addr string, key ssh.PublicKey) string {
 	}
 	return knownhosts.Line([]string{knownhosts.Normalize(net.JoinHostPort(host, port))}, key)
 }
+
+// A refusal has to tell the operator what to do next, and must not tell them
+// to ask the host itself: ssh-keyscan trusts whatever answered, which is the
+// exact thing the refusal exists to prevent. The broker already saw the key
+// during the failed handshake, so it can show the fingerprint to check and
+// the line to add once it checks out.
+func TestUnknownHostKeyErrorExplainsWhatToDo(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+
+	known := t.TempDir() + "/known_hosts"
+	if err := os.WriteFile(known, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := s.config("htc-ccb -carrier-stdio")
+	cfg.HostKeyCallback = nil
+	cfg.KnownHosts = []string{known}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := Dial(ctx, cfg)
+	if err == nil {
+		t.Fatal("an unknown host key was accepted")
+	}
+	var hke *HostKeyError
+	if !errors.As(err, &hke) {
+		t.Fatalf("error %v is not a *HostKeyError", err)
+	}
+	if hke.Offered == nil {
+		t.Fatal("the error does not carry the key the server offered, so it cannot name a fingerprint")
+	}
+
+	msg := err.Error()
+	// The fingerprint of the key actually seen, to check out of band.
+	if want := ssh.FingerprintSHA256(s.hostKey); !strings.Contains(msg, want) {
+		t.Errorf("message does not carry the offered fingerprint %q:\n%s", want, msg)
+	}
+	// The file to put it in.
+	if !strings.Contains(msg, known) {
+		t.Errorf("message does not name the known_hosts file:\n%s", msg)
+	}
+	// A line that actually parses as known_hosts, not prose about one.
+	line := extractKnownHostsLine(t, msg, s.addr)
+	if line == "" {
+		t.Fatalf("message contains no usable known_hosts line:\n%s", msg)
+	}
+	tmp := t.TempDir() + "/from_message"
+	if err := os.WriteFile(tmp, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The real test of the advice: following it works.
+	retry := s.config("htc-ccb -carrier-stdio")
+	retry.HostKeyCallback = nil
+	retry.KnownHosts = []string{tmp}
+	c := dialTest(t, retry)
+	if _, err := c.Write([]byte("up")); err != nil {
+		t.Fatalf("after following the advice, the carrier still failed: %v", err)
+	}
+}
+
+// It must not send an operator to ssh-keyscan, which would trust whatever
+// answered.
+func TestUnknownHostKeyAdviceDoesNotRecommendTrustingTheHost(t *testing.T) {
+	hke := &HostKeyError{Addr: "h:22", Err: errors.New("x")}
+	s := newTestSSHServer(t, echo)
+	hke.Offered = s.hostKey
+	help := hke.Help()
+	if !strings.Contains(help, "ssh-keyscan") {
+		t.Fatal("the advice does not mention ssh-keyscan at all; it should name it to warn against it")
+	}
+	if !strings.Contains(help, "would trust whatever answered") {
+		t.Errorf("the advice mentions ssh-keyscan without the warning:\n%s", help)
+	}
+}
+
+// A changed key is the serious case and must not read as "update the entry".
+func TestChangedHostKeyAdviceIsSterner(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+	hke := &HostKeyError{Addr: "h:22", Err: errors.New("x"), Changed: true, Offered: s.hostKey}
+	help := hke.Help()
+	for _, want := range []string{"NOT the key on record", "Do not simply replace", "out of band"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("the changed-key advice is missing %q:\n%s", want, help)
+		}
+	}
+}
+
+// extractKnownHostsLine pulls the suggested line out of the message.
+func extractKnownHostsLine(t *testing.T, msg, addr string) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := knownhosts.Normalize(net.JoinHostPort(host, port))
+	for _, line := range strings.Split(msg, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix+" ") {
+			return line
+		}
+	}
+	return ""
+}
