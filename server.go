@@ -222,6 +222,15 @@ type Config struct {
 	// config CCB_CARRIER_COMMAND_GRACE.
 	CarrierCommandGrace time.Duration
 
+	// CarrierSSH configures an ssh:// carrier: the broker opens the SSH
+	// session itself rather than running the system ssh. Mirrors the
+	// CCB_CARRIER_SSH_* knobs.
+	CarrierSSH SSHCarrierConfig
+
+	// OperatorWait is how long an attached administrator waits for the broker
+	// to reach the point of asking something. 0 uses DefaultOperatorWait.
+	OperatorWait time.Duration
+
 	// CarrierPipe, if set, is an already-established byte pipe to use for a
 	// "stdio:" carrier instead of claiming this process's descriptors here. The
 	// daemon claims them before it starts logging, because a single line
@@ -246,6 +255,36 @@ type Config struct {
 
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
+}
+
+// SSHCarrierConfig configures an ssh:// carrier.
+//
+// There is deliberately no way to skip host-key verification: a carrier that
+// cannot verify the host it hands the tunnel to would give it to whoever
+// answered on that address.
+type SSHCarrierConfig struct {
+	// User is the login name when the address does not carry one.
+	User string
+	// KnownHosts are the files to verify the server's host key against.
+	// Required.
+	KnownHosts []string
+	// IdentityFiles are private keys to offer, in order.
+	IdentityFiles []string
+	// Agent consults SSH_AUTH_SOCK.
+	Agent bool
+
+	// StageBinary is a local htc-ccb to put on the far host if it is not
+	// already there, after which the carrier runs the staged copy. This is the
+	// zero-touch install: with it, a cluster needs nothing in advance.
+	StageBinary string
+	// RemoteDir is where a staged binary goes; empty uses the package default
+	// under the login account.
+	RemoteDir string
+
+	// Command overrides what runs on the far host. With StageBinary set it is
+	// derived from where the binary landed, which is what an operator usually
+	// wants; this is for a site that installs the binary its own way.
+	Command string
 }
 
 // UpstreamConfig configures an inside CCB's registration with its upstream
@@ -295,6 +334,10 @@ type Server struct {
 	// outside CCB (see carrier.go); its dial hook backs both the upstream
 	// registration and the outbound next-hop forwarding.
 	carrier *carrierClient
+
+	// console rendezvouses a carrier that needs a person with an administrator
+	// who has attached to finish the login.
+	console *operatorConsole
 
 	// carrierExhausted is closed when this broker's carrier can never be
 	// re-established -- a stdio carrier whose parent has gone away. The daemon
@@ -367,12 +410,16 @@ func New(cfg Config) (*Server, error) {
 		requests:         map[uint64]*request{},
 		proxies:          map[string]*proxySession{},
 		carrierExhausted: make(chan struct{}),
+		console:          newOperatorConsole(),
 	}
 	// Detect a non-TCP carrier on the inside-CCB knobs (a shared pipe to the
 	// outside CCB backing both upstream registration and outbound forwarding).
 	cc, err := s.detectCarrier()
 	if err != nil {
 		return nil, err
+	}
+	if cc != nil {
+		cc.prompter = s.console
 	}
 	s.carrier = cc
 	if cc != nil {
@@ -456,6 +503,13 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 	// with its derived tunnel address (Model 2 off-host CCB orchestration).
 	if s.cfg.Upstream != nil {
 		cs.Handle(ccb.CommandGetTunnelAddress, s.handleGetTunnelAddress, "DAEMON")
+	}
+	// The operator console. ADMINISTRATOR only: whoever holds it can answer a
+	// password prompt from a host this broker logs into, which is as privileged
+	// as the carrier's own credentials. Registered only when a carrier could
+	// ever ask, so an ordinary broker does not carry the surface.
+	if s.carrier != nil && s.carrier.canAskAnOperator() {
+		cs.Handle(CommandFinishLogin, s.handleFinishLogin, "ADMINISTRATOR")
 	}
 }
 
