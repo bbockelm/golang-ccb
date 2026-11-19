@@ -707,11 +707,27 @@ func (cfg Config) authMethods() ([]ssh.AuthMethod, error) {
 	if len(cfg.authOverride) > 0 {
 		return cfg.authOverride, nil
 	}
-	var auths []ssh.AuthMethod
+	// Every key -- agent and file alike -- goes into ONE publickey method.
+	//
+	// x/crypto/ssh tries each method *name* at most once: given two
+	// ssh.AuthMethods that both report "publickey", the second is silently
+	// skipped. A method per identity file therefore offers only the first key,
+	// and an agent alongside identity files offers only the agent's, so a host
+	// that wants any other key fails with "no supported methods remain" and
+	// the reason is invisible. Collecting them into a single callback offers
+	// them all in turn, which is what ssh(1) does with several IdentityFile
+	// lines and an agent.
+	var signers []ssh.Signer
 	if cfg.Agent {
 		if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 			if c, err := net.Dial("unix", sock); err == nil {
-				auths = append(auths, ssh.PublicKeysCallback(agent.NewClient(c).Signers))
+				agentSigners, err := agent.NewClient(c).Signers()
+				if err != nil && cfg.Logger != nil {
+					cfg.Logger.Warn("ssh agent offered no keys", "error", err)
+				}
+				signers = append(signers, agentSigners...)
+			} else if cfg.Logger != nil {
+				cfg.Logger.Warn("ssh agent unreachable", "socket", sock, "error", err)
 			}
 		}
 	}
@@ -724,7 +740,11 @@ func (cfg Config) authMethods() ([]ssh.AuthMethod, error) {
 		if err != nil {
 			return nil, fmt.Errorf("sshcarrier: parsing identity %s: %w", path, err)
 		}
-		auths = append(auths, ssh.PublicKeys(signer))
+		signers = append(signers, signer)
+	}
+	var auths []ssh.AuthMethod
+	if len(signers) > 0 {
+		auths = append(auths, ssh.PublicKeys(signers...))
 	}
 	if len(auths) == 0 && cfg.Prompter == nil {
 		return nil, fmt.Errorf("sshcarrier: no credentials configured (no agent, no identity files, no operator prompter)")

@@ -138,9 +138,10 @@ func TestOnlyAnSSHCarrierCanAskAnOperator(t *testing.T) {
 		{"tcp", false},
 		{"stdio", false},
 	} {
-		c := &carrierClient{ref: carrierRef{scheme: tc.scheme}}
-		if got := c.canAskAnOperator(); got != tc.want {
-			t.Errorf("scheme %q: canAskAnOperator() = %v, want %v", tc.scheme, got, tc.want)
+		// Via the inside knob.
+		s := &Server{carrier: &carrierClient{ref: carrierRef{scheme: tc.scheme}}}
+		if got := s.canAskAnOperator(); got != tc.want {
+			t.Errorf("scheme %q on the inside knob: canAskAnOperator() = %v, want %v", tc.scheme, got, tc.want)
 		}
 	}
 }
@@ -189,4 +190,55 @@ func TestAParkedCarrierDoesNotDial(t *testing.T) {
 
 func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0o600)
+}
+
+// An outside broker reaching into a cluster over ssh:// meets the same
+// two-factor prompt as an inside broker reaching out, and its carrier is
+// built by the listener rather than by detectCarrier -- so the console has to
+// be offered for that role too.
+func TestConsoleIsOfferedForAnOutsideSSHCarrier(t *testing.T) {
+	s := &Server{cfg: Config{CarrierListen: "ssh://login.cluster.edu"}}
+	if !s.canAskAnOperator() {
+		t.Error("an outside ssh:// carrier does not offer the console; a login needing a person could never be finished")
+	}
+	plain := &Server{cfg: Config{CarrierListen: "tcp://127.0.0.1:9700"}}
+	if plain.canAskAnOperator() {
+		t.Error("a tcp:// listener offers the console")
+	}
+}
+
+// The gate must exist before anything dials. It lives on the Server because
+// both roles need it and only one of them builds a carrierClient through
+// detectCarrier; a nil gate here was a panic in the outside role.
+func TestEveryCarrierRoleHasAGate(t *testing.T) {
+	kh := t.TempDir() + "/known_hosts"
+	if err := writeFile(kh, ""); err != nil {
+		t.Fatal(err)
+	}
+	sc := SSHCarrierConfig{KnownHosts: []string{kh}, StageBinary: "/nonexistent/htc-ccb"}
+
+	inside, err := New(Config{
+		PublicAddress: "127.0.0.1:9618", Security: plaintextSec(),
+		OutboundNextHop: "ssh://h", OutboundNextHopSecurity: plaintextSec(), CarrierSSH: sc,
+	})
+	if err != nil {
+		t.Fatalf("inside role: %v", err)
+	}
+	if inside.gate == nil || inside.carrier == nil || inside.carrier.gate == nil {
+		t.Error("the inside role has no gate")
+	}
+	if inside.carrier.gate != inside.gate {
+		t.Error("the carrier does not share the broker's gate, so the console would release the wrong one")
+	}
+
+	outside, err := New(Config{
+		PublicAddress: "127.0.0.1:9618", Security: plaintextSec(),
+		CarrierListen: "ssh://h", CarrierSSH: sc,
+	})
+	if err != nil {
+		t.Fatalf("outside role: %v", err)
+	}
+	if outside.gate == nil {
+		t.Error("the outside role has no gate")
+	}
 }
