@@ -190,29 +190,58 @@ ownership check fails the second.
 
 #### What "ordinary client" means, precisely
 
-A **Go** client needs no change: `dialOne` already recurses on a nested
-contact. A **C++** client does need one, and it is the pre-existing Stage D
-requirement from `CCB_TUNNELING_DESIGN.md` 4.6-4.7, not something this model
-adds:
+A **Go** client needs no change: `dialOne` recurses on a nested contact.
 
-- `CCBClient::SplitCCBContact` must split on the **last** `#`, not `strchr`'s
-  first, so it can follow a nested contact at all;
-- `CCBServer::CCBIDFromString` must parse strictly, so an un-upgraded client
-  fails cleanly instead of misrouting. Today's lenient `sscanf("%lu")` stops at
-  `#` and yields the first id.
+A **C++ v26 client does not work unmodified**, and the reason is not the one
+`CCB_TUNNELING_DESIGN.md` 4.7 anticipated. Both changes that section called for
+have already landed in v26:
 
-An un-upgraded C++ client given `<public>#P#T` splits on the first `#` and asks
-for CCBID `"P#T"`. The Go broker already parses strictly and refuses with
-`bad target CCBID "P#T"` -- pinned by
-`TestOldClientMisparseOfACarrierContactFailsCleanly`. With the lenient parse it
-would instead be routed to registrant `P`, which under this model is a carrier
-id rather than a target, so there is nothing there to reach.
+- `CCBServer::CCBIDFromString` parses strictly, rejecting `"42#17"` outright
+  (`ccb_server.cpp:112`);
+- `CCBClient::SplitCCBContact` takes a `peel_innermost` flag and splits on the
+  last or first `#` as the caller needs (`ccb_client.cpp:1171`), and
+  `establishStreamingPipe` peels a whole id chain into `ccbid` + route
+  (`ccb_client.cpp:199`).
 
-No wire format avoids this. Reaching a target that cannot dial out requires the
-client to stop expecting to be dialed, and that is client-side behaviour: it
-cannot be signalled to a client that does not implement it. The contact shape
-only decides whether an upgraded client gets it right and an old one fails
-cleanly.
+The parsing half is done. What is missing is the **trigger**. v26 chooses
+streaming from a property of the *client*, never from the shape of the contact.
+Both gate sites ask the same question:
+
+```cpp
+// ccb_client.cpp:884 (blocking) and :1391 (non-blocking)
+Sinful sinful_return( daemonCore->publicNetworkIpAddr() );
+if( sinful_return.getCCBContact() ) {       // am I behind a CCB?
+    ... ProxyConnect ...
+}
+```
+
+and `streamingReturnAddr` says so outright: *"Streaming/proxy mode only applies
+when this client is itself behind a CCB."* The third call site
+(`ccb_client.cpp:977`) is the same kind of test -- `TOOLS_ASSUME_FIREWALLS` for
+a tool that cannot open a listen socket.
+
+So a v26 client reaches a carrier-attached target only when it is *itself*
+unable to accept a reverse connection. A publicly reachable client -- a schedd
+with a real address, the common case -- takes the plain reverse-connect path and
+offers an address the target cannot dial.
+
+**This is a pre-existing gap in C++ Stage D, not one this model introduces.**
+The same public client reaching a tunneled EP through a nested contact hits the
+same wall. The fix mirrors Go's `dialOne`: stream when the contact is nested,
+whatever the client's own reachability. A few lines at the two gate sites.
+
+An un-upgraded client fails cleanly either way. Peeling innermost it gets broker
+`<public>#P` and ccbid `T`, and `<public>#P` is not a dialable address, so it
+never reaches a broker to misroute at. A client that split the other way asks
+for CCBID `"P#T"`, which the Go broker refuses --
+`TestOldClientMisparseOfACarrierContactFailsCleanly` pins that, and v26's own
+strict parse does the same.
+
+No wire format avoids the trigger problem. Reaching a target that cannot dial
+out requires the client to stop expecting to be dialed, and that is client-side
+behaviour: it cannot be signalled to a client that does not implement it. The
+contact shape only decides whether a client that *can* stream knows that it
+should.
 
 ## 4. Determining the internal address (SUPERSEDED by §3.2; kept for the record)
 
@@ -256,8 +285,9 @@ carrier-attached target with no knowledge of any of this (§3.3).
 Open design questions: none. What remains is engineering:
 
 - land the cedar half of §3.2 (six lines) so the EP needs no carrier hook;
-- the two C++ changes in `CCB_TUNNELING_DESIGN.md` 4.7, if C++ clients are to
-  reach carrier-attached targets (already required for Stage D);
+- the C++ streaming trigger (§3.3): v26 streams only when the client is itself
+  behind a CCB, so a public client cannot reach a carrier-attached target. Needed
+  for Stage D regardless of this model;
 - drive `ServeCarrier` from a real carrier's yamux listener rather than a TCP
   one, and tie carrier lifetime to the pipe;
 - build the helper itself -- a listener, a yamux client, and `io.Copy`;
