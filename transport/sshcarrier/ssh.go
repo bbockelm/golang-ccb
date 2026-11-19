@@ -149,13 +149,13 @@ func (e *HostKeyError) Help() string {
 			"The server offered %s %s.\n"+
 				"%sVerify that fingerprint against a source you trust, then set this line as\n"+
 				"CCB_CARRIER_SSH_HOST_KEY:\n\n  %s\n%s",
-			e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), line, keyscanNote)
+			e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), line, e.keyscanNote())
 	}
 	return fmt.Sprintf(
 		"The server offered %s %s.\n"+
 			"%sVerify that fingerprint against a source you trust, then add this line to %s\n"+
 			"(or set it as CCB_CARRIER_SSH_HOST_KEY):\n\n  %s\n%s",
-		e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), where, line, keyscanNote)
+		e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), where, line, e.keyscanNote())
 }
 
 // preamble says what kind of situation this is, for the case where it is not
@@ -171,10 +171,24 @@ func (e *HostKeyError) preamble() string {
 		"worth the trouble.\n"
 }
 
-// keyscanNote is factual: ssh-keyscan is the usual way to obtain the line, and
-// what it does and does not establish is worth stating once.
-const keyscanNote = "\nssh-keyscan prints the same line. It reads the key from the host, so it shows\n" +
-	"what is answering that address rather than confirming which host that is.\n"
+// keyscanNote gives the command that produces the same line, and says what it
+// establishes. An operator who wants to generate the line themselves -- on
+// another machine, or to compare -- should not have to work out the flags.
+func (e *HostKeyError) keyscanNote() string {
+	host, port, err := net.SplitHostPort(e.Addr)
+	if err != nil {
+		host, port = e.Addr, DefaultPort
+	}
+	cmd := "ssh-keyscan -t " + e.Offered.Type()
+	if port != DefaultPort {
+		cmd += " -p " + port
+	}
+	cmd += " " + host
+	return fmt.Sprintf(
+		"\nTo produce the same line yourself:\n\n  %s\n\n"+
+			"It reads the key from the host, so it shows what is answering that address\n"+
+			"rather than confirming which host that is.\n", cmd)
+}
 
 func (e *HostKeyError) Unwrap() error { return e.Err }
 

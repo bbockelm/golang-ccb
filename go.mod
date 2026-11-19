@@ -9,6 +9,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 )
 
 require (
@@ -42,5 +43,5 @@ require (
 	github.com/bbockelm/golang-htcondor v0.22.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/pkg/errors v0.9.1 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.58.0
 )
