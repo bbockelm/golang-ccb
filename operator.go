@@ -142,9 +142,7 @@ func (s *Server) handleFinishLogin(ctx context.Context, c *cedarserver.Conn) err
 	defer s.console.detach()
 
 	// An operator is here: let anything parked try again.
-	if s.carrier != nil {
-		s.carrier.gate.Release()
-	}
+	s.gate.Release()
 	s.log.Info("an operator attached to finish a login", "remote", c.RemoteAddr, "user", c.AuthorizationUser())
 
 	wait := s.cfg.OperatorWait

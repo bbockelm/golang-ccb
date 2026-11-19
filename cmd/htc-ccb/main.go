@@ -115,6 +115,23 @@ func run() error {
 	// handshake diagnostics land in CcbLog rather than a discarded stderr.
 	slog.SetDefault(d.Slog())
 
+	// CCB_LISTEN / CCB_PUBLIC stand in for -listen / -public when the flag was
+	// not given. A staged broker needs them: the SSH carrier starts the remote
+	// process with `env -i` and a configuration file of our choosing, and that
+	// file is the only channel to it -- there is no command line to edit on a
+	// host we do not install on. The default :9618 is also the one port a
+	// login node most likely already has in use, so a staged broker that
+	// cannot be told otherwise fails to start with EADDRINUSE.
+	if !listenExplicit {
+		if v := configString(cfg, "CCB_LISTEN", ""); v != "" {
+			*listen = v
+			listenExplicit = true
+		}
+	}
+	if *public == "" {
+		*public = configString(cfg, "CCB_PUBLIC", "")
+	}
+
 	// Session-cache persistence: open the store *after* New so its database file
 	// is condor-owned (not root-owned), then restore + arrange snapshots. The
 	// signing keys it reads are root-owned and loaded as root via droppriv.
@@ -938,16 +955,17 @@ func carrierCommandEnv(cfg *config.Config) []string {
 // push one change to a fleet.
 func sshCarrierSettings(cfg *config.Config) ccbserver.SSHCarrierConfig {
 	return ccbserver.SSHCarrierConfig{
-		User:          configString(cfg, "CCB_CARRIER_SSH_USER", ""),
-		KnownHosts:    configList(cfg, "CCB_CARRIER_SSH_KNOWN_HOSTS"),
-		HostKeys:      configList(cfg, "CCB_CARRIER_SSH_HOST_KEY"),
-		IdentityFiles: configList(cfg, "CCB_CARRIER_SSH_IDENTITY"),
-		Agent:         configBool(cfg, "CCB_CARRIER_SSH_AGENT", false),
-		ProxyJump:     configList(cfg, "CCB_CARRIER_SSH_PROXY_JUMP"),
-		StageBinary:   configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
-		RemoteDir:     configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
-		StageConfig:   configString(cfg, "CCB_CARRIER_SSH_STAGE_CONFIG", ""),
-		Command:       configString(cfg, "CCB_CARRIER_SSH_COMMAND", ""),
+		User:           configString(cfg, "CCB_CARRIER_SSH_USER", ""),
+		KnownHosts:     configList(cfg, "CCB_CARRIER_SSH_KNOWN_HOSTS"),
+		HostKeys:       configList(cfg, "CCB_CARRIER_SSH_HOST_KEY"),
+		IdentityFiles:  configList(cfg, "CCB_CARRIER_SSH_IDENTITY"),
+		Agent:          configBool(cfg, "CCB_CARRIER_SSH_AGENT", false),
+		ProxyJump:      configList(cfg, "CCB_CARRIER_SSH_PROXY_JUMP"),
+		StageBinary:    configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
+		StageBinaryDir: configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY_DIR", ""),
+		RemoteDir:      configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
+		StageConfig:    configString(cfg, "CCB_CARRIER_SSH_STAGE_CONFIG", ""),
+		Command:        configString(cfg, "CCB_CARRIER_SSH_COMMAND", ""),
 	}
 }
 

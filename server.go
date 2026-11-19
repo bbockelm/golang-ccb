@@ -27,6 +27,8 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
+
+	"github.com/bbockelm/golang-ccb/transport/carrier"
 )
 
 // Config configures a CCB Server.
@@ -277,6 +279,14 @@ type SSHCarrierConfig struct {
 	// already there, after which the carrier runs the staged copy. This is the
 	// zero-touch install: with it, a cluster needs nothing in advance.
 	StageBinary string
+	// StageBinaryDir is a directory of per-platform builds named
+	// htc-ccb-<os>-<arch>. Used when StageBinary is empty, so one broker can
+	// stage onto an amd64 login node and an arm64 one from one configuration.
+	//
+	// With neither set, a build compiled into this binary is staged if there
+	// is one for the far host's platform. Only an htc-ccb built with the
+	// `embedremote` tag carries any; an ordinary one does not, and says so.
+	StageBinaryDir string
 	// RemoteDir is where a staged binary goes; empty uses the package default
 	// under the login account.
 	RemoteDir string
@@ -346,6 +356,12 @@ type Server struct {
 	// who has attached to finish the login.
 	console *operatorConsole
 
+	// gate holds carrier attempts that failed for a reason only a person can
+	// clear. It lives here rather than on the carrier client because a broker
+	// has one carrier but may reach it in either role, and the console has to
+	// release whichever one exists.
+	gate *carrier.HumanGate
+
 	// carrierExhausted is closed when this broker's carrier can never be
 	// re-established -- a stdio carrier whose parent has gone away. The daemon
 	// watches it and shuts down, because nothing can reach this broker again.
@@ -412,6 +428,7 @@ func New(cfg Config) (*Server, error) {
 		proxies:          map[string]*proxySession{},
 		carrierExhausted: make(chan struct{}),
 		console:          newOperatorConsole(),
+		gate:             &carrier.HumanGate{},
 	}
 	// Detect a non-TCP carrier on the inside-CCB knobs (a shared pipe to the
 	// outside CCB backing both upstream registration and outbound forwarding).
@@ -509,7 +526,7 @@ func (s *Server) RegisterOn(cs *cedarserver.Server) {
 	// password prompt from a host this broker logs into, which is as privileged
 	// as the carrier's own credentials. Registered only when a carrier could
 	// ever ask, so an ordinary broker does not carry the surface.
-	if s.carrier != nil && s.carrier.canAskAnOperator() {
+	if s.canAskAnOperator() {
 		cs.Handle(CommandFinishLogin, s.handleFinishLogin, "ADMINISTRATOR")
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 	"github.com/bbockelm/golang-ccb/transport/fstun"
 	"github.com/bbockelm/golang-ccb/transport/sshcarrier"
+	"github.com/bbockelm/golang-ccb/transport/sshcarrier/remotebin"
 	"github.com/bbockelm/golang-ccb/transport/tcpcarrier"
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
@@ -142,8 +143,8 @@ type carrierClient struct {
 	proxy           func(*http.Request) (*url.URL, error)
 	keepalive       time.Duration
 
-	// gate holds this carrier's attempts when a login needs a person. The
-	// operator console releases it; see operator.go.
+	// gate is the broker's; see Server.gate. Never nil -- every construction
+	// site passes one, and the dial closure dereferences it.
 	gate *carrier.HumanGate
 
 	// exhausted is closed when the pipe source can never produce another pipe,
@@ -158,7 +159,7 @@ type carrierClient struct {
 	done     bool
 }
 
-func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) (*carrierClient, error) {
+func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger, gate *carrier.HumanGate) (*carrierClient, error) {
 	c := &carrierClient{
 		ref:             ref,
 		log:             log,
@@ -169,7 +170,7 @@ func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) (*carrierCli
 		proxy:           cfg.CarrierProxy,
 		keepalive:       cfg.CarrierKeepalive,
 		exhausted:       make(chan struct{}),
-		gate:            &carrier.HumanGate{},
+		gate:            gate,
 	}
 	src, err := c.pipeSource(cfg)
 	if err != nil {
@@ -290,14 +291,23 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 	if len(sc.KnownHosts) == 0 && len(sc.HostKeys) == 0 {
 		return sshcarrier.Config{}, nil, fmt.Errorf("ccbserver: an ssh:// carrier requires CCB_CARRIER_SSH_KNOWN_HOSTS or CCB_CARRIER_SSH_HOST_KEY")
 	}
-	if cfg.CarrierSSH.StageBinary == "" {
-		if sc.Command == "" {
-			return sshcarrier.Config{}, nil, fmt.Errorf("ccbserver: an ssh:// carrier needs either CCB_CARRIER_SSH_STAGE_BINARY or CCB_CARRIER_SSH_COMMAND")
-		}
+	// An explicit command means the far host already has a broker and the
+	// operator has said how to run it; nothing is staged.
+	if sc.Command != "" && cfg.CarrierSSH.StageBinary == "" && cfg.CarrierSSH.StageBinaryDir == "" {
 		return sc, nil, nil
+	}
+	// Otherwise stage. With neither a file nor a directory named, the only
+	// source left is a build compiled into this one -- which an ordinary
+	// htc-ccb does not carry. That is knowable now, so say so now rather than
+	// on the first dial. Which *platforms* are carried is not knowable until
+	// the far host says what it is, so that case is left to staging.
+	if cfg.CarrierSSH.StageBinary == "" && cfg.CarrierSSH.StageBinaryDir == "" && !remotebin.Any() {
+		return sshcarrier.Config{}, nil, fmt.Errorf(
+			"ccbserver: an ssh:// carrier needs CCB_CARRIER_SSH_STAGE_BINARY, CCB_CARRIER_SSH_STAGE_BINARY_DIR or CCB_CARRIER_SSH_COMMAND (this htc-ccb carries no built-in builds to stage; one built with -tags embedremote does)")
 	}
 	return sc, &sshcarrier.StageConfig{
 		Binary:       cfg.CarrierSSH.StageBinary,
+		BinaryDir:    cfg.CarrierSSH.StageBinaryDir,
 		RemoteDir:    cfg.CarrierSSH.RemoteDir,
 		CondorConfig: cfg.CarrierSSH.StageConfig,
 		Logger:       c.log,
@@ -335,10 +345,22 @@ func (c *carrierClient) route() string {
 
 func (c *carrierClient) describe() string { return c.ref.describe() }
 
-// canAskAnOperator reports whether this carrier has any way to put a question
-// to a person. Only the embedded SSH carrier does: a cmd: carrier's ssh talks
-// to its own terminal, which the broker does not have.
-func (c *carrierClient) canAskAnOperator() bool { return c.ref.scheme == "ssh" }
+// canAskAnOperator reports whether any configured carrier has a way to put a
+// question to a person. Only the embedded SSH carrier does: a cmd: carrier's
+// ssh talks to its own terminal, which the broker does not have.
+//
+// Both roles count. An outside broker reaching into a cluster over ssh:// hits
+// the same two-factor prompt as an inside broker reaching out, and its carrier
+// is built by the listener rather than by detectCarrier.
+func (s *Server) canAskAnOperator() bool {
+	if s.carrier != nil && s.carrier.ref.scheme == "ssh" {
+		return true
+	}
+	if r, ok := parseCarrierRef(s.cfg.CarrierListen); ok && r.scheme == "ssh" {
+		return true
+	}
+	return false
+}
 
 // Exhausted is closed when this broker's carrier can never be re-established.
 // Only a stdio carrier can reach that state: its pipe came from the process
@@ -474,7 +496,7 @@ func (s *Server) detectCarrier() (*carrierClient, error) {
 			return nil, fmt.Errorf("ccbserver: stdio: is configured as both this broker's carrier to its outside CCB and its CarrierListen; one inherited pipe cannot carry both roles")
 		}
 	}
-	return newCarrierClient(refs[0], s.cfg, s.log)
+	return newCarrierClient(refs[0], s.cfg, s.log, s.gate)
 }
 
 // startCarrierListener runs an outside CCB's acceptor for inside CCBs arriving
@@ -558,7 +580,7 @@ func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
 func (s *Server) spawningCarrierListener(ref carrierRef) (net.Listener, error) {
 	// A carrierClient is the one place that knows how to build a pipe source
 	// from a ref; the outside role needs the source, not the client.
-	c := &carrierClient{ref: ref, log: s.log, exhausted: make(chan struct{})}
+	c := &carrierClient{ref: ref, log: s.log, exhausted: make(chan struct{}), gate: s.gate, prompter: s.console}
 	src, err := c.pipeSource(s.cfg)
 	if err != nil {
 		return nil, err
@@ -569,7 +591,10 @@ func (s *Server) spawningCarrierListener(ref carrierRef) (net.Listener, error) {
 	ln := carrier.NewSourceListener(src, s.log, carrier.Backoff{
 		Initial: s.cfg.CarrierRetryInitial,
 		Max:     s.cfg.CarrierRetryMax,
-	}, carrier.OnePipeAtATime())
+	}, carrier.OnePipeAtATime(),
+		// Without this the loop would retry a login that needs a person on the
+		// ordinary backoff, which is what the gate exists to prevent.
+		carrier.WithNeedsHuman(s.gate, sshcarrier.NeedsHuman))
 	return &exhaustNotifier{Listener: ln, notify: s.markCarrierExhausted}, nil
 }
 
