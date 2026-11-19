@@ -36,6 +36,15 @@ type Config struct {
 	// ("<PublicAddress>#<id>") and as the proxy rendezvous address. Required.
 	PublicAddress string
 
+	// ReverseConnectAddress, when set, is handed to registered targets as the
+	// rendezvous address instead of PublicAddress, and forces every request for
+	// them onto the streaming path. It is how a broker reached through a splice
+	// helper names an address its targets can actually dial.
+	//
+	// EXPERIMENT: per server, so one broker cannot serve two helpers. See
+	// docs/SPLICE_HELPER.md.
+	ReverseConnectAddress string
+
 	// Security is the server-side security config for CCB sessions. The
 	// session may be encrypted: a relayed connection is spliced as raw sockets
 	// after the broker's reply, so its crypto never reaches the relayed bytes,
@@ -303,6 +312,19 @@ type target struct {
 	stream  *stream.Stream
 	conn    net.Conn
 	writeMu sync.Mutex
+
+	// reverseAddr is the address THIS target must be told to reverse-connect
+	// to, when it is not one that can dial this broker. A target that reached
+	// us through a splice helper can dial only the helper on its own side of
+	// the carrier, so the rendezvous address has to be minted in an address
+	// space this broker does not own. Empty means the ordinary case: the
+	// target can reach us, and proxyAddrSinful applies.
+	//
+	// EXPERIMENT: filled from Config.ReverseConnectAddress, which is per
+	// server. A real deployment serves many helpers from one broker, so this
+	// must come from the carrier the registration arrived on. See
+	// docs/SPLICE_HELPER.md.
+	reverseAddr string
 }
 
 func (t *target) write(ctx context.Context, ad *classad.ClassAd) error {
@@ -606,9 +628,10 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 	}
 
 	t := &target{
-		name:   name,
-		stream: c.Stream,
-		conn:   c.Stream.GetConnection(),
+		name:        name,
+		stream:      c.Stream,
+		conn:        c.Stream.GetConnection(),
+		reverseAddr: s.cfg.ReverseConnectAddress,
 	}
 
 	peerIPStr := ""

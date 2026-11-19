@@ -63,7 +63,10 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 	// for streaming, if the return address is itself CCB-routed, or if there is a
 	// downstream route to follow (a tunnel).
 	returnInfo, _ := addresses.ParseSinful(returnAddr)
-	if streamingRequired || returnInfo.IsCCB() || route != "" {
+	// A target that cannot dial this broker can never serve a standard request:
+	// standard mode tells it to connect to the REQUESTER, which is further away
+	// than we are. Such a target is always proxied.
+	if streamingRequired || returnInfo.IsCCB() || route != "" || t.reverseAddr != "" {
 		rc := routeContext{
 			route: route,
 			// This is the client-facing (entry) broker: stamp the audit trail from
