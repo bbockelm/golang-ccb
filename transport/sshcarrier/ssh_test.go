@@ -297,30 +297,63 @@ func TestUnknownHostKeyErrorExplainsWhatToDo(t *testing.T) {
 	}
 }
 
-// It must not send an operator to ssh-keyscan, which would trust whatever
-// answered.
-func TestUnknownHostKeyAdviceDoesNotRecommendTrustingTheHost(t *testing.T) {
-	hke := &HostKeyError{Addr: "h:22", Err: errors.New("x")}
+// The advice asks for the one step that cannot be automated -- checking the
+// fingerprint against a trusted source -- and says what ssh-keyscan does
+// establish, since it is the first tool most people reach for. It states
+// facts; the decision is the administrator's.
+func TestUnknownHostKeyAdviceIsFactual(t *testing.T) {
 	s := newTestSSHServer(t, echo)
-	hke.Offered = s.hostKey
+	hke := &HostKeyError{Addr: "h:22", Err: errors.New("x"), Offered: s.hostKey}
 	help := hke.Help()
-	if !strings.Contains(help, "ssh-keyscan") {
-		t.Fatal("the advice does not mention ssh-keyscan at all; it should name it to warn against it")
+
+	if !strings.Contains(help, "Verify that fingerprint against a source you trust") {
+		t.Errorf("the advice does not ask for the one manual step:\n%s", help)
 	}
-	if !strings.Contains(help, "would trust whatever answered") {
-		t.Errorf("the advice mentions ssh-keyscan without the warning:\n%s", help)
+	if !strings.Contains(help, "ssh-keyscan") {
+		t.Errorf("the advice does not mention the tool an operator will reach for:\n%s", help)
+	}
+	// It should describe what the tool does, not tell them off for using it.
+	for _, scold := range []string{"would trust whatever answered", "refusal is for", "Do not ", "must not"} {
+		if strings.Contains(help, scold) {
+			t.Errorf("the advice lectures (%q):\n%s", scold, help)
+		}
 	}
 }
 
-// A changed key is the serious case and must not read as "update the entry".
-func TestChangedHostKeyAdviceIsSterner(t *testing.T) {
+// A changed key is a different situation and says so, but still leaves the
+// call to the person who can find out which it is.
+func TestChangedHostKeyAdviceNamesTheAmbiguity(t *testing.T) {
 	s := newTestSSHServer(t, echo)
 	hke := &HostKeyError{Addr: "h:22", Err: errors.New("x"), Changed: true, Offered: s.hostKey}
 	help := hke.Help()
-	for _, want := range []string{"NOT the key on record", "Do not simply replace", "out of band"} {
+	for _, want := range []string{"differs from the key already on record", "look the same from here", "confirming the change with the site"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("the changed-key advice is missing %q:\n%s", want, help)
 		}
+	}
+	if strings.Contains(help, "Do not simply replace") {
+		t.Errorf("the changed-key advice issues an order rather than stating the situation:\n%s", help)
+	}
+}
+
+// With no known_hosts file configured -- an inline-only deployment -- the
+// advice must point at the setting that exists, not a file the operator does
+// not have.
+func TestAdvicePointsAtTheConfiguredPlace(t *testing.T) {
+	s := newTestSSHServer(t, echo)
+
+	withFile := &HostKeyError{Addr: "h:22", Err: errors.New("x"), Offered: s.hostKey, Where: "/etc/condor/ccb/known_hosts"}
+	if !strings.Contains(withFile.Help(), "/etc/condor/ccb/known_hosts") {
+		t.Errorf("the advice does not name the configured file:\n%s", withFile.Help())
+	}
+
+	inlineOnly := &HostKeyError{Addr: "h:22", Err: errors.New("x"), Offered: s.hostKey}
+	help := inlineOnly.Help()
+	if !strings.Contains(help, "CCB_CARRIER_SSH_HOST_KEY") {
+		t.Errorf("the inline-only advice does not name the setting:\n%s", help)
+	}
+	if strings.Contains(help, "known_hosts:") {
+		t.Errorf("the inline-only advice points at a file the operator has not configured:\n%s", help)
 	}
 }
 
