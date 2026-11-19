@@ -128,40 +128,53 @@ func (e *HostKeyError) Error() string {
 	return msg
 }
 
-// Help tells an operator what to do about it.
+// Help gives an operator what they need to make the decision: the fingerprint
+// that was offered, somewhere to put it, and the line to put there.
 //
-// It deliberately does not say "run ssh-keyscan and paste the output".
-// ssh-keyscan trusts whatever answers the address, which is the exact thing
-// this carrier refuses to do -- following that advice would turn a refusal
-// into trust-on-first-use with extra steps. What it gives instead is the
-// fingerprint of the key that was actually offered, to be checked against
-// whatever the site publishes, and the line to add once it checks out.
+// Verifying a fingerprint against a trusted source is the step that cannot be
+// automated, so the message asks for it once and plainly. The note about
+// ssh-keyscan is there because it is the first tool most people reach for and
+// it is worth knowing exactly what it establishes -- not as a reproach for
+// reaching for it.
 func (e *HostKeyError) Help() string {
 	if e.Offered == nil {
 		return ""
 	}
+	line := knownhosts.Line([]string{knownhosts.Normalize(e.Addr)}, e.Offered)
 	where := e.Where
 	if where == "" {
-		where = "the file named by CCB_CARRIER_SSH_KNOWN_HOSTS"
-	}
-	line := knownhosts.Line([]string{knownhosts.Normalize(e.Addr)}, e.Offered)
-
-	if e.Changed {
+		// No file is configured, so the inline setting is the only place the
+		// line can go; pointing at a file they do not have would not help.
 		return fmt.Sprintf(
-			"The server offered %s %s, which is NOT the key on record.\n"+
-				"Do not simply replace the entry: this is what an interposed host looks like.\n"+
-				"Confirm with the site that the key was rotated, out of band, before changing anything.\n"+
-				"If it was, the new line is:\n\n  %s\n",
-			e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), line)
+			"The server offered %s %s.\n"+
+				"%sVerify that fingerprint against a source you trust, then set this line as\n"+
+				"CCB_CARRIER_SSH_HOST_KEY:\n\n  %s\n%s",
+			e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), line, keyscanNote)
 	}
 	return fmt.Sprintf(
 		"The server offered %s %s.\n"+
-			"Check that fingerprint against what the site publishes -- asking the host itself\n"+
-			"(ssh-keyscan) would trust whatever answered, which is what this refusal is for.\n"+
-			"Once it matches, add to %s:\n\n  %s\n"+
-			"or set the same line as CCB_CARRIER_SSH_HOST_KEY.\n",
-		e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), where, line)
+			"%sVerify that fingerprint against a source you trust, then add this line to %s\n"+
+			"(or set it as CCB_CARRIER_SSH_HOST_KEY):\n\n  %s\n%s",
+		e.Offered.Type(), ssh.FingerprintSHA256(e.Offered), e.preamble(), where, line, keyscanNote)
 }
+
+// preamble says what kind of situation this is, for the case where it is not
+// simply a host nobody has approved yet.
+func (e *HostKeyError) preamble() string {
+	if !e.Changed {
+		return ""
+	}
+	// A rotation and an interposed host are indistinguishable from here, so
+	// say that and leave the call to the person who can find out.
+	return "This differs from the key already on record. A rotated key and an interposed\n" +
+		"host look the same from here, so confirming the change with the site first is\n" +
+		"worth the trouble.\n"
+}
+
+// keyscanNote is factual: ssh-keyscan is the usual way to obtain the line, and
+// what it does and does not establish is worth stating once.
+const keyscanNote = "\nssh-keyscan prints the same line. It reads the key from the host, so it shows\n" +
+	"what is answering that address rather than confirming which host that is.\n"
 
 func (e *HostKeyError) Unwrap() error { return e.Err }
 
