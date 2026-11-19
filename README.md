@@ -298,6 +298,12 @@ tunnel through it; where it permits only SSH to a bastion, the connection is an
 `ssh` the broker runs itself; where it runs no network path at all, a shared
 filesystem will do.
 
+On a cluster you have an account on and nothing else, the broker can speak SSH
+itself: it stages `htc-ccb` and its configuration onto the login host, crosses
+a bastion on the way if there is one, and routes a login that needs a one-time
+code or a password to an administrator rather than failing. Nothing is
+installed on the cluster in advance.
+
 **Start here: [docs/ADMIN_TUNNELING.md](docs/ADMIN_TUNNELING.md)** — what to ask
 the site for, the configuration for both brokers and the execution point, how to
 verify it with `htc-ccb -carrier-check`, and what each failure means.
