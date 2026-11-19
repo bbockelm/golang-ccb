@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bbockelm/cedar/addresses"
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/commands"
 	cedarserver "github.com/bbockelm/cedar/server"
@@ -222,6 +223,56 @@ func TestCarrierHopWillNotReachAnotherCarriersTarget(t *testing.T) {
 	select {
 	case <-served:
 		t.Fatal("the EP served a connection reached through a carrier it is not on")
+	default:
+	}
+}
+
+// TestOldClientMisparseOfACarrierContactFailsCleanly pins the §4.6
+// compatibility rule for carrier contacts. An un-upgraded client splits a
+// contact on the FIRST '#' rather than the last, so given "<public>#P#T" it
+// asks the broker for CCBID "P#T".
+//
+// The C++ lenient parse (sscanf "%lu", which stops at '#') would yield P and
+// misroute the request to registrant P. A strict parse must reject it. This
+// asserts the Go broker is strict, and -- because P now names a carrier rather
+// than a registrant -- that a misparse cannot be turned into a reachable
+// target by accident.
+func TestOldClientMisparseOfACarrierContactFailsCleanly(t *testing.T) {
+	publicAddr, carrierAddr, stopBroker := startCarrierBroker(t)
+	defer stopBroker()
+	helperAddr, stopHelper := startSpliceHelper(t, carrierAddr)
+	defer stopHelper()
+
+	served := make(chan struct{}, 1)
+	epContact, stopEP := startHelperEP(t, helperAddr, served)
+	defer stopEP()
+
+	// What an old client does: split on the first '#'.
+	rest := strings.TrimPrefix(epContact, publicAddr+"#")
+	if !strings.Contains(rest, "#") {
+		t.Fatalf("contact %q did not nest, so there is no misparse to test", epContact)
+	}
+	t.Logf("contact=%s  old client would send CCBID=%q", epContact, rest)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	conn, err := ccb.Dial(ctx, []addresses.CCBContact{{
+		Raw:        epContact,
+		BrokerAddr: publicAddr,
+		CCBID:      rest, // "P#T", exactly what the lenient split produces
+	}}, ccb.DialOptions{
+		Security:   plaintextSec(),
+		TargetDesc: "old-client",
+		Timeout:    6 * time.Second,
+	})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("the broker accepted a CCBID of \"P#T\"; a lenient parse would misroute it")
+	}
+	t.Logf("refused, as required: %v", err)
+	select {
+	case <-served:
+		t.Fatal("an old client's misparse reached the EP")
 	default:
 	}
 }

@@ -188,6 +188,32 @@ client that sets no `ProxyReturnAddr` and is told nothing. Both tests were
 mutation-checked: flattening the contact fails the first by name, dropping the
 ownership check fails the second.
 
+#### What "ordinary client" means, precisely
+
+A **Go** client needs no change: `dialOne` already recurses on a nested
+contact. A **C++** client does need one, and it is the pre-existing Stage D
+requirement from `CCB_TUNNELING_DESIGN.md` 4.6-4.7, not something this model
+adds:
+
+- `CCBClient::SplitCCBContact` must split on the **last** `#`, not `strchr`'s
+  first, so it can follow a nested contact at all;
+- `CCBServer::CCBIDFromString` must parse strictly, so an un-upgraded client
+  fails cleanly instead of misrouting. Today's lenient `sscanf("%lu")` stops at
+  `#` and yields the first id.
+
+An un-upgraded C++ client given `<public>#P#T` splits on the first `#` and asks
+for CCBID `"P#T"`. The Go broker already parses strictly and refuses with
+`bad target CCBID "P#T"` -- pinned by
+`TestOldClientMisparseOfACarrierContactFailsCleanly`. With the lenient parse it
+would instead be routed to registrant `P`, which under this model is a carrier
+id rather than a target, so there is nothing there to reach.
+
+No wire format avoids this. Reaching a target that cannot dial out requires the
+client to stop expecting to be dialed, and that is client-side behaviour: it
+cannot be signalled to a client that does not implement it. The contact shape
+only decides whether an upgraded client gets it right and an old one fails
+cleanly.
+
 ## 4. Determining the internal address (SUPERSEDED by §3.2; kept for the record)
 
 Two separate things, easily conflated:
@@ -230,6 +256,8 @@ carrier-attached target with no knowledge of any of this (§3.3).
 Open design questions: none. What remains is engineering:
 
 - land the cedar half of §3.2 (six lines) so the EP needs no carrier hook;
+- the two C++ changes in `CCB_TUNNELING_DESIGN.md` 4.7, if C++ clients are to
+  reach carrier-attached targets (already required for Stage D);
 - drive `ServeCarrier` from a real carrier's yamux listener rather than a TCP
   one, and tie carrier lifetime to the pipe;
 - build the helper itself -- a listener, a yamux client, and `io.Copy`;
