@@ -257,8 +257,12 @@ type SSHCarrierConfig struct {
 	// User is the login name when the address does not carry one.
 	User string
 	// KnownHosts are the files to verify the server's host key against.
-	// Required.
+	// Required, unless HostKeys supplies the same material inline.
 	KnownHosts []string
+	// HostKeys are known_hosts lines given directly, for a broker with no
+	// durable filesystem to keep a file on. Still the operator declaring what
+	// the host is: there is no trust-on-first-use anywhere here.
+	HostKeys []string
 	// IdentityFiles are private keys to offer, in order.
 	IdentityFiles []string
 	// Agent consults SSH_AUTH_SOCK.

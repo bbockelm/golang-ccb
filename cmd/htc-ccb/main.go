@@ -303,6 +303,8 @@ func run() error {
 		CarrierRetryInitial:     cc.retryInitial,
 		CarrierRetryMax:         cc.retryMax,
 		CarrierPipe:             cc.pipe,
+		CarrierSSH:              cc.ssh,
+		OperatorWait:            cc.operatorWait,
 		DialControl:             dialControl,
 		Logger:                  d.Slog(),
 	})
@@ -587,6 +589,11 @@ type carrierSettings struct {
 	// pipe is a carrier pipe already claimed before the daemon started
 	// logging, for -carrier-stdio.
 	pipe net.Conn
+	// ssh configures an ssh:// carrier.
+	ssh ccbserver.SSHCarrierConfig
+	// operatorWait bounds how long an attached administrator waits for the
+	// broker to reach the point of asking something.
+	operatorWait time.Duration
 }
 
 // buildCarrierSettings resolves the carrier knobs from config: the listener side
@@ -599,6 +606,8 @@ func buildCarrierSettings(cfg *config.Config, sec *security.SecurityConfig, outb
 	cc.commandEnv = carrierCommandEnv(cfg)
 	cc.commandGrace = configSeconds(cfg, "CCB_CARRIER_COMMAND_GRACE")
 	cc.retryInitial = configSeconds(cfg, "CCB_CARRIER_RETRY_INITIAL")
+	cc.operatorWait = configSeconds(cfg, "CCB_OPERATOR_WAIT")
+	cc.ssh = sshCarrierSettings(cfg)
 	cc.retryMax = configSeconds(cfg, "CCB_CARRIER_RETRY_MAX")
 	cc.maxSessions = configInt(cfg, "CCB_CARRIER_MAX_SESSIONS", 0)
 	cc.maxPerSource = configInt(cfg, "CCB_CARRIER_MAX_PER_SOURCE", 0)
@@ -920,4 +929,48 @@ func carrierCommandEnv(cfg *config.Config) []string {
 		env = append(env, entry)
 	}
 	return env
+}
+
+// sshCarrierSettings reads the ssh:// carrier knobs.
+//
+// There is deliberately no knob that disables host-key verification. A carrier
+// hands the whole tunnel to whatever answers the address, so an option to skip
+// the check would be an option to hand it to anyone -- and options like that
+// get set in a hurry at 2am and never unset.
+//
+// Host keys stay in known_hosts rather than in the broker's database, even
+// though the broker has one. The list is the administrator's decision about
+// what a host is, not state the broker owns: it has to be legible to the ssh
+// the same administrator will run by hand when a connection fails, and a trust
+// anchor must not quietly regenerate itself when the broker's disposable
+// session database is lost. CCB_CARRIER_SSH_HOST_KEY carries the same lines
+// inline for a broker with no durable filesystem, so config management can
+// push one change to a fleet.
+func sshCarrierSettings(cfg *config.Config) ccbserver.SSHCarrierConfig {
+	return ccbserver.SSHCarrierConfig{
+		User:          configString(cfg, "CCB_CARRIER_SSH_USER", ""),
+		KnownHosts:    configList(cfg, "CCB_CARRIER_SSH_KNOWN_HOSTS"),
+		HostKeys:      configList(cfg, "CCB_CARRIER_SSH_HOST_KEY"),
+		IdentityFiles: configList(cfg, "CCB_CARRIER_SSH_IDENTITY"),
+		Agent:         configBool(cfg, "CCB_CARRIER_SSH_AGENT", false),
+		StageBinary:   configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
+		RemoteDir:     configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
+		Command:       configString(cfg, "CCB_CARRIER_SSH_COMMAND", ""),
+	}
+}
+
+// configList reads a comma-separated setting. Commas rather than spaces
+// because a known_hosts line contains spaces, and a path may.
+func configList(cfg *config.Config, key string) []string {
+	v, ok := cfg.Get(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
