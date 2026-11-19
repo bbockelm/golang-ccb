@@ -98,25 +98,47 @@ what its own doc comment describes for a carrier-dialing EP:
 So `Config.ReverseConnectAddress` is scaffolding to delete, and §4 below is
 moot, **provided the EP goes back through its carrier**.
 
-#### What this costs instead
+#### The strong form: no address is needed by anyone
 
-The requirement moves to the EP rather than vanishing. An EP that resolves
-`MyAddress` literally -- a plain TCP dial, no carrier hook -- still dials an
-address it cannot reach.
+The first correction still assumed a carrier-aware EP. It does not need one.
 
-That matters for exactly one question: whether an **unmodified C++ HTCondor EP**
-is a target for this model. Today's inside-CCB model works with one, but only
-because the address it is handed happens to be locally reachable -- the inside
-broker is next door. Under the carrier convention, a C++ EP would dial the
-broker's external address and fail.
+For an incoming reversal the first hop out is **always the target's own
+broker** -- the one it registered through, whose address is already in its
+configuration. In proxy mode the broker mints its own address
+(`proxyAddrSinful`), so `MyAddress` is by construction always "me". It is pure
+redundancy: the target can ignore it and reconnect to its configured broker.
 
-- EPs that dial through a carrier (any golang EP, and the staged case): the
-  external address is enough. Nothing to configure.
-- Unmodified C++ EPs: still need a reachable address. It need not be announced
-  up the pipe, though -- the operator configuring the carrier can state it once,
-  which is configuration rather than protocol.
+Verified against a patched cedar with a **plain TCP EP** -- no carrier hook, no
+dialer that knows anything about the helper -- walled off from every
+destination but the helper, with the broker minting its own unreachable
+external address. The rendezvous completes and the EP never resolves an
+address at all.
 
-Settle that question first; it decides whether any of §4 survives.
+The production change is six lines across two repos:
+
+```go
+// golang-ccb, proxy.go: mark the request
+fwd := ccb.NewAd(map[string]any{
+    ccb.AttrCommand: ccb.CommandRequest,
+    "CCBProxyMode":  true,
+    ...
+})
+
+// cedar, ccb/listener.go handleRequest: a proxy request goes back to my broker
+if b, ok := AdBool(ad, "CCBProxyMode"); ok && b {
+    myAddr = r.addr   // the address this registrant registered through
+}
+```
+
+It is held out of this branch because the cedar half is not landed, so the
+committed tests use `ListenerConfig.Dial` to stand in for it.
+
+This also means `Config.ReverseConnectAddress` is dead, the announcement
+protocol is unnecessary, §4 below is moot, and the question of whether an
+unmodified C++ EP is a target becomes much narrower: proxy mode is a golang
+extension that no C++ EP implements today, so that side needs a change either
+way -- and the change to make is "go back to your broker", which needs no
+address and no configuration.
 
 ### 3.3 The requester picks the mode, and the broker cannot upgrade it
 
@@ -143,7 +165,7 @@ This is the part to design next, and it has to be settled before anything else
 is built. `ProxyReturnAddr` is forced in the test purely to isolate the data
 path from this question.
 
-## 4. Determining the internal address (only if §3.2's EP question says yes)
+## 4. Determining the internal address (SUPERSEDED by §3.2; kept for the record)
 
 Two separate things, easily conflated:
 
@@ -178,8 +200,8 @@ configuration and falls through to loopback.
 
 ## 6. Status
 
-Proven: the data path (§2), and that an external return address suffices for a
-carrier-dialing EP (§3.2).
-Unresolved: how a client learns to stream (§3.3), and whether unmodified C++ EPs
-are a target -- which decides whether any address needs configuring at all.
+Proven: the data path (§2); that no reverse-connect address is needed by anyone,
+including a plain TCP EP (§3.2).
+Unresolved: how a client learns to stream (§3.3). That is the only open design
+question left.
 Not started: everything else.
