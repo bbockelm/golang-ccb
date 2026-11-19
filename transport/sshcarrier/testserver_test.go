@@ -96,6 +96,11 @@ func serveConn(nc net.Conn, cfg *ssh.ServerConfig, handle execHandler) {
 	go ssh.DiscardRequests(reqs)
 
 	for newCh := range chans {
+		if newCh.ChannelType() == "direct-tcpip" {
+			// Acting as a jump host: forward the channel to where it asks.
+			go forwardDirectTCPIP(newCh)
+			continue
+		}
 		if newCh.ChannelType() != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "only sessions")
 			continue
@@ -167,4 +172,35 @@ func (s *testSSHServer) config(command string) Config {
 func echo(_ string, stdin io.Reader, stdout, _ io.Writer) int {
 	_, _ = io.Copy(stdout, stdin)
 	return 0
+}
+
+// forwardDirectTCPIP makes the test server usable as a jump host: it opens the
+// requested TCP connection and splices the channel to it, which is what
+// `ssh -J` relies on.
+func forwardDirectTCPIP(newCh ssh.NewChannel) {
+	var req struct {
+		DestAddr string
+		DestPort uint32
+		OrigAddr string
+		OrigPort uint32
+	}
+	if err := ssh.Unmarshal(newCh.ExtraData(), &req); err != nil {
+		_ = newCh.Reject(ssh.ConnectionFailed, "bad direct-tcpip request")
+		return
+	}
+	target := net.JoinHostPort(req.DestAddr, fmt.Sprintf("%d", req.DestPort))
+	up, err := net.Dial("tcp", target)
+	if err != nil {
+		_ = newCh.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := newCh.Accept()
+	if err != nil {
+		_ = up.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go func() { _, _ = io.Copy(up, ch); _ = up.Close() }()
+	_, _ = io.Copy(ch, up)
+	_ = ch.Close()
 }

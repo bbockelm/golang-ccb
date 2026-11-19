@@ -65,6 +65,15 @@ type Config struct {
 	// such a server at all, and it will not offer those methods.
 	Prompter Prompter
 
+	// ProxyJump is a chain of hosts to reach Addr through, nearest first, in
+	// ssh(1)'s -J form: [user@]host[:port].
+	//
+	// Every hop is verified against the same host-key policy as the
+	// destination. A chain is only as trustworthy as its weakest link, and a
+	// jump host nobody has approved can see and alter everything that crosses
+	// it -- so there is no "the bastion is internal, skip it" mode.
+	ProxyJump []string
+
 	// Command runs on the far host; its stdin and stdout become the carrier
 	// pipe. Empty requests the default shell, which is almost never what a
 	// carrier wants.
@@ -321,13 +330,26 @@ func Connect(ctx context.Context, cfg Config) (*ssh.Client, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
+	clientCfg := func(asUser string) *ssh.ClientConfig {
+		return &ssh.ClientConfig{
+			User:    asUser,
+			Auth:    auths,
+			Timeout: timeout,
+		}
+	}
+
+	if len(cfg.ProxyJump) > 0 {
+		client, err := dialThroughJumps(ctx, cfg, addr, user, hostKey, clientCfg)
+		if err != nil {
+			return nil, st.classify(err)
+		}
+		return client, nil
+	}
+
 	var offered ssh.PublicKey
-	client, err := dialClient(ctx, addr, &ssh.ClientConfig{
-		User:            user,
-		Auth:            auths,
-		HostKeyCallback: capturingHostKey(hostKey, &offered),
-		Timeout:         timeout,
-	}, &offered, firstOf(cfg.KnownHosts))
+	cc := clientCfg(user)
+	cc.HostKeyCallback = capturingHostKey(hostKey, &offered)
+	client, err := dialClient(ctx, addr, cc, &offered, firstOf(cfg.KnownHosts))
 	if err != nil {
 		return nil, st.classify(err)
 	}
@@ -354,6 +376,117 @@ func Start(client *ssh.Client, cfg Config) (net.Conn, error) {
 	}
 	log.Debug("ssh carrier session started", "addr", addr, "command", cfg.Command)
 	return conn, nil
+}
+
+// dialThroughJumps reaches addr through a chain of jump hosts, nearest first,
+// as ssh -J does.
+//
+// Each hop is a full SSH connection with the same host-key policy and the same
+// credentials, and the next hop is dialed *through* the previous one -- so the
+// jump hosts never see the traffic in clear, only an encrypted channel they
+// forward.
+func dialThroughJumps(
+	ctx context.Context,
+	cfg Config,
+	addr, user string,
+	hostKey ssh.HostKeyCallback,
+	clientCfg func(string) *ssh.ClientConfig,
+) (*ssh.Client, error) {
+	where := firstOf(cfg.KnownHosts)
+
+	// The first hop is dialed directly.
+	first, firstUser, err := parseJump(cfg.ProxyJump[0], user)
+	if err != nil {
+		return nil, err
+	}
+	var offered ssh.PublicKey
+	cc := clientCfg(firstUser)
+	cc.HostKeyCallback = capturingHostKey(hostKey, &offered)
+	client, err := dialClient(ctx, first, cc, &offered, where)
+	if err != nil {
+		return nil, fmt.Errorf("sshcarrier: reaching jump host %s: %w", first, err)
+	}
+
+	// Each remaining hop, and finally the destination, is reached through the
+	// connection already established.
+	hops := make([]string, 0, len(cfg.ProxyJump))
+	users := make([]string, 0, len(cfg.ProxyJump))
+	for _, spec := range cfg.ProxyJump[1:] {
+		h, u, err := parseJump(spec, user)
+		if err != nil {
+			_ = client.Close()
+			return nil, err
+		}
+		hops = append(hops, h)
+		users = append(users, u)
+	}
+	hops = append(hops, addr)
+	users = append(users, user)
+
+	for i, hop := range hops {
+		next, err := dialVia(ctx, client, hop, users[i], hostKey, clientCfg, where)
+		if err != nil {
+			_ = client.Close()
+			if i == len(hops)-1 {
+				return nil, err
+			}
+			return nil, fmt.Errorf("sshcarrier: reaching jump host %s: %w", hop, err)
+		}
+		// The previous client stays alive underneath: closing it would close
+		// the channel this one runs over. Closing the outermost client tears
+		// the whole chain down, which is what the carrier does on Close.
+		client = next
+	}
+	return client, nil
+}
+
+// dialVia opens a connection to hop over an existing client's forwarded
+// channel.
+func dialVia(
+	ctx context.Context,
+	through *ssh.Client,
+	hop, user string,
+	hostKey ssh.HostKeyCallback,
+	clientCfg func(string) *ssh.ClientConfig,
+	where string,
+) (*ssh.Client, error) {
+	raw, err := through.DialContext(ctx, "tcp", hop)
+	if err != nil {
+		return nil, fmt.Errorf("sshcarrier: forwarding to %s: %w", hop, err)
+	}
+	var offered ssh.PublicKey
+	cc := clientCfg(user)
+	cc.HostKeyCallback = capturingHostKey(hostKey, &offered)
+	c, chans, reqs, err := ssh.NewClientConn(raw, hop, cc)
+	if err != nil {
+		_ = raw.Close()
+		if ke := asKeyError(err); ke != nil {
+			hke := &HostKeyError{Addr: hop, Err: err, Changed: len(ke.Want) > 0, Where: where}
+			if offered != nil {
+				hke.Offered = offered
+			}
+			return nil, hke
+		}
+		return nil, fmt.Errorf("sshcarrier: ssh handshake with %s: %w", hop, err)
+	}
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+// parseJump reads an ssh -J element: [user@]host[:port].
+func parseJump(spec, defaultUser string) (addr, user string, err error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", fmt.Errorf("sshcarrier: empty jump host in ProxyJump")
+	}
+	user = defaultUser
+	if at := strings.LastIndex(spec, "@"); at >= 0 {
+		user, spec = spec[:at], spec[at+1:]
+	}
+	addr, err = normalizeAddr(spec)
+	if err != nil {
+		return "", "", err
+	}
+	return addr, user, nil
 }
 
 // dialClient makes the TCP connection under ctx and then runs the SSH
