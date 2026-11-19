@@ -131,11 +131,25 @@ func run() error {
 
 	// Server credentials verify the daemons on this host that register with
 	// this relay; client credentials are what it presents to the next hop.
-	srvSec, err := htcondor.GetServerSecurityConfig(cfg, 0, d.SharedPortName())
+	//
+	// d.ServerSecurityConfig, and with exactly the arguments htc-ccb passes:
+	// it loads the server-side credentials AND adds this daemon's shared-port
+	// id, which an HTCondor 25.14+ FS client's channel binding names. Calling
+	// the underlying htcondor.GetServerSecurityConfig here instead would be a
+	// place for the two binaries' security policy to drift apart silently,
+	// which is the last thing that should differ between them.
+	srvSec, err := d.ServerSecurityConfig(ccb.CommandRegister, "DAEMON")
 	if err != nil {
 		return fmt.Errorf("building server security config: %w", err)
 	}
 	srvSec.RemoteVersion = streamingVersionString
+
+	// Reload signing keys and SSL material on SIGHUP, the HTCondor
+	// reconfigure convention. A staged relay rarely sees one, but a long-lived
+	// carrier outliving a key rotation is exactly when it would matter.
+	if rl, ok := srvSec.Credentials.(htcondor.CredentialReloader); ok {
+		d.OnReconfig(func(*config.Config) { rl.Reload() })
+	}
 	clientSec, err := htcondor.GetSecurityConfig(cfg, ccb.CommandRegister, "CLIENT")
 	if err != nil {
 		return fmt.Errorf("building next-hop client security config: %w", err)
