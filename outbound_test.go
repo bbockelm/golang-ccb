@@ -82,7 +82,13 @@ func startCedarDialTarget(t *testing.T, listenIP string, served chan<- struct{})
 		case served <- struct{}{}:
 		default:
 		}
-		return nil
+		// KeepOpen, not nil. Returning nil lets ServeConn close the socket in
+		// the same breath as its reply, and on macOS closing a socket with
+		// unread data discards the send buffer -- so the client sees EOF
+		// instead of the response it was given. That is the long-standing
+		// flake in this suite: it needs load to lose the race, so it bites in
+		// a full run and never in isolation.
+		return cedarserver.KeepOpen()
 	})
 	ln, err := net.Listen("tcp", net.JoinHostPort(listenIP, "0"))
 	if err != nil {
