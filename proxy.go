@@ -75,12 +75,19 @@ func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replySt
 	}()
 
 	// Ask the target to reverse-connect to the broker's rendezvous address.
+	//
+	// CCBProxyMode says that address is OURS, not the requester's, so a target
+	// that cannot route to us -- one reached through a carrier whose far end is
+	// a byte relay -- must ignore it and go back out through the broker it
+	// registered with. A target too old to know the attribute ignores it and
+	// dials MyAddress as before.
 	fwd := ccb.NewAd(map[string]any{
-		ccb.AttrCommand:   ccb.CommandRequest,
-		ccb.AttrMyAddress: s.proxyAddrSinful(),
-		ccb.AttrClaimID:   connectID,
-		ccb.AttrRequestID: reqID,
-		ccb.AttrName:      name,
+		ccb.AttrCommand:      ccb.CommandRequest,
+		ccb.AttrMyAddress:    s.proxyAddrSinful(),
+		ccb.AttrClaimID:      connectID,
+		ccb.AttrRequestID:    reqID,
+		ccb.AttrName:         name,
+		ccb.AttrCCBProxyMode: true,
 	})
 	// Recursive inbound tunnel: when there are more hops beyond this target, tell it
 	// the remaining route so it recurses; carry the audit trail so it can log who the

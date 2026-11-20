@@ -2,6 +2,7 @@ package ccbserver
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -77,10 +78,15 @@ func startSpliceHelper(t *testing.T, carrierAddr string) (addr string, stop func
 	}
 }
 
-// startHelperEP registers a DC_NOP EP through a splice helper. Its only way out
-// is the helper: the Dial hook stands in for the cedar change that makes a
-// proxy-mode reverse-connect go back to the broker the target registered
-// through (docs/SPLICE_HELPER.md 3.2), which is not landed yet.
+// startHelperEP registers a DC_NOP EP through a splice helper, walled off from
+// everything else: its Dial hook refuses every address but the helper's.
+//
+// That wall is what makes this a test of cedar's CCBProxyMode rather than a
+// test of localhost. In proxy mode the broker names its OWN address, which an
+// EP on the far side of a carrier cannot route to; the target must ignore it
+// and go back to the broker it registered through (docs/SPLICE_HELPER.md 3.2).
+// Everything is dialable in-process, so without the wall the EP reaches the
+// broker directly and the test passes whether or not CCBProxyMode works.
 func startHelperEP(t *testing.T, helperAddr string, served chan<- struct{}) (contact string, stop func()) {
 	t.Helper()
 	cs := cedarserver.New(plaintextSec())
@@ -97,13 +103,12 @@ func startHelperEP(t *testing.T, helperAddr string, served chan<- struct{}) (con
 		Name:              "helper-ep",
 		HeartbeatInterval: 30 * time.Second,
 		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = cs.ServeConn(context.Background(), conn) },
-		// Stands in for the cedar change (docs/SPLICE_HELPER.md 3.2): a
-		// proxy-mode reverse-connect goes back to the broker the target
-		// registered through. Landed as cedar CCBProxyMode; this can go once
-		// golang-ccb depends on a cedar release that carries it.
-		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			if addr != helperAddr {
+				return nil, fmt.Errorf("walled-off EP may only dial its helper %s, not %s", helperAddr, addr)
+			}
 			var d net.Dialer
-			return d.DialContext(ctx, "tcp", helperAddr)
+			return d.DialContext(ctx, "tcp", addr)
 		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
