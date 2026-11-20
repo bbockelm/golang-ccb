@@ -230,12 +230,35 @@ The same public client reaching a tunneled EP through a nested contact hits the
 same wall. The fix mirrors Go's `dialOne`: stream when the contact is nested,
 whatever the client's own reachability. A few lines at the two gate sites.
 
-An un-upgraded client fails cleanly either way. Peeling innermost it gets broker
-`<public>#P` and ccbid `T`, and `<public>#P` is not a dialable address, so it
-never reaches a broker to misroute at. A client that split the other way asks
-for CCBID `"P#T"`, which the Go broker refuses --
-`TestOldClientMisparseOfACarrierContactFailsCleanly` pins that, and v26's own
-strict parse does the same.
+**An un-upgraded client does not fail cleanly, and this is worse than §4.6 of
+`CCB_TUNNELING_DESIGN.md` assumes.** That section's guarantee rests on an old
+client splitting on the FIRST `#` and sending a chained `"P#T"`, which a strict
+server refuses. v26 splits on the LAST `#`, so it never sends a chained id. It
+sends a bare, valid id to the entry broker, having silently lost the hop:
+
+`SplitCCBContact(peel_innermost)` turns `<entry?params>#P#T` into address
+`entry?params#P` and ccbid `T`. A broker address normally carries sinful
+params, and `split_sin` takes the params blob as `strcspn(addr,">")`
+(`condor_utils/condor_sinful.cpp:93`), so the trailing `#P` is absorbed into
+the last param value. The sinful stays valid, still points at the entry broker,
+and the carrier hop is gone. Without params the address is rejected instead and
+the broker is skipped -- a clean failure, but not the usual case.
+
+In a two-BROKER tunnel that is a **misroute**: `T` is the inner broker's id for
+the EP, and the entry broker resolves it against its own unrelated table. That
+has been observed end to end in HTCondor -- a tool asking for a tunneled schedd
+was rendezvoused with the inside CCB's *collector* and completed a CEDAR
+handshake against it before failing on an unknown command.
+
+**This model does not have that failure**, because both ids belong to the same
+broker: `T` still names the intended target. The request is then refused or
+stalls, since the client is in standard mode and a carrier-attached target can
+only be proxied, but it never reaches a different daemon.
+`TestV26PeelMisparseResolvesToTheRightTargetOrHangs` pins that, and the EP is
+asserted never to serve.
+
+That is a reason to prefer this shape, not a reason to skip the C++ fix: a
+stall is still a failure, and the misroute is live for Stage D today.
 
 No wire format avoids the trigger problem. Reaching a target that cannot dial
 out requires the client to stop expecting to be dialed, and that is client-side
@@ -319,4 +342,5 @@ Remaining:
   a broker stages `htc-ccb-splice` rather than `htc-ccb-relay`;
 - the C++ streaming trigger (§3.3): v26 streams only when the client is itself
   behind a CCB, so a public client cannot reach a carrier-attached target.
-  Needed for Stage D regardless of this model, and outside this repo.
+  Needed for Stage D regardless of this model -- where it is not a stall but a
+  silent misroute to the wrong daemon -- and outside this repo.

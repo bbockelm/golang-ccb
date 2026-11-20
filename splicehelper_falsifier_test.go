@@ -267,3 +267,63 @@ func TestOldClientMisparseOfACarrierContactFailsCleanly(t *testing.T) {
 	default:
 	}
 }
+
+// TestV26PeelMisparseResolvesToTheRightTargetOrHangs covers what a current C++
+// v26 client actually does with a carrier contact, which is not what an "old"
+// client does.
+//
+// v26 splits a contact on the LAST '#', so given "<public>#P#T" it takes
+// ccb_address "<public>#P" and ccbid "T". In HTCondor the broker address
+// normally carries sinful params, and split_sin consumes everything up to '>'
+// as the params blob, so the trailing "#P" is absorbed into the last param
+// value: the address stays valid, points at the entry broker, and the carrier
+// hop is silently gone. The client then asks the entry broker for a bare "T".
+//
+// In a two-BROKER tunnel that is a misroute -- "T" is the INNER broker's id for
+// the EP, and the entry broker resolves it against its own unrelated table. In
+// this model both ids belong to the same broker, so "T" still names the
+// intended target. The request is then refused or stalls because the client is
+// in standard mode and a carrier-attached target can only be proxied, but it
+// never reaches a DIFFERENT daemon. That difference is the point of this test.
+func TestV26PeelMisparseResolvesToTheRightTargetOrHangs(t *testing.T) {
+	publicAddr, carrierAddr, stopBroker := startCarrierBroker(t)
+	defer stopBroker()
+	helperAddr, stopHelper := startSpliceHelper(t, carrierAddr)
+	defer stopHelper()
+
+	served := make(chan struct{}, 1)
+	epContact, stopEP := startHelperEP(t, helperAddr, served)
+	defer stopEP()
+
+	// What v26 extracts: ccbid is the LAST id, and the hop is lost.
+	lastHash := strings.LastIndex(epContact, "#")
+	bareID := epContact[lastHash+1:]
+	t.Logf("contact=%s  v26 would ask %s for bare CCBID %q", epContact, publicAddr, bareID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	conn, err := ccb.Dial(ctx, []addresses.CCBContact{{
+		Raw:        epContact,
+		BrokerAddr: publicAddr,
+		CCBID:      bareID,
+	}}, ccb.DialOptions{
+		Security:   plaintextSec(),
+		TargetDesc: "v26-style",
+		Timeout:    4 * time.Second,
+	})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("a standard-mode request for a carrier-attached target succeeded; it must be proxied")
+	}
+	t.Logf("refused or stalled, as expected: %v", err)
+
+	// The critical property: whatever happened, no OTHER daemon was reached.
+	// Here the EP is the only registrant, so serving at all would mean the
+	// standard path had worked -- which it must not, since the EP cannot dial
+	// a requester.
+	select {
+	case <-served:
+		t.Fatal("the EP served a standard-mode request; a carrier-attached target must always be proxied")
+	default:
+	}
+}
