@@ -62,7 +62,7 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 		// there is no hop to forward -- collapse it here.
 		if ct, rest, ok := s.resolveCarrierHop(targetID, route); ok {
 			s.log.Info("collapsed carrier hop", "carrier", targetID, "ccbid", ct.id, "route", rest)
-			t, route, targetID = ct, rest, ct.id
+			t, route = ct, rest
 		} else {
 			return s.replyFailure(ctx, c, fmt.Sprintf("no target registered for ccbid %d", targetID))
 		}

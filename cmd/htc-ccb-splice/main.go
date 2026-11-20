@@ -54,9 +54,9 @@ func run() error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		return errors.New("stdin is a terminal, so there is no carrier to the outside CCB. " +
-			"This command is started by an outside broker over a transport that gives it a pipe, " +
-			"typically `ssh host htc-ccb-splice`; it is not run interactively.")
+		return errors.New("stdin is a terminal, so there is no carrier to the outside CCB; " +
+			"this command is started by an outside broker over a transport that gives it a pipe, " +
+			"typically `ssh host htc-ccb-splice`, and is not run interactively")
 	}
 	pipe, err := cmdcarrier.Stdio(log)
 	if err != nil {
