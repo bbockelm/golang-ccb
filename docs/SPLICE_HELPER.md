@@ -243,33 +243,51 @@ behaviour: it cannot be signalled to a client that does not implement it. The
 contact shape only decides whether a client that *can* stream knows that it
 should.
 
-## 4. Determining the internal address (SUPERSEDED by §3.2; kept for the record)
+## 4. The helper
 
-Two separate things, easily conflated:
+`transport/splice` is the whole thing, and `cmd/htc-ccb-splice` wraps it for a
+carrier that is its own stdin and stdout:
 
-- **what the helper binds** — `0.0.0.0:9618`, or loopback when the only clients
-  are on the same host;
-- **what is minted into `MyAddress`** — what the EP will actually dial.
-
-Only the second is protocol-visible. Autodetection alone is not safe for it: the
-host you reached over the carrier is often not the name the worker network knows
-it by, and a login node has several interfaces with no local way to tell which
-one the cluster uses. Precedence:
-
-```
-explicit configuration  >  helper autodetect  >  loopback
+```go
+h, _ := splice.Start(splice.Config{Listen: "127.0.0.1:9618", Pipe: pipe})
+h.Serve(ctx)   // accept locally, one yamux stream per connection, copy
 ```
 
-with the outside broker able to override, since whoever configured it often
-knows the topology better than the node does. The same-host case needs no
-configuration and falls through to loopback.
+It terminates nothing. `CCB_SPLICE_LISTEN` is the only knob -- an environment
+variable, because a staged helper crosses an SSH session with `env -i` -- and
+it defaults to loopback, since the common case is daemons on the same host and
+a wildcard bind would offer the pool's inside to anything that can route there.
+
+Measured, linux/amd64, `-trimpath -s -w`:
+
+| | raw | gzipped |
+|---|---|---|
+| `htc-ccb` | 15.4 MiB | 6.35 MiB |
+| `htc-ccb-relay` (a real inside CCB, `-tags condor_nosqlite`) | 11.7 MiB | 4.71 MiB |
+| **`htc-ccb-splice`** | **3.4 MiB** | **1.43 MiB** |
+
+Two things that look like detail and are not:
+
+- **Half-close.** A relay must forward `CloseWrite` onto the yamux stream.
+  yamux has no such method, so `carrier.WithHalfClose` supplies it; without it
+  the far side waits for data that never comes and a finished bulk transfer is
+  torn down looking truncated, while control traffic survives. Anything that
+  wraps a stream has to forward it too -- `pipeConn` did not, at first, and
+  `TestStreamsSupportHalfClose` caught it.
+- **Shutdown.** `Close` must close the local connections it is relaying before
+  waiting for the copies to finish. A relay sits in `io.Copy` on a socket whose
+  peer may hold it open forever, so waiting without closing waits for the peer.
+  Shipped wrong once: one idle connection made shutdown take two minutes.
+  `TestCloseDoesNotWaitForPeers` pins it.
 
 ## 5. What this does not solve
 
 - **Authorization moves off the execute host.** The outbound allowlist (the
   SSRF guard) and the registration policy are enforced at the outside broker.
-  That is arguably the better place, but it is a change in where the boundary
-  sits and should be stated plainly rather than discovered.
+  Nothing had to be built for this -- the relay does not terminate CEDAR, so
+  the broker authorizes each daemon's own end-to-end session and sees its real
+  identity rather than a broker's. It is still a change in where the boundary
+  sits, and worth stating rather than discovering.
 - **It is not the "inside CCB" role** the C++ design specifies, so the Stage C
   interop story does not cover it. It is a second model that lives alongside.
 - **One broker, many helpers.** `Config.ReverseConnectAddress` is per server
@@ -282,14 +300,23 @@ Proven: the data path (§2); that no reverse-connect address is needed by anyone
 including a plain TCP EP (§3.2); that an ordinary client reaches a
 carrier-attached target with no knowledge of any of this (§3.3).
 
-Open design questions: none. What remains is engineering:
+Open design questions: none.
 
-- land the cedar half of §3.2 (six lines) so the EP needs no carrier hook;
+Built:
+
+- the helper, `transport/splice` and `cmd/htc-ccb-splice` (§4);
+- carriers keyed on the pipe, with exact lifetime: `carrier.WithPipeHooks` and
+  `Server.CarrierHooks`, so one broker serves many helpers and a contact naming
+  a dead carrier resolves to nothing;
+- the nested contact and hop collapse (§3.3);
+- the cedar half of §3.2, as cedar's `CCBProxyMode`.
+
+Remaining:
+
+- depend on a cedar release carrying `CCBProxyMode`, then drop the
+  `ListenerConfig.Dial` stand-in from the tests here;
+- wire the helper into the SSH carrier's staging (the `ssh-carrier` branch), so
+  a broker stages `htc-ccb-splice` rather than `htc-ccb-relay`;
 - the C++ streaming trigger (§3.3): v26 streams only when the client is itself
-  behind a CCB, so a public client cannot reach a carrier-attached target. Needed
-  for Stage D regardless of this model;
-- drive `ServeCarrier` from a real carrier's yamux listener rather than a TCP
-  one, and tie carrier lifetime to the pipe;
-- build the helper itself -- a listener, a yamux client, and `io.Copy`;
-- decide where the outbound allowlist and registration policy live now that
-  they are enforced only at the outside broker (§5).
+  behind a CCB, so a public client cannot reach a carrier-attached target.
+  Needed for Stage D regardless of this model, and outside this repo.

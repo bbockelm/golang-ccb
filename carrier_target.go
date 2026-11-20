@@ -1,10 +1,11 @@
 package ccbserver
 
 import (
-	"context"
 	"net"
 	"strconv"
 	"sync"
+
+	"github.com/bbockelm/golang-ccb/transport/carrier"
 )
 
 // A carrier-attached target is one that reached this broker through a splice
@@ -25,81 +26,83 @@ import (
 // single-hop proxy request for T. P exists only to make the contact nest, which
 // is what tells the client to stream.
 
-// carrierConn tags a connection with the carrier it arrived on.
-type carrierConn struct {
-	net.Conn
-	carrierID uint64
+// carrierSet maps each live pipe to the CCBID this broker gave it. Carrier ids
+// come from the same counter as target ids, because both appear as "#N" in a
+// contact and must not collide.
+type carrierSet struct {
+	mu    sync.Mutex
+	byID  map[uint64]struct{} // carrier ids currently live
+	byPip map[uint64]uint64   // transport pipe id -> carrier id
 }
 
-// carrierListener tags every connection it accepts. One listener is one carrier
-// -- in production the yamux listener over a single pipe.
-type carrierListener struct {
-	net.Listener
-	carrierID uint64
-}
-
-func (l *carrierListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+func (s *carrierSet) open(pipeID, carrierID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byID == nil {
+		s.byID = make(map[uint64]struct{})
+		s.byPip = make(map[uint64]uint64)
 	}
-	return &carrierConn{Conn: c, carrierID: l.carrierID}, nil
+	s.byID[carrierID] = struct{}{}
+	s.byPip[pipeID] = carrierID
 }
 
-// carrierOf reports the carrier a connection arrived on, if any.
-func carrierOf(c net.Conn) (uint64, bool) {
-	cc, ok := c.(*carrierConn)
+func (s *carrierSet) closePipe(pipeID uint64) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.byPip[pipeID]
 	if !ok {
 		return 0, false
 	}
-	return cc.carrierID, true
+	delete(s.byPip, pipeID)
+	delete(s.byID, id)
+	return id, true
 }
 
-// carriers tracks the live carrier ids so a request naming one can be told
-// apart from a request naming a target.
-type carrierSet struct {
-	mu  sync.Mutex
-	ids map[uint64]struct{}
-}
-
-func (s *carrierSet) add(id uint64) {
+func (s *carrierSet) forPipe(pipeID uint64) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ids == nil {
-		s.ids = make(map[uint64]struct{})
-	}
-	s.ids[id] = struct{}{}
-}
-
-func (s *carrierSet) remove(id uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.ids, id)
+	id, ok := s.byPip[pipeID]
+	return id, ok
 }
 
 func (s *carrierSet) has(id uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.ids[id]
+	_, ok := s.byID[id]
 	return ok
 }
 
-// ServeCarrier serves CCB on a carrier's listener: every connection accepted
-// from l belongs to one carrier, and targets registering over it advertise a
-// contact that nests through this broker's id for that carrier.
+// CarrierHooks returns the pipe hooks to give carrier.NewMuxListener so that
+// targets registering over each pipe are recognised as carrier-attached.
 //
-// l is the far end of one pipe. In production that is the yamux listener over
-// the carrier; the helper on the other side relays bytes and nothing else.
-func (s *Server) ServeCarrier(ctx context.Context, l net.Listener) error {
-	s.mu.Lock()
-	s.nextID++
-	id := s.nextID
-	s.mu.Unlock()
-	s.carriers.add(id)
-	defer s.carriers.remove(id)
-	s.log.Info("carrier attached", "carrier", id, "listen", l.Addr().String())
-	s.StartBackground(ctx)
-	return s.srv.Serve(ctx, &carrierListener{Listener: l, carrierID: id})
+// One pipe is one carrier. The hooks give its exact lifetime: the id is
+// allocated when the pipe comes up and released when it goes, so a contact
+// naming a dead carrier resolves to nothing.
+func (s *Server) CarrierHooks() carrier.PipeHooks {
+	return carrier.PipeHooks{
+		Open: func(pipeID uint64) {
+			s.mu.Lock()
+			s.nextID++
+			id := s.nextID
+			s.mu.Unlock()
+			s.carriers.open(pipeID, id)
+			s.log.Info("carrier attached", "carrier", id, "pipe", pipeID)
+		},
+		Close: func(pipeID uint64) {
+			if id, ok := s.carriers.closePipe(pipeID); ok {
+				s.log.Info("carrier detached", "carrier", id, "pipe", pipeID)
+			}
+		},
+	}
+}
+
+// carrierOf reports the carrier a connection arrived on, if any.
+func (s *Server) carrierOf(c net.Conn) (uint64, bool) {
+	pipeID, ok := carrier.PipeIDOf(c)
+	if !ok {
+		return 0, false
+	}
+	return s.carriers.forPipe(pipeID)
 }
 
 // carrierContactString builds the nested contact for a target behind a carrier.

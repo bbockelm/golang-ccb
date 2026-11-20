@@ -617,7 +617,7 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 		stream: c.Stream,
 		conn:   c.Stream.GetConnection(),
 	}
-	if cid, ok := carrierOf(t.conn); ok {
+	if cid, ok := s.carrierOf(t.conn); ok {
 		t.carrierID = cid
 	}
 

@@ -3,10 +3,10 @@ package ccbserver
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,58 +14,14 @@ import (
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/commands"
 	cedarserver "github.com/bbockelm/cedar/server"
+
+	"github.com/bbockelm/golang-ccb/transport/carrier"
+	"github.com/bbockelm/golang-ccb/transport/splice"
 )
 
-// startSpliceHelper is the whole proposed helper: a TCP listener on the EP's
-// side of the pipe that copies bytes to the outside broker and back. It holds
-// no keys, parses nothing, and knows no CCB. Each accepted connection stands in
-// for one yamux stream over the carrier -- the multiplexing is not what this
-// test is asking about.
-func startSpliceHelper(t *testing.T, outsideAddr string) (addr string, stop func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	done := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				defer func() { _ = c.Close() }()
-				up, err := net.Dial("tcp", outsideAddr)
-				if err != nil {
-					return
-				}
-				defer func() { _ = up.Close() }()
-				var inner sync.WaitGroup
-				inner.Add(2)
-				go func() { defer inner.Done(); _, _ = io.Copy(up, c); _ = up.(*net.TCPConn).CloseWrite() }()
-				go func() { defer inner.Done(); _, _ = io.Copy(c, up); _ = c.(*net.TCPConn).CloseWrite() }()
-				ch := make(chan struct{})
-				go func() { inner.Wait(); close(ch) }()
-				select {
-				case <-ch:
-				case <-done:
-				}
-			}()
-		}
-	}()
-	return ln.Addr().String(), func() { close(done); _ = ln.Close(); wg.Wait() }
-}
-
 // startCarrierBroker starts a broker with two listeners: the public one that
-// clients reach, and a carrier listener standing in for the far end of one
-// pipe. In production the second is the yamux listener over the carrier; here
-// it is TCP, and only the helper ever dials it.
+// clients reach, and a carrier listener that helpers dial. The carrier side is
+// a real MuxListener, so each pipe is one yamux session and one carrier.
 func startCarrierBroker(t *testing.T) (publicAddr, carrierAddr string, stop func()) {
 	t.Helper()
 	pub, err := net.Listen("tcp", "127.0.0.1:0")
@@ -84,10 +40,41 @@ func startCarrierBroker(t *testing.T) (publicAddr, carrierAddr string, stop func
 	if err != nil {
 		t.Fatal(err)
 	}
+	mux := carrier.NewMuxListener(car, carrier.WithPipeHooks(srv.CarrierHooks()))
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = srv.Serve(ctx, pub) }()
-	go func() { _ = srv.ServeCarrier(ctx, car) }()
-	return pub.Addr().String(), car.Addr().String(), cancel
+	go func() { _ = srv.Serve(ctx, mux) }()
+	return pub.Addr().String(), car.Addr().String(), func() {
+		cancel()
+		_ = mux.Close()
+	}
+}
+
+// startSpliceHelper runs the real helper: it dials the broker's carrier port,
+// runs yamux over that one connection, and copies each local connection onto
+// its own stream. It terminates nothing.
+func startSpliceHelper(t *testing.T, carrierAddr string) (addr string, stop func()) {
+	t.Helper()
+	pipe, err := net.Dial("tcp", carrierAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := splice.Start(splice.Config{
+		Listen: "127.0.0.1:0",
+		Pipe:   pipe,
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = h.Serve(ctx) }()
+	return h.Addr().String(), func() {
+		cancel()
+		_ = h.Close()
+		<-done
+	}
 }
 
 // startHelperEP registers a DC_NOP EP through a splice helper. Its only way out
@@ -110,6 +97,10 @@ func startHelperEP(t *testing.T, helperAddr string, served chan<- struct{}) (con
 		Name:              "helper-ep",
 		HeartbeatInterval: 30 * time.Second,
 		Handler:           func(conn net.Conn, _ ccb.InboundMeta) { _ = cs.ServeConn(context.Background(), conn) },
+		// Stands in for the cedar change (docs/SPLICE_HELPER.md 3.2): a
+		// proxy-mode reverse-connect goes back to the broker the target
+		// registered through. Landed as cedar CCBProxyMode; this can go once
+		// golang-ccb depends on a cedar release that carries it.
 		Dial: func(ctx context.Context, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "tcp", helperAddr)
