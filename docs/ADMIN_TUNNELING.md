@@ -572,9 +572,10 @@ with files named as the release tarballs name them:
 accepts connections on the far host and copies each onto its own stream of the
 carrier. It terminates nothing, reads no configuration and holds no
 credentials. On linux/amd64 it is 1.43 MB gzipped against the full binary's
-6.6 MB. A directory of `htc-ccb-<os>-<arch>` is **not** a substitute: the full
-broker would run as an inside CCB, a different topology with a different
-authorization boundary, so a missing helper build is an error instead.
+6.6 MB. A directory of `htc-ccb-<os>-<arch>` works too — the full binary is
+run as `htc-ccb -carrier-splice`, the same relay in a larger file — and with
+both present the helper is sent. A broker with neither can still stage the
+binary it is running, onto a host of its own platform.
 
 A host whose platform has no build there fails by name, and the message lists
 the builds that *were* available — usually the answer is that one was never
@@ -920,7 +921,7 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_SSH_USER` / `CCB_CARRIER_SSH_IDENTITY` / `CCB_CARRIER_SSH_AGENT` | login name, private keys to offer, and whether to consult `SSH_AUTH_SOCK` |
 | `CCB_CARRIER_SSH_PROXY_JUMP` | bastion hops, nearest first, as `ssh -J` takes them. Every hop is host-key verified |
 | `CCB_CARRIER_SSH_STAGE_BINARY` | a local `htc-ccb-splice` to put on the far host — the zero-touch install |
-| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-splice-<os>-<arch>` builds instead, chosen by what the far host reports. Needed for every platform staged onto, including this broker's own |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-splice-<os>-<arch>` builds instead, chosen by what the far host reports. `htc-ccb-<os>-<arch>` is accepted and run with `-carrier-splice`; unneeded for the broker's own platform, which it can stage itself |
 | `CCB_CARRIER_SSH_HELPER_LISTEN` | the address the staged helper accepts connections on — what daemons there name as their CCB. Unset leaves the helper's default |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | where a staged binary goes (default under the login account) |
 | `CCB_CARRIER_SSH_COMMAND` | run a binary the site installed its own way, instead of staging |

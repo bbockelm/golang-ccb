@@ -22,19 +22,31 @@ import (
 	"strings"
 )
 
-// Names is what a per-platform build can be called in a directory:
-// htc-ccb-splice-<os>-<arch>, as the release tarballs name it.
+// Names are what a per-platform build can be called in a directory, best
+// first: htc-ccb-splice-<os>-<arch> then htc-ccb-<os>-<arch>, as the release
+// tarballs name them.
 //
-// There is deliberately no fallback to htc-ccb. The far end of this carrier is
-// a splice helper -- a byte relay with no CEDAR, no ClassAds and no
-// credentials -- and the full broker is not one. It would start, register as a
-// broker, and behave like an inside CCB, which is a different model with a
-// different authorization boundary, not a degraded version of this one. A
-// missing build is an error rather than a silent change of topology.
+// The helper is preferred because it is what should cross the network: on
+// linux/amd64 it is 1.43 MiB gzipped against the full binary's 6.59 MiB, and
+// that difference is paid on every host that has not seen this build. The
+// full binary still works -- `htc-ccb -carrier-splice` is the same byte relay
+// inside a larger file -- so this is a preference, not a requirement, and a
+// site that ships only htc-ccb can still stage.
 func Names(goos, goarch string) []string {
 	return []string{
 		fmt.Sprintf("htc-ccb-splice-%s-%s", goos, goarch),
+		fmt.Sprintf("htc-ccb-%s-%s", goos, goarch),
 	}
+}
+
+// IsHelper reports whether a build name is the dedicated helper, which runs
+// the relay with no flag, rather than a full htc-ccb, which must be told to be
+// one with -carrier-splice.
+func IsHelper(name string) bool {
+	base := filepath.Base(name)
+	// Both spellings: a release build carries the platform, a file someone
+	// named by hand or built with -o usually does not.
+	return base == "htc-ccb-splice" || strings.HasPrefix(base, "htc-ccb-splice-")
 }
 
 // Name is the preferred spelling for one platform.
@@ -47,13 +59,20 @@ type Source struct {
 	Path string
 	// Embedded reports a build carried inside this binary.
 	Embedded bool
-	Size     int
+	// Self reports this running binary, sent for a host of its own platform.
+	Self bool
+	// Helper reports a dedicated htc-ccb-splice build, which needs no flag.
+	// False means a full htc-ccb, which must be run with -carrier-splice.
+	Helper bool
+	Size   int
 }
 
 func (s Source) String() string {
 	switch {
 	case s.Embedded:
 		return fmt.Sprintf("embedded (%d bytes)", s.Size)
+	case s.Self:
+		return fmt.Sprintf("this running binary, %s (%d bytes)", s.Path, s.Size)
 	default:
 		return fmt.Sprintf("%s (%d bytes)", s.Path, s.Size)
 	}
@@ -73,7 +92,7 @@ func Find(dir, goos, goarch string) ([]byte, Source, error) {
 			path := filepath.Join(dir, want)
 			body, err := os.ReadFile(path)
 			if err == nil {
-				return body, Source{Path: path, Size: len(body)}, nil
+				return body, Source{Path: path, Helper: IsHelper(want), Size: len(body)}, nil
 			}
 			if !os.IsNotExist(err) {
 				return nil, Source{}, fmt.Errorf("remotebin: reading %s: %w", path, err)
@@ -82,15 +101,20 @@ func Find(dir, goos, goarch string) ([]byte, Source, error) {
 	}
 	for _, want := range wanted {
 		if body, ok := embedded(want); ok {
-			return body, Source{Embedded: true, Size: len(body)}, nil
+			return body, Source{Embedded: true, Helper: IsHelper(want), Size: len(body)}, nil
 		}
 	}
-	// There is no self-staging fallback. A broker could stage a copy of
-	// ITSELF when the far host matched its platform, which is what made
-	// staging "always work" and let the embedded set skip the host platform,
-	// halving what `-tags embedremote` cost. That ended with the relay: this
-	// broker is not a splice helper, so its own binary is not a candidate.
-	// Every platform that will be staged onto must be present.
+	// Last: this running binary, when the far host is of its own platform.
+	//
+	// It is a full htc-ccb, so it is staged to be run with -carrier-splice --
+	// the same byte relay, in a much larger file. Being last is the point: it
+	// is 4.6x the bytes of a helper build, so it is what makes staging always
+	// work, not what anyone should rely on. It also means the embedded set
+	// need not carry this platform, which halves what `-tags embedremote`
+	// costs.
+	if body, src, err := self(goos, goarch); err == nil && body != nil {
+		return body, src, nil
+	}
 	return nil, Source{}, fmt.Errorf("remotebin: no %s/%s build available%s; %s. %s",
 		goos, goarch, inDir(dir), haveWhat(dir), remedy)
 }
@@ -122,10 +146,10 @@ func haveWhat(dir string) string {
 		}
 	}
 	have = append(have, embeddedNames()...)
+	// This binary can always stage itself onto a host of its own platform, so
+	// that is part of the inventory even when nothing else is configured.
+	have = append(have, fmt.Sprintf("this binary's own platform (%s/%s)", runtime.GOOS, runtime.GOARCH))
 	sort.Strings(have)
-	if len(have) == 0 {
-		return "available: nothing"
-	}
 	return "available: " + strings.Join(have, ", ")
 }
 
@@ -149,6 +173,33 @@ func ParsePlatform(name string) (goos, goarch string, ok bool) {
 
 // Local names the platform this binary was built for.
 func Local() (string, string) { return runtime.GOOS, runtime.GOARCH }
+
+// self returns this running binary when it matches the far host's platform.
+//
+// Returns (nil, _, nil) for any other platform, and an error only when the
+// executable cannot be read -- not fatal here, because a directory or an
+// embedded copy may still have the build.
+func self(goos, goarch string) ([]byte, Source, error) {
+	if goos != runtime.GOOS || goarch != runtime.GOARCH {
+		return nil, Source{}, nil
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return nil, Source{}, err
+	}
+	// Resolve symlinks so the bytes come from the real file: a broker started
+	// through /usr/local/bin/htc-ccb -> ../libexec/... would otherwise read a
+	// link.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, Source{}, err
+	}
+	// Not Helper: this is a full htc-ccb and needs -carrier-splice.
+	return body, Source{Path: path, Self: true, Size: len(body)}, nil
+}
 
 // Any reports whether this build carries any compiled-in binaries at all.
 //

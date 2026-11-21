@@ -49,8 +49,8 @@ func TestAMissingPlatformErrorNamesWhatIsAvailable(t *testing.T) {
 }
 
 func TestNoSourceAtAllSaysHowToGetOne(t *testing.T) {
-	// A platform this build cannot possibly have, so an embedded copy cannot
-	// answer it either.
+	// A platform this build cannot possibly have: not the host's, and not one
+	// anybody embeds. Asking for a real one would succeed by self-staging.
 	_, _, err := Find("", "plan9", "mips64")
 	if err == nil {
 		t.Fatal("with no directory and nothing embedded, Find should fail")
@@ -58,31 +58,45 @@ func TestNoSourceAtAllSaysHowToGetOne(t *testing.T) {
 	if !strings.Contains(err.Error(), "embedremote") {
 		t.Errorf("the error does not name the way to carry builds: %v", err)
 	}
-	if !strings.Contains(err.Error(), "htc-ccb-splice") {
-		t.Errorf("the error does not name the build to produce: %v", err)
+	if !strings.Contains(err.Error(), "own platform") {
+		t.Errorf("the error does not say this binary can stage its own platform: %v", err)
 	}
 }
 
-// A broker does NOT stage a copy of itself.
+// A broker stages a copy of itself for its own platform, as the last resort.
 //
-// It used to: asked for its own platform with nothing configured, it sent the
-// binary it was running, which made staging "always work" and let the embedded
-// set skip the host platform. That ended with the relay. The far end is a
-// splice helper and this broker is not one, so its own binary is not a
-// candidate for any platform, including its own.
-func TestItNeverStagesItself(t *testing.T) {
+// That is what makes staging always work, and what lets the embedded set skip
+// the host platform. It is a full htc-ccb, so Helper is false and the caller
+// must run it with -carrier-splice.
+func TestItStagesItselfForItsOwnPlatform(t *testing.T) {
 	goos, goarch := Local()
-	_, src, err := Find("", goos, goarch)
-	if Any() {
-		// An embedremote build may legitimately answer from a compiled-in
-		// copy; what it must never do is reach for the running binary.
-		if err == nil && !src.Embedded {
-			t.Errorf("staged %v for the host's own platform; the only sources are a directory and an embedded copy", src)
-		}
-		return
+	body, src, err := Find("", goos, goarch)
+	if err != nil {
+		t.Fatalf("Find(own platform): %v", err)
 	}
-	if err == nil {
-		t.Errorf("staged %v with no directory and nothing embedded; the running binary is not a splice helper", src)
+	if len(body) == 0 {
+		t.Fatal("staged an empty binary")
+	}
+	if !src.Self && !src.Embedded {
+		t.Errorf("source is %v; with nothing configured it should be this running binary", src)
+	}
+	if src.Self && src.Helper {
+		t.Error("the running binary is a full htc-ccb, not a helper; it needs -carrier-splice")
+	}
+}
+
+// ...but only for its own platform: a different architecture cannot come from
+// the running binary, and saying it could would stage something that cannot
+// exec.
+func TestItDoesNotStageItselfForAnotherPlatform(t *testing.T) {
+	goos, goarch := Local()
+	other := "arm64"
+	if goarch == "arm64" {
+		other = "amd64"
+	}
+	_, src, err := Find("", goos, other)
+	if err == nil && src.Self {
+		t.Errorf("staged this %s/%s binary onto a %s/%s host", goos, goarch, goos, other)
 	}
 }
 
@@ -121,7 +135,7 @@ func TestTheDirectoryWinsOverAnEmbeddedCopy(t *testing.T) {
 
 func TestNamesMatchTheReleaseSpelling(t *testing.T) {
 	got := Names("linux", "arm64")
-	want := []string{"htc-ccb-splice-linux-arm64"}
+	want := []string{"htc-ccb-splice-linux-arm64", "htc-ccb-linux-arm64"}
 	if len(got) != len(want) {
 		t.Fatalf("Names = %v, want %v", got, want)
 	}
@@ -135,23 +149,39 @@ func TestNamesMatchTheReleaseSpelling(t *testing.T) {
 	}
 }
 
-// The full broker is NOT a stand-in for the helper.
-//
-// It used to be the fallback: htc-ccb ran the same -carrier-stdio role, so a
-// site shipping only the full binary still got a staged broker. The splice
-// helper is a different thing -- a byte relay with no CEDAR, no ClassAds and
-// no credentials -- and htc-ccb is a broker. Staging it would silently give
-// the far host an inside CCB, a different model with a different
-// authorization boundary. Failing is the correct outcome.
-func TestTheFullBinaryIsNotAHelper(t *testing.T) {
+// A site that ships only htc-ccb can still stage: it is the same byte relay
+// inside a larger file, and Helper=false is what tells the caller to add
+// -carrier-splice.
+func TestTheFullBinaryIsUsedWhenNoHelperIsShipped(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "the full broker")
-	_, src, err := Find(dir, "linux", "amd64")
-	if err == nil {
-		t.Fatalf("staged %v; the full broker is not a splice helper", src)
+	body, src, err := Find(dir, "linux", "amd64")
+	if err != nil {
+		t.Fatalf("Find: %v", err)
 	}
-	if !strings.Contains(err.Error(), "htc-ccb-splice") {
-		t.Errorf("the error does not say what build is wanted: %v", err)
+	if string(body) != "the full broker" {
+		t.Errorf("got %q", body)
+	}
+	if src.Helper {
+		t.Error("htc-ccb was reported as a helper; it needs -carrier-splice")
+	}
+}
+
+// With both present the helper wins: 1.43 MiB gzipped against 6.59 MiB, paid
+// on every host that has not seen this build.
+func TestTheHelperOutranksTheFullBinary(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "the full broker")
+	write(t, filepath.Join(dir, "htc-ccb-splice-linux-amd64"), "the helper")
+	body, src, err := Find(dir, "linux", "amd64")
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if string(body) != "the helper" {
+		t.Errorf("staged %q; the helper should be preferred", body)
+	}
+	if !src.Helper {
+		t.Error("the helper was not reported as one; it would be run with a flag it rejects")
 	}
 }
 

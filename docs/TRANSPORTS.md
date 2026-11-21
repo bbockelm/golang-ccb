@@ -919,30 +919,33 @@ effect is invisible in behaviour and visible only in size, so
 `scripts/embed-builds.sh` asserts the dependency is actually gone rather than
 trusting the flag.
 
-A full `htc-ccb` is **not** accepted as a substitute. It would start and run
-as an inside CCB — a different topology with a different authorization
-boundary — so a missing helper build is an error rather than a silent change
-of model.
+A full `htc-ccb` **is** accepted, and run as `htc-ccb -carrier-splice`: the
+same byte relay inside a larger file, so it is a size preference rather than a
+different topology. It is tried after the helper, and the broker's own running
+binary after that, because the difference is 4.6x on the wire and is paid on
+every host that has not seen this build.
 
 #### 6.3.2 Which build, for which host
 
-The far host's architecture is discovered, not configured, so there are three
+The far host's architecture is discovered, not configured, so there are four
 places the matching build can come from, tried in this order:
 
 | Source | Knob | For |
 |---|---|---|
 | A named file | `CCB_CARRIER_SSH_STAGE_BINARY` | One architecture, or a build you want to pin. Refused if it is for the wrong platform — before the transfer, not after. |
-| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. `htc-ccb-splice-<os>-<arch>` only; `htc-ccb-<os>-<arch>` is not a substitute. |
+| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. `htc-ccb-splice-<os>-<arch>`, or `htc-ccb-<os>-<arch>` — the helper is preferred when both are there. |
 | Compiled into the broker | *(a build-time choice)* | A single-file install with nowhere to keep a directory. Only an `htc-ccb` built with `-tags embedremote` carries any. |
 
 The directory outranks a compiled-in copy, so a site that ships its own builds
 keeps control of what lands on its hosts even when both exist.
 
-There used to be a fourth source: the broker's own running binary, for a far
-host of its own platform. That made staging always work and let the embedded
-set skip the host platform, halving what `-tags embedremote` cost. It ended
-with the relay — this broker is not a splice helper — so every platform staged
-onto must now be present.
+A fourth source is the broker's own running binary, for a far host of its own
+platform, run with `-carrier-splice`. It is last because it is the largest,
+and it is what makes staging always work: it also lets the embedded set skip
+the host platform, halving what `-tags embedremote` costs. The trade is bytes
+on the wire — 6.59 MiB gzipped rather than 1.43 MiB, once per host per version
+— so a site staging onto many hosts of its own kind should carry the helper
+build anyway (`SELF=`).
 
 **A broker never needs to carry a copy of itself.** A linux/amd64 `htc-ccb`
 staging onto a linux/amd64 host already has a binary that runs the role, on

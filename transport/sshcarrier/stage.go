@@ -107,6 +107,10 @@ type StageConfig struct {
 // StagedPaths is what a stage left on the far host.
 type StagedPaths struct {
 	Binary string
+	// Helper reports a dedicated htc-ccb-splice build, which runs the relay
+	// with no flag. False means a full htc-ccb, which must be told to be one
+	// with -carrier-splice.
+	Helper bool
 }
 
 // Stage puts the binary on the far host if it is not already there, and returns
@@ -122,7 +126,7 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	body, source, err := resolveBinary(cfg)
+	body, source, helper, err := resolveBinary(cfg)
 	if err != nil {
 		return StagedPaths{}, err
 	}
@@ -139,7 +143,7 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 	if err := putFile(ctx, client, remote, body, log, "broker binary", cfg.Platform.String(), source); err != nil {
 		return StagedPaths{}, err
 	}
-	out := StagedPaths{Binary: remote}
+	out := StagedPaths{Binary: remote, Helper: helper}
 
 	return out, nil
 }
@@ -262,26 +266,26 @@ func shellQuote(s string) string {
 // only in a binary built with the `embedremote` tag -- a copy compiled into
 // this one. The last exists so a single-file install has something to stage
 // on a host it has never seen, which is the whole premise of zero touch.
-func resolveBinary(cfg StageConfig) ([]byte, string, error) {
+func resolveBinary(cfg StageConfig) (body []byte, source string, helper bool, err error) {
 	if cfg.Binary != "" {
 		// An explicitly named file is the caller's word for "this build": the
 		// only check worth making is that it is not for the wrong machine,
 		// which otherwise surfaces as "Exec format error" at the far end.
 		if cfg.LocalPlatform != (Platform{}) && cfg.Platform != (Platform{}) && cfg.LocalPlatform != cfg.Platform {
-			return nil, "", fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
+			return nil, "", false, fmt.Errorf("sshcarrier: refusing to stage a %s binary on a %s host", cfg.LocalPlatform, cfg.Platform)
 		}
 		body, err := os.ReadFile(cfg.Binary)
 		if err != nil {
-			return nil, "", fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
+			return nil, "", false, fmt.Errorf("sshcarrier: reading %s: %w", cfg.Binary, err)
 		}
-		return body, cfg.Binary, nil
+		return body, cfg.Binary, remotebin.IsHelper(cfg.Binary), nil
 	}
 	if cfg.Platform == (Platform{}) {
-		return nil, "", fmt.Errorf("sshcarrier: no binary named and the remote platform is unknown, so none can be chosen")
+		return nil, "", false, fmt.Errorf("sshcarrier: no binary named and the remote platform is unknown, so none can be chosen")
 	}
 	body, src, err := remotebin.Find(cfg.BinaryDir, cfg.Platform.OS, cfg.Platform.Arch)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
-	return body, src.String(), nil
+	return body, src.String(), src.Helper, nil
 }

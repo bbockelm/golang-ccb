@@ -35,12 +35,19 @@ fi
 # build that carries only one simply fails on the other, by name.
 PLATFORMS="${PLATFORMS:-linux/amd64 linux/arm64}"
 
-# Every platform is carried. A broker used to skip its own, because it could
-# stage the binary it was running; that ended when the far end stopped being a
-# broker -- htc-ccb is not a splice helper, so its own platform is no more
-# available than any other. The tag therefore costs both builds, which is
-# still less than what it carried before: 2 x 1.43 MiB gzipped against one
-# 4.71 MiB relay.
+# A broker need not carry a copy of its own platform: it can stage the binary
+# it is running, told to be a helper with -carrier-splice (see remotebin.self).
+# So when these builds are being embedded, the platform the final htc-ccb is
+# FOR is skipped -- which for the usual linux/amd64 release means only
+# linux/arm64 is carried, halving what the tag costs.
+#
+# The trade is bytes on the wire: self-staging sends the full 6.59 MiB gzipped
+# rather than the helper's 1.43 MiB, once per host per version. Carry the
+# platform (SELF=) if you stage onto many hosts of your own kind.
+#
+# SELF names that platform; it defaults to what `go env` would build now.
+# Set SELF= to carry every platform.
+SELF="${SELF-$(go env GOOS)/$(go env GOARCH)}"
 
 # -s -w drops the symbol table and DWARF. The staged binary is run, not
 # debugged; when it misbehaves an operator stages their own with
@@ -85,6 +92,12 @@ built=0
 for p in $PLATFORMS; do
 	goos="${p%%/*}"
 	goarch="${p##*/}"
+	# Only when embedding: a directory of builds is read by whatever broker is
+	# configured to use it, which need not share this platform.
+	if [ "$embedding" = yes ] && [ -n "$SELF" ] && [ "$p" = "$SELF" ]; then
+		echo "skipping ${p}: an htc-ccb built for it can stage itself (set SELF= to carry it anyway)"
+		continue
+	fi
 	name="htc-ccb-splice-${goos}-${goarch}"
 	echo "building ${name}"
 	if [ -n "$TAGS" ]; then

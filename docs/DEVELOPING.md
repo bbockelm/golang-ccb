@@ -63,17 +63,19 @@ connections on the far host and copies each onto its own stream of the carrier
 configuration. Built with `-tags condor_nosqlite` it is 1.43 MB gzipped
 against `htc-ccb`'s 6.6 MB.
 
-Builds are needed for **every** platform staged onto, including this one. A
-broker used to stage the binary it was running when the far host shared its
-platform; that ended when the far end stopped being a broker.
+A broker can stage the binary it is *running* when the far host shares its
+platform — `htc-ccb -carrier-splice` is the same relay — so builds are only
+ever needed for other platforms. That costs 6.59 MiB gzipped on the wire
+instead of 1.43 MiB, so carry the helper (`SELF=`) if you stage onto many
+hosts of your own kind.
 
 ```sh
-scripts/embed-builds.sh                      # every platform in PLATFORMS
+scripts/embed-builds.sh                      # skips this build's own platform
 go build -tags embedremote -o htc-ccb ./cmd/htc-ccb
 ```
 
-For the usual linux/amd64 release that carries both helpers, about 2.9 MB --
-still less than the single 4.7 MB relay it replaced. `OUT=<dir>` writes a
+For the usual linux/amd64 release that carries one arm64 helper, about
+1.43 MB. `SELF=` turns the skip off; `OUT=<dir>` writes a
 directory for `CCB_CARRIER_SSH_STAGE_BINARY_DIR` instead of the embed
 directory; `TAGS=` builds without `condor_nosqlite`. The script refuses to
 build a tagged helper that still links SQLite, because that only shows up as

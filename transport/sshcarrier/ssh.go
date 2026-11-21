@@ -277,6 +277,10 @@ func startStaged(ctx context.Context, client *ssh.Client, cfg Config, stage Stag
 // from stdin without being asked.
 const ListenFlag = "-listen"
 
+// SpliceFlag tells a full htc-ccb to be a splice helper. A dedicated
+// htc-ccb-splice build is one already and takes no such flag.
+const SpliceFlag = "-carrier-splice"
+
 // remoteCommand builds what runs on the far host.
 //
 // There is no environment to control and no configuration to point at. The
@@ -287,6 +291,12 @@ const ListenFlag = "-listen"
 // a configuration file -- a reconfiguration risk a byte relay does not have.
 func remoteCommand(s StagedPaths, listen string) string {
 	cmd := shellQuote(s.Binary)
+	if !s.Helper {
+		// A full htc-ccb was staged -- no helper build was available for this
+		// platform, or the broker sent the binary it is running. Same relay,
+		// larger file, and it has to be told which role to take.
+		cmd += " " + SpliceFlag
+	}
 	if listen != "" {
 		cmd += " " + ListenFlag + " " + shellQuote(listen)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -323,10 +324,14 @@ func TestDialStagedInstallsThenRunsTheStagedCopy(t *testing.T) {
 	if !strings.Contains(*cmd, "/home/ccb/.cache/htc-ccb/htc-ccb-") {
 		t.Errorf("ran %q; it does not name the staged path", *cmd)
 	}
-	// The helper takes its carrier from stdin without being told; what the
-	// command must NOT carry is the old broker invocation.
+	// This test stages a file named htc-ccb..., i.e. a full binary, so it must
+	// be told which role to take. A dedicated htc-ccb-splice build takes no
+	// flag -- see TestAHelperBuildIsRunWithoutTheSpliceFlag.
+	if !strings.Contains(*cmd, "-carrier-splice") {
+		t.Errorf("ran %q; a full htc-ccb must be told to be a splice helper", *cmd)
+	}
 	if strings.Contains(*cmd, "-carrier-stdio") {
-		t.Errorf("ran %q; the staged process is a splice helper, not a broker", *cmd)
+		t.Errorf("ran %q; the staged process is a relay, not a broker", *cmd)
 	}
 	if uploads, _ := h.count(); uploads != 1 {
 		t.Errorf("uploaded %d times, want 1", uploads)
@@ -447,5 +452,46 @@ func TestNoStagedConfigLeavesTheEnvironmentAlone(t *testing.T) {
 	}
 	if cmd := ran.Load(); cmd == nil || strings.Contains(*cmd, "env -i") {
 		t.Errorf("ran %v; with no staged config the environment should be left alone", cmd)
+	}
+}
+
+// A dedicated helper build runs the relay with no flag; adding one would make
+// it exit on an unknown argument, and the carrier would die at startup with
+// nothing to say why.
+func TestAHelperBuildIsRunWithoutTheSpliceFlag(t *testing.T) {
+	h := newFakeHost("Linux x86_64")
+	var ran atomic.Pointer[string]
+	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		if strings.HasPrefix(cmd, "uname") || strings.Contains(cmd, "wc -c <") || strings.Contains(cmd, "cat >") {
+			return h.handle(cmd, stdin, stdout, stderr)
+		}
+		ran.Store(&cmd)
+		_, _ = io.Copy(stdout, stdin)
+		return 0
+	})
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "htc-ccb-splice")
+	if err := os.WriteFile(bin, []byte("fake helper body"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := DialStaged(ctx, s.config(""), StageConfig{Binary: bin, RemoteDir: "/scratch/ccb"})
+	if err != nil {
+		t.Fatalf("DialStaged: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	cmd := ran.Load()
+	if cmd == nil {
+		t.Fatal("the helper was never run")
+	}
+	if strings.Contains(*cmd, "-carrier-splice") {
+		t.Errorf("ran %q; a htc-ccb-splice build is already a helper and rejects that flag", *cmd)
 	}
 }

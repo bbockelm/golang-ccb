@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -36,6 +37,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
+	"github.com/bbockelm/golang-ccb/transport/splice"
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
 
@@ -68,6 +70,7 @@ func run() error {
 	// config lookups (CCB.<key> / <local-name>.<key> beat the bare key).
 	localName := flag.String("local-name", "", "HTCondor subsystem local-name; passed by condor_master. Used as a config-lookup prefix.")
 	_ = flag.String("sock", "", "HTCondor shared-port endpoint name; passed by condor_master. Accepted for compatibility; the endpoint fd is inherited via CONDOR_INHERIT.")
+	carrierSplice := flag.Bool("carrier-splice", false, "run as a splice helper: accept connections on -listen and copy each onto its own stream of the carrier taken from stdin. Terminates no CEDAR, reads no configuration and holds no credentials -- the authorization boundary stays at the broker that started it. This is what an SSH carrier runs when it stages this binary instead of the smaller htc-ccb-splice; `ssh <node> htc-ccb -carrier-splice -listen <addr>`. Starts no daemon.")
 	carrierStdio := flag.Bool("carrier-stdio", false, "take this process's stdin and stdout as the carrier to the outside CCB, and run as the inside broker over it. This is what `ssh <node> htc-ccb -carrier-stdio` starts at the far end of a cmd: carrier: the broker joins the pool through the pipe it was started with and binds no port of its own to reach the outside. Equivalent to CCB_OUTBOUND_NEXT_HOP = stdio:.")
 	finishLogin := flag.String("finish-login", "", "attach to the broker at this `address` and finish a login it is waiting on: the broker's ssh carrier asks for a password or a one-time code, this prints the question and sends back the answer. Attaching also releases a carrier that parked for want of a person, so it retries at once. Starts no daemon.")
 	carrierCheck := flag.Bool("carrier-check", false, "check that the configured carrier can reach the outside CCB (proxy, CONNECT, TLS, token, CEDAR handshake), print a per-stage report, and exit non-zero if any stage fails. Starts no daemon; a diagnostic to run by hand when a node cannot reach its broker.")
@@ -77,12 +80,7 @@ func run() error {
 	// port alongside an inherited command socket; left at its default we preserve the
 	// pre-existing behavior (advertise the shared-port sinful, bind no extra TCP port) so a
 	// pure shared-port deployment does not collide with the shared-port server's own port.
-	listenExplicit := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "listen" {
-			listenExplicit = true
-		}
-	})
+	listenExplicit := flagWasSet("listen")
 
 	// Claim stdin and stdout for the carrier before anything else runs. The
 	// pipe carries a framed protocol, so one line written to stdout in between
@@ -90,6 +88,13 @@ func run() error {
 	// the symptom would be an unintelligible yamux error at the far end.
 	// Claiming here also points stdout at stderr, so a later stray write is
 	// harmless.
+	// A splice helper needs nothing this process would otherwise set up -- no
+	// configuration, no daemon, no listeners -- so it runs here, before any of
+	// it. Same claim on stdout as -carrier-stdio below, for the same reason.
+	if *carrierSplice {
+		return runCarrierSplice(*listen)
+	}
+
 	var stdioPipe net.Conn
 	if *carrierStdio {
 		var err error
@@ -1094,4 +1099,51 @@ func advertisedAddress(d *daemon.Daemon, directLn net.Listener, flagValue string
 		return sinful, nil
 	}
 	return "", fmt.Errorf("running behind shared port but could not derive an advertised address; pass -public <host:port?sock=name>")
+}
+
+// flagWasSet reports whether a flag was given on the command line, as opposed
+// to carrying its default. flag.Visit walks only what was set.
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// runCarrierSplice is the splice-helper role inside the full binary.
+//
+// It is byte-for-byte the same job as cmd/htc-ccb-splice, and exists so that a
+// broker staging over SSH has something to send when no htc-ccb-splice build
+// is available for the far host -- including the broker's own platform, where
+// it can stage the binary it is already running. The helper build is still
+// preferred: this one is 6.59 MiB gzipped against its 1.43 MiB, and that
+// difference crosses the network on every host that has not seen it.
+func runCarrierSplice(listen string) error {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("stdin is a terminal, so there is no carrier to the outside CCB; " +
+			"-carrier-splice is started by an outside broker over a transport that gives it a pipe, " +
+			"typically `ssh host htc-ccb -carrier-splice`, and is not run interactively")
+	}
+	pipe, err := cmdcarrier.Stdio(log)
+	if err != nil {
+		return err
+	}
+	h, err := splice.Start(splice.Config{Listen: listen, Pipe: pipe, Log: log})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = h.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := h.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	log.Info("shutting down")
+	return nil
 }
