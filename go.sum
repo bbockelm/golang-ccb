@@ -1,9 +1,9 @@
-github.com/PelicanPlatform/classad v0.38.2 h1:FqhqCbSZg/soRV4E0swPP1uU/53nLvXSY4Sak5zQq0U=
-github.com/PelicanPlatform/classad v0.38.2/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
+github.com/PelicanPlatform/classad v0.43.0 h1:x9lZvh0zNAlzFn/DavsA/hR67CBFcnyUJ3TLLCODnzo=
+github.com/PelicanPlatform/classad v0.43.0/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
 github.com/bbockelm/cedar v0.7.16 h1:03Ti8digqS1dK+SCGFpkJTb4v8HPKcDsylNPidA9vMA=
 github.com/bbockelm/cedar v0.7.16/go.mod h1:i2/CctKzhvEyYKOfxTHx4zcRKujI4nblDX76sb9dU88=
-github.com/bbockelm/golang-htcondor v0.22.1 h1:eVLf08GlNZKcsrxtNHZKARGapZkdh+nseGzlljL5mkI=
-github.com/bbockelm/golang-htcondor v0.22.1/go.mod h1:S/ULg2+k+0XuXsSa9djUnoQqWrd5pkwmjYVjBKcxPyI=
+github.com/bbockelm/golang-htcondor v0.24.0 h1:Uwe//LsEQi0yJtKBLN9HPzBGKUWhDY7L6lPFEruCJlQ=
+github.com/bbockelm/golang-htcondor v0.24.0/go.mod h1:s5CFHGU7o7qyRZ61E0vPH2h+gPyPBiUNiF/rKAja0JA=
 github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=
 github.com/bbockelm/gosssd v0.0.4/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
@@ -84,8 +84,8 @@ golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v
 golang.org/x/net v0.0.0-20220722155237-a158d28d115b/go.mod h1:XRhObCWvk6IyKnWLug+ECip1KBveYUHfp+8e9klMJ9c=
 golang.org/x/net v0.6.0/go.mod h1:2Tu9+aMcznHK/AK1HMvgo6xiTLG5rD5rZLDS+rp2Bjs=
 golang.org/x/net v0.7.0/go.mod h1:2Tu9+aMcznHK/AK1HMvgo6xiTLG5rD5rZLDS+rp2Bjs=
-golang.org/x/net v0.62.0 h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=
-golang.org/x/net v0.62.0/go.mod h1:WgDCOTH8iwtB66T4/GfI94AHo/hhdb7Hah9NDseQfiI=
+golang.org/x/net v0.63.0 h1:HCoTmNh9EpD1PpK8gBNFY4gcTY4N+KQEO8ylfIKqFJ0=
+golang.org/x/net v0.63.0/go.mod h1:15JLg3IX1bLjHK264EZQEbIpTiR/KVLuo9CTRWd0pig=
 golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 golang.org/x/sync v0.25.0 h1:dJnifr0nMV8/SBnBvdo4eSGGnrc3O4FFx6IqvtLcmRs=
