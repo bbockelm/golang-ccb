@@ -28,7 +28,7 @@ import (
 // pass whatever the keepalive did.
 func idleThenUse(t *testing.T, keepalive time.Duration, proxyIdle, quiet time.Duration) (tunnels int, err error) {
 	t.Helper()
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.StartWithIdleTimeout(t, proxyIdle)
 	targetIP := nonLoopbackIPv4(t)
 
@@ -36,7 +36,7 @@ func idleThenUse(t *testing.T, keepalive time.Duration, proxyIdle, quiet time.Du
 	targetAddr, stopTgt := startLingeringDialTarget(t, targetIP, served)
 	defer stopTgt()
 
-	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, []string{targetIP + "/32"})
+	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, []string{targetIP + "/32"})
 	defer stopOut()
 
 	cfg := insideWSSConfig("", carrierURL, clientTLS, proxy, true)

@@ -43,6 +43,13 @@ type TokenSource func(ctx context.Context) (string, error)
 type ListenConfig struct {
 	// Addr is the TCP listen address ("host:port" or ":port").
 	Addr string
+	// Inner, if set, is served instead of binding Addr, and Addr is ignored.
+	//
+	// For a listener that is already bound: one inherited from a supervisor or
+	// socket activation, or one a test bound itself so that the port it tells
+	// peers to dial cannot be taken by anyone else in between. Close() closes
+	// it, so ownership passes to this Listener.
+	Inner net.Listener
 	// Path is the upgrade path (default DefaultPath).
 	Path string
 	// TLS, if set, serves HTTPS (wss). nil serves plaintext HTTP (ws) -- test/dev
@@ -148,9 +155,12 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	if maxSessions <= 0 {
 		maxSessions = DefaultMaxSessions
 	}
-	inner, err := net.Listen("tcp", cfg.Addr)
-	if err != nil {
-		return nil, err
+	inner := cfg.Inner
+	if inner == nil {
+		var err error
+		if inner, err = net.Listen("tcp", cfg.Addr); err != nil {
+			return nil, err
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{

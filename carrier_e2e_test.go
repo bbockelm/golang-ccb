@@ -193,7 +193,7 @@ func TestOutboundProxyTwoCCBOverFSCarrier(t *testing.T) {
 // ws://; a client reaching the nested contact over TCP dispatches an end-to-end
 // DC_NOP through both CCBs, proving the WebSocket carrier is transparent.
 func TestInboundTunnel2CCBOverWSCarrier(t *testing.T) {
-	carrierURL := fmt.Sprintf("ws://127.0.0.1:%d/ccb/tunnel", freePort(t))
+	carrierURL, carrierLn := heldCarrier(t, "ws")
 	verify := func(_ context.Context, tok string) (string, error) {
 		if tok == "insider-token" {
 			return "inside@pool", nil
@@ -212,6 +212,7 @@ func TestInboundTunnel2CCBOverWSCarrier(t *testing.T) {
 		Security:           plaintextSec(),
 		RequestTimeout:     5 * time.Second,
 		CarrierListen:      carrierURL,
+		carrierInner:       carrierLn,
 		CarrierTokenVerify: verify,
 	})
 	if err != nil {
