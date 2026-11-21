@@ -11,7 +11,7 @@ import (
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/commands"
 	cedarserver "github.com/bbockelm/cedar/server"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // logCatcher is a slog.Handler that records log messages so a test can assert

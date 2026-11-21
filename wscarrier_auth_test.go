@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/golang-htcondor/mapfile"
+	"github.com/htcondor/golang-htcondor/mapfile"
 	"github.com/golang-jwt/jwt/v5"
 )
 

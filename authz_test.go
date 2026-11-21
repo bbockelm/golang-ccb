@@ -14,7 +14,7 @@ import (
 	"github.com/bbockelm/cedar/client"
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/golang-htcondor/authz"
+	"github.com/htcondor/golang-htcondor/authz"
 )
 
 // testCfg is a minimal authz.ConfigGetter backed by a map.
