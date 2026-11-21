@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -73,7 +74,38 @@ func startOutsideWSSCCB(t *testing.T, carrierURL string, serverTLS *tls.Config, 
 	}
 	ctx, c := context.WithCancel(context.Background())
 	go func() { _ = srv.Serve(ctx, ln) }()
+	waitForCarrierAccepting(t, carrierURL)
 	return tcpAddr, rec, c
+}
+
+// waitForCarrierAccepting blocks until the carrier endpoint accepts a
+// connection.
+//
+// wssCarrier() names a port that nothing is listening on -- freePort() closes
+// its probe socket before returning the number -- and Serve() binds it on the
+// goroutine above.  Returning as soon as that goroutine is launched hands the
+// caller an address that refuses connections for a few milliseconds, which a
+// proxied CONNECT reports as "503 Service Unavailable ... the far broker is
+// listening?".  Only a loaded machine loses the race, so it reads as a flake.
+//
+// A plain TCP dial is enough: the question is whether the listener is bound,
+// not whether TLS completes.  The half-open connection is discarded, and the
+// tests assert only on log lines they expect to see, never on their absence.
+func waitForCarrierAccepting(t *testing.T, carrierURL string) {
+	t.Helper()
+	u, err := url.Parse(carrierURL)
+	if err != nil {
+		t.Fatalf("parsing carrier URL %q: %v", carrierURL, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.DialTimeout("tcp", u.Host, 200*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("carrier endpoint %s never started accepting", u.Host)
 }
 
 // insideWSSConfig is the inside CCB of a restricted node: it serves local EPs
