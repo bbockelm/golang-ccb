@@ -3,6 +3,7 @@ package carrier
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 func localListener(t *testing.T) net.Listener {
@@ -57,7 +58,11 @@ func TestLimitListenerCapsSessions(t *testing.T) {
 	}
 
 	_ = held[0].Close()
-	if got := l.Sessions(); got != 1 {
+	// Close() ends our side; the listener drops the session when ITS goroutine
+	// observes that, which does not happen before Close() returns.  Reading the
+	// count once races that goroutine and reports the pre-close value on a loaded
+	// machine, so wait for the drop instead.
+	if got := waitForSessions(l, 1); got != 1 {
 		t.Errorf("after closing one pipe, holding %d sessions, want 1", got)
 	}
 }
@@ -119,4 +124,17 @@ func TestLimitListenerPerSourceZeroDisables(t *testing.T) {
 	if got := l.Sessions(); got != 3 {
 		t.Errorf("holding %d sessions from one source, want 3", got)
 	}
+}
+
+// waitForSessions polls until the listener reports want sessions, returning the
+// last value it saw.  A test that wants to prove the count NEVER reaches a value
+// must not use this -- it returns as soon as the value appears.
+func waitForSessions(l *LimitListener, want int) int {
+	deadline := time.Now().Add(5 * time.Second)
+	got := l.Sessions()
+	for got != want && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+		got = l.Sessions()
+	}
+	return got
 }
