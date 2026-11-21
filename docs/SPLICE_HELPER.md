@@ -286,7 +286,7 @@ Measured, linux/amd64, `-trimpath -s -w`:
 | | raw | gzipped |
 |---|---|---|
 | `htc-ccb` | 15.4 MiB | 6.35 MiB |
-| `htc-ccb-relay` (a real inside CCB, `-tags condor_nosqlite`) | 11.7 MiB | 4.71 MiB |
+| `htc-ccb-relay` (the former staged broker, since deleted) | 11.7 MiB | 4.71 MiB |
 | **`htc-ccb-splice`** | **3.4 MiB** | **1.43 MiB** |
 
 Two things that look like detail and are not:
@@ -332,14 +332,17 @@ Built:
   `Server.CarrierHooks`, so one broker serves many helpers and a contact naming
   a dead carrier resolves to nothing;
 - the nested contact and hop collapse (§3.3);
-- the cedar half of §3.2, as cedar's `CCBProxyMode`.
+- the cedar half of §3.2, as cedar's `CCBProxyMode`, with the broker setting it
+  on every forwarded proxy request;
+- the SSH carrier stages `htc-ccb-splice`; `htc-ccb-relay` is deleted, and the
+  full broker is refused as a substitute rather than silently run as an inside
+  CCB;
+- `Server.CarrierHooks` wired into the real carrier listener, so a target
+  registering over a carrier is carrier-attached in a running broker and not
+  only in a test that wires the hooks by hand.
 
 Remaining:
 
-- depend on a cedar release carrying `CCBProxyMode`, then drop the
-  `ListenerConfig.Dial` stand-in from the tests here;
-- wire the helper into the SSH carrier's staging (the `ssh-carrier` branch), so
-  a broker stages `htc-ccb-splice` rather than `htc-ccb-relay`;
 - the C++ streaming trigger (§3.3): v26 streams only when the client is itself
   behind a CCB, so a public client cannot reach a carrier-attached target.
   Needed for Stage D regardless of this model -- where it is not a stall but a

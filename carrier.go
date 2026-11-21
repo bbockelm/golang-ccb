@@ -16,6 +16,8 @@ import (
 	"github.com/bbockelm/golang-ccb/transport/carrier"
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 	"github.com/bbockelm/golang-ccb/transport/fstun"
+	"github.com/bbockelm/golang-ccb/transport/sshcarrier"
+	"github.com/bbockelm/golang-ccb/transport/sshcarrier/remotebin"
 	"github.com/bbockelm/golang-ccb/transport/tcpcarrier"
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )
@@ -32,12 +34,14 @@ import (
 //	tcp://host:port            raw carrier pipe over TCP (behind a tunnel)
 //	cmd:<command line>         spawn a command; its stdin/stdout is the pipe
 //	stdio:                     this process's own stdin/stdout is the pipe
+//	ssh://[user@]host[:port]   an SSH session this broker opens itself
 type carrierRef struct {
-	scheme string // "fs", "ws" (ws:// and wss://), "tcp", "cmd" or "stdio"
+	scheme string // "fs", "ws" (ws:// and wss://), "tcp", "cmd", "stdio" or "ssh"
 	path   string // filesystem root for scheme "fs"
 	url    string // full ws/wss URL for scheme "ws"
-	addr   string // host:port for scheme "tcp"
+	addr   string // host:port for scheme "tcp", host[:port] for "ssh"
 	argv   string // the unparsed command line for scheme "cmd"
+	user   string // login name for scheme "ssh", when the address carries one
 	tls    bool   // wss (TLS)
 }
 
@@ -65,6 +69,13 @@ func parseCarrierRef(addr string) (carrierRef, bool) {
 	if c, ok := strings.CutPrefix(addr, "cmd:"); ok {
 		return carrierRef{scheme: "cmd", argv: strings.TrimSpace(c)}, true
 	}
+	if rest, ok := strings.CutPrefix(addr, "ssh://"); ok {
+		user, host := "", rest
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			user, host = rest[:at], rest[at+1:]
+		}
+		return carrierRef{scheme: "ssh", addr: strings.Trim(host, "/"), user: user}, true
+	}
 	// "stdio:" and a bare "stdio" both name the inherited pipe; there is
 	// nothing after the scheme to get wrong.
 	if addr == "stdio:" || addr == "stdio" {
@@ -83,7 +94,7 @@ func isCarrier(addr string) bool {
 // has no notion of listening, so an outside broker configured with one obtains
 // its pipes through a carrier.SourceListener instead of a network listener.
 func (r carrierRef) spawns() bool {
-	return r.scheme == "cmd" || r.scheme == "stdio"
+	return r.scheme == "cmd" || r.scheme == "stdio" || r.scheme == "ssh"
 }
 
 // fstunConfig builds the fstun endpoint config for a carrier ref (defaults for
@@ -100,6 +111,11 @@ func (r carrierRef) describe() string {
 		return "tcp://" + r.addr
 	case "cmd":
 		return "cmd:" + r.argv
+	case "ssh":
+		if r.user != "" {
+			return "ssh://" + r.user + "@" + r.addr
+		}
+		return "ssh://" + r.addr
 	case "stdio":
 		return "stdio:"
 	default:
@@ -118,12 +134,18 @@ type carrierClient struct {
 	src carrier.PipeSource
 
 	// WebSocket dial parameters (scheme "ws"); unused for the others.
+	// prompter answers a server that wants something only a person can give.
+	prompter        sshcarrier.Prompter
 	token           string
 	tokenSource     func(ctx context.Context) (string, error)
 	clientTLS       *tls.Config
 	unauthenticated bool
 	proxy           func(*http.Request) (*url.URL, error)
 	keepalive       time.Duration
+
+	// gate is the broker's; see Server.gate. Never nil -- every construction
+	// site passes one, and the dial closure dereferences it.
+	gate *carrier.HumanGate
 
 	// exhausted is closed when the pipe source can never produce another pipe,
 	// which for a stdio carrier means the parent that started this broker has
@@ -137,7 +159,7 @@ type carrierClient struct {
 	done     bool
 }
 
-func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) (*carrierClient, error) {
+func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger, gate *carrier.HumanGate) (*carrierClient, error) {
 	c := &carrierClient{
 		ref:             ref,
 		log:             log,
@@ -148,6 +170,7 @@ func newCarrierClient(ref carrierRef, cfg Config, log *slog.Logger) (*carrierCli
 		proxy:           cfg.CarrierProxy,
 		keepalive:       cfg.CarrierKeepalive,
 		exhausted:       make(chan struct{}),
+		gate:            gate,
 	}
 	src, err := c.pipeSource(cfg)
 	if err != nil {
@@ -183,6 +206,35 @@ func (c *carrierClient) pipeSource(cfg Config) (carrier.PipeSource, error) {
 		return carrier.Dialing(label, func(ctx context.Context) (net.Conn, error) {
 			return cmdcarrier.Dial(ctx, dialCfg)
 		}), nil
+	case "ssh":
+		sshCfg, stage, err := c.sshConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return carrier.Dialing(label, func(ctx context.Context) (net.Conn, error) {
+			// Read the prompter here rather than capturing it: the console is
+			// attached to the client after the source is built, so a captured
+			// copy would be nil and the carrier would never ask anyone.
+			sshCfg := sshCfg
+			sshCfg.Prompter = c.prompter
+			// A carrier parked for want of a person does not dial: the server
+			// would ask the same question and there would still be nobody.
+			// The operator console releases the gate when one turns up.
+			if st, parked := c.gate.Parked(); parked {
+				return nil, fmt.Errorf("carrier %s is waiting for an operator (%v ago): %w",
+					c.describe(), st.Since.Round(time.Second), st.Reason)
+			}
+			var conn net.Conn
+			if stage != nil {
+				conn, err = sshcarrier.DialStaged(ctx, sshCfg, *stage)
+			} else {
+				conn, err = sshcarrier.Dial(ctx, sshCfg)
+			}
+			if err != nil && sshcarrier.NeedsHuman(err) {
+				c.gate.Park(err)
+			}
+			return conn, err
+		}), nil
 	case "stdio":
 		pipe := cfg.CarrierPipe
 		if pipe == nil {
@@ -216,6 +268,52 @@ func (c *carrierClient) cmdDialConfig(cfg Config) (cmdcarrier.DialConfig, error)
 	}, nil
 }
 
+// sshConfig builds the SSH dial parameters, and the staging plan when a binary
+// is configured. Validated here, at startup, so a missing known_hosts or an
+// unreadable key is reported before anything depends on the carrier.
+func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.StageConfig, error) {
+	sc := sshcarrier.Config{
+		Addr:          c.ref.addr,
+		User:          c.ref.user,
+		KnownHosts:    cfg.CarrierSSH.KnownHosts,
+		HostKeys:      cfg.CarrierSSH.HostKeys,
+		IdentityFiles: cfg.CarrierSSH.IdentityFiles,
+		Agent:         cfg.CarrierSSH.Agent,
+		ProxyJump:     cfg.CarrierSSH.ProxyJump,
+		Command:       cfg.CarrierSSH.Command,
+		HelperListen:  cfg.CarrierSSH.HelperListen,
+		Logger:        c.log,
+	}
+	if sc.User == "" {
+		sc.User = cfg.CarrierSSH.User
+	}
+	// A carrier that cannot verify the host it is handing the tunnel to is not
+	// a carrier worth having, so this is refused rather than defaulted.
+	if len(sc.KnownHosts) == 0 && len(sc.HostKeys) == 0 {
+		return sshcarrier.Config{}, nil, fmt.Errorf("ccbserver: an ssh:// carrier requires CCB_CARRIER_SSH_KNOWN_HOSTS or CCB_CARRIER_SSH_HOST_KEY")
+	}
+	// An explicit command means the far host already has a broker and the
+	// operator has said how to run it; nothing is staged.
+	if sc.Command != "" && cfg.CarrierSSH.StageBinary == "" && cfg.CarrierSSH.StageBinaryDir == "" {
+		return sc, nil, nil
+	}
+	// Otherwise stage. With neither a file nor a directory named, the only
+	// source left is a build compiled into this one -- which an ordinary
+	// htc-ccb does not carry. That is knowable now, so say so now rather than
+	// on the first dial. Which *platforms* are carried is not knowable until
+	// the far host says what it is, so that case is left to staging.
+	if cfg.CarrierSSH.StageBinary == "" && cfg.CarrierSSH.StageBinaryDir == "" && !remotebin.Any() {
+		return sshcarrier.Config{}, nil, fmt.Errorf(
+			"ccbserver: an ssh:// carrier needs CCB_CARRIER_SSH_STAGE_BINARY, CCB_CARRIER_SSH_STAGE_BINARY_DIR or CCB_CARRIER_SSH_COMMAND (this htc-ccb carries no built-in builds to stage; one built with -tags embedremote does)")
+	}
+	return sc, &sshcarrier.StageConfig{
+		Binary:    cfg.CarrierSSH.StageBinary,
+		BinaryDir: cfg.CarrierSSH.StageBinaryDir,
+		RemoteDir: cfg.CarrierSSH.RemoteDir,
+		Logger:    c.log,
+	}, nil
+}
+
 // wsDialConfig is the WebSocket dial parameters for this carrier, in one place
 // so the dial and the route reported in logs cannot drift apart.
 func (c *carrierClient) wsDialConfig() wscarrier.DialConfig {
@@ -246,6 +344,23 @@ func (c *carrierClient) route() string {
 }
 
 func (c *carrierClient) describe() string { return c.ref.describe() }
+
+// canAskAnOperator reports whether any configured carrier has a way to put a
+// question to a person. Only the embedded SSH carrier does: a cmd: carrier's
+// ssh talks to its own terminal, which the broker does not have.
+//
+// Both roles count. An outside broker reaching into a cluster over ssh:// hits
+// the same two-factor prompt as an inside broker reaching out, and its carrier
+// is built by the listener rather than by detectCarrier.
+func (s *Server) canAskAnOperator() bool {
+	if s.carrier != nil && s.carrier.ref.scheme == "ssh" {
+		return true
+	}
+	if r, ok := parseCarrierRef(s.cfg.CarrierListen); ok && r.scheme == "ssh" {
+		return true
+	}
+	return false
+}
 
 // Exhausted is closed when this broker's carrier can never be re-established.
 // Only a stdio carrier can reach that state: its pipe came from the process
@@ -381,7 +496,7 @@ func (s *Server) detectCarrier() (*carrierClient, error) {
 			return nil, fmt.Errorf("ccbserver: stdio: is configured as both this broker's carrier to its outside CCB and its CarrierListen; one inherited pipe cannot carry both roles")
 		}
 	}
-	return newCarrierClient(refs[0], s.cfg, s.log)
+	return newCarrierClient(refs[0], s.cfg, s.log, s.gate)
 }
 
 // startCarrierListener runs an outside CCB's acceptor for inside CCBs arriving
@@ -403,7 +518,15 @@ func (s *Server) startCarrierListener(ctx context.Context) {
 		s.log.Error("failed to start carrier listener", "carrier", s.cfg.CarrierListen, "error", err)
 		return
 	}
-	ml := carrier.NewMuxListener(inner, carrier.WithFirstStreamTimeout(s.pipeProbation()))
+	// WithPipeHooks is what makes a target that registers over this carrier
+	// carrier-attached: one pipe gets one CCBID, so its contact nests as
+	// <outside>#P#T and the broker collapses the hop locally. Without the
+	// hooks the set stays empty, every registrant looks directly attached,
+	// and the nesting the splice model depends on never happens.
+	ml := carrier.NewMuxListener(inner,
+		carrier.WithFirstStreamTimeout(s.pipeProbation()),
+		carrier.WithPipeHooks(s.CarrierHooks()),
+	)
 	go func() {
 		<-ctx.Done()
 		_ = ml.Close()
@@ -466,7 +589,7 @@ func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
 func (s *Server) spawningCarrierListener(ref carrierRef) (net.Listener, error) {
 	// A carrierClient is the one place that knows how to build a pipe source
 	// from a ref; the outside role needs the source, not the client.
-	c := &carrierClient{ref: ref, log: s.log, exhausted: make(chan struct{})}
+	c := &carrierClient{ref: ref, log: s.log, exhausted: make(chan struct{}), gate: s.gate, prompter: s.console}
 	src, err := c.pipeSource(s.cfg)
 	if err != nil {
 		return nil, err
@@ -477,7 +600,10 @@ func (s *Server) spawningCarrierListener(ref carrierRef) (net.Listener, error) {
 	ln := carrier.NewSourceListener(src, s.log, carrier.Backoff{
 		Initial: s.cfg.CarrierRetryInitial,
 		Max:     s.cfg.CarrierRetryMax,
-	}, carrier.OnePipeAtATime())
+	}, carrier.OnePipeAtATime(),
+		// Without this the loop would retry a login that needs a person on the
+		// ordinary backoff, which is what the gate exists to prevent.
+		carrier.WithNeedsHuman(s.gate, sshcarrier.NeedsHuman))
 	return &exhaustNotifier{Listener: ln, notify: s.markCarrierExhausted}, nil
 }
 

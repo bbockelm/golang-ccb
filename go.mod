@@ -43,5 +43,5 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/htcondor/golang-htcondor v0.25.0
 	github.com/pkg/errors v0.9.1 // indirect
-	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/crypto v0.59.0
 )
