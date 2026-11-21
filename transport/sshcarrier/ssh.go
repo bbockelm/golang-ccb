@@ -79,6 +79,11 @@ type Config struct {
 	// carrier wants.
 	Command string
 
+	// HelperListen is the address the staged splice helper accepts local
+	// connections on -- what daemons on the far host name as their CCB. Empty
+	// leaves the helper's own default.
+	HelperListen string
+
 	// Timeout bounds the connect and handshake. Zero uses DefaultTimeout.
 	Timeout time.Duration
 
@@ -262,35 +267,30 @@ func startStaged(ctx context.Context, client *ssh.Client, cfg Config, stage Stag
 		return nil, err
 	}
 	if cfg.Command == "" {
-		cfg.Command = remoteCommand(staged)
+		cfg.Command = remoteCommand(staged, cfg.HelperListen)
 	}
 	return Start(client, cfg)
 }
 
-// StdioFlag is what the staged broker is told to be: the far end of this
-// carrier, taking the pipe it was started with.
-const StdioFlag = "-carrier-stdio"
+// ListenFlag names the address the staged splice helper accepts local
+// connections on. Its carrier is the pipe it was started with, which it takes
+// from stdin without being asked.
+const ListenFlag = "-listen"
 
 // remoteCommand builds what runs on the far host.
 //
-// With a staged configuration the broker is started in a controlled
-// environment -- `env -i` with only CONDOR_CONFIG, HOME and PATH -- so nothing
-// the login host puts in a shell profile reaches it. That matters beyond
-// tidiness: HTCondor reads _CONDOR_<PARAM> from the environment and lets it
-// override the configuration file, so a stray _CONDOR_SEC_DEFAULT_AUTHENTICATION
-// on the remote host would quietly reconfigure the broker's security. HOME and
-// PATH are carried across from the login shell, because dropping those breaks
-// more than it protects.
-//
-// Without a staged configuration the broker is run plainly: the operator is
-// relying on the far host's own configuration deliberately, and clearing the
-// environment would take CONDOR_CONFIG with it.
-func remoteCommand(s StagedPaths) string {
-	if s.Config == "" {
-		return shellQuote(s.Binary) + " " + StdioFlag
+// There is no environment to control and no configuration to point at. The
+// staged process is a splice helper: it accepts connections and copies bytes,
+// reads no HTCondor configuration, and holds no credentials. The `env -i`
+// wrapper that used to run here existed because the staged process was a
+// broker and HTCondor lets a stray _CONDOR_<PARAM> in the environment override
+// a configuration file -- a reconfiguration risk a byte relay does not have.
+func remoteCommand(s StagedPaths, listen string) string {
+	cmd := shellQuote(s.Binary)
+	if listen != "" {
+		cmd += " " + ListenFlag + " " + shellQuote(listen)
 	}
-	return "env -i CONDOR_CONFIG=" + shellQuote(s.Config) +
-		` HOME="$HOME" PATH="$PATH" ` + shellQuote(s.Binary) + " " + StdioFlag
+	return cmd
 }
 
 // Connect performs the TCP connect, the host-key check and authentication,

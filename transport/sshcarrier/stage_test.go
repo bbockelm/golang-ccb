@@ -323,8 +323,10 @@ func TestDialStagedInstallsThenRunsTheStagedCopy(t *testing.T) {
 	if !strings.Contains(*cmd, "/home/ccb/.cache/htc-ccb/htc-ccb-") {
 		t.Errorf("ran %q; it does not name the staged path", *cmd)
 	}
-	if !strings.Contains(*cmd, StdioFlag) {
-		t.Errorf("ran %q; it does not tell the far broker to be the stdio end", *cmd)
+	// The helper takes its carrier from stdin without being told; what the
+	// command must NOT carry is the old broker invocation.
+	if strings.Contains(*cmd, "-carrier-stdio") {
+		t.Errorf("ran %q; the staged process is a splice helper, not a broker", *cmd)
 	}
 	if uploads, _ := h.count(); uploads != 1 {
 		t.Errorf("uploaded %d times, want 1", uploads)
@@ -367,10 +369,14 @@ func TestDialStagedHonoursAnExplicitCommand(t *testing.T) {
 	}
 }
 
-// A staged configuration is what makes zero touch independent of the far
-// host: without it the broker reads whatever config that host has, which is
-// either nothing or another pool's.
-func TestStageAlsoStagesTheConfiguration(t *testing.T) {
+// Nothing but the binary is staged, and it is run plainly.
+//
+// A staged broker needed a condor_config beside it and an `env -i` wrapper, so
+// that a stray _CONDOR_<PARAM> in the login host's environment could not
+// override its security settings. A splice helper reads no configuration and
+// holds no credentials, so there is nothing to stage and nothing to protect --
+// and a knob that staged a file the far end ignores would be worse than none.
+func TestOnlyTheBinaryIsStaged(t *testing.T) {
 	h := newFakeHost("Linux x86_64")
 	var ran atomic.Pointer[string]
 	s := newTestSSHServer(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -382,17 +388,11 @@ func TestStageAlsoStagesTheConfiguration(t *testing.T) {
 		return 0
 	})
 
-	conf := t.TempDir() + "/remote.conf"
-	if err := os.WriteFile(conf, []byte("CCB_OUTBOUND_PROXY = TRUE\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	c, err := DialStaged(ctx, s.config(""), StageConfig{
-		Binary:       localBinary(t, "fake htc-ccb binary body"),
-		CondorConfig: conf,
-		RemoteDir:    "/scratch/ccb",
+		Binary:    localBinary(t, "fake htc-ccb-splice body"),
+		RemoteDir: "/scratch/ccb",
 	})
 	if err != nil {
 		t.Fatalf("DialStaged: %v", err)
@@ -404,35 +404,20 @@ func TestStageAlsoStagesTheConfiguration(t *testing.T) {
 
 	cmd := ran.Load()
 	if cmd == nil {
-		t.Fatal("the broker was never run")
+		t.Fatal("the helper was never run")
 	}
-	// The environment must be controlled: HTCondor reads _CONDOR_<PARAM> from
-	// it and lets those override the file, so a login host's shell profile
-	// could otherwise reconfigure the broker's security.
-	if !strings.HasPrefix(*cmd, "env -i ") {
-		t.Errorf("the broker was not started in a controlled environment: %q", *cmd)
-	}
-	if !strings.Contains(*cmd, "CONDOR_CONFIG='/scratch/ccb/htc-ccb-") || !strings.Contains(*cmd, ".conf'") {
-		t.Errorf("the command does not point the broker at the staged config: %q", *cmd)
-	}
-	// HOME and PATH still come across; dropping them breaks more than it
-	// protects.
-	for _, keep := range []string{`HOME="$HOME"`, `PATH="$PATH"`} {
-		if !strings.Contains(*cmd, keep) {
-			t.Errorf("the command drops %s: %q", keep, *cmd)
+	for _, gone := range []string{"env -i", "CONDOR_CONFIG"} {
+		if strings.Contains(*cmd, gone) {
+			t.Errorf("the command still carries %q: %q", gone, *cmd)
 		}
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var sawConf bool
-	for p, body := range h.files {
-		if strings.HasSuffix(p, ".conf") && string(body) == "CCB_OUTBOUND_PROXY = TRUE\n" {
-			sawConf = true
+	for path := range h.files {
+		if strings.HasSuffix(path, ".conf") {
+			t.Errorf("a configuration file was staged (%s); the helper reads none", path)
 		}
-	}
-	if !sawConf {
-		t.Errorf("the configuration was not staged; files are %v", keysOf(h.files))
 	}
 }
 

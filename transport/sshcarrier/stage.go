@@ -101,24 +101,12 @@ type StageConfig struct {
 	// RemoteDir is where the binary goes; empty uses DefaultRemoteDir.
 	RemoteDir string
 
-	// CondorConfig is a local configuration file to stage beside the binary
-	// and point the remote broker at.
-	//
-	// Without it the staged broker reads whatever configuration the far host
-	// happens to have, which on a login node is either nothing or -- worse --
-	// another pool's: its security settings, its trust domain, its token
-	// directory. Staging one makes the remote broker depend on nothing it
-	// found there.
-	CondorConfig string
-
 	Logger *slog.Logger
 }
 
 // StagedPaths is what a stage left on the far host.
 type StagedPaths struct {
 	Binary string
-	// Config is empty when none was staged.
-	Config string
 }
 
 // Stage puts the binary on the far host if it is not already there, and returns
@@ -153,18 +141,6 @@ func Stage(ctx context.Context, client *ssh.Client, cfg StageConfig) (StagedPath
 	}
 	out := StagedPaths{Binary: remote}
 
-	if cfg.CondorConfig != "" {
-		confBody, err := os.ReadFile(cfg.CondorConfig)
-		if err != nil {
-			return StagedPaths{}, fmt.Errorf("sshcarrier: reading %s: %w", cfg.CondorConfig, err)
-		}
-		confSum := sha256.Sum256(confBody)
-		conf := path.Join(dir, "htc-ccb-"+hex.EncodeToString(confSum[:])[:16]+".conf")
-		if err := putFile(ctx, client, conf, confBody, log, "configuration", "", cfg.CondorConfig); err != nil {
-			return StagedPaths{}, err
-		}
-		out.Config = conf
-	}
 	return out, nil
 }
 

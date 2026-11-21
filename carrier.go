@@ -309,7 +309,6 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 		Binary:       cfg.CarrierSSH.StageBinary,
 		BinaryDir:    cfg.CarrierSSH.StageBinaryDir,
 		RemoteDir:    cfg.CarrierSSH.RemoteDir,
-		CondorConfig: cfg.CarrierSSH.StageConfig,
 		Logger:       c.log,
 	}, nil
 }

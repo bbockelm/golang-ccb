@@ -964,7 +964,6 @@ func sshCarrierSettings(cfg *config.Config) ccbserver.SSHCarrierConfig {
 		StageBinary:    configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY", ""),
 		StageBinaryDir: configString(cfg, "CCB_CARRIER_SSH_STAGE_BINARY_DIR", ""),
 		RemoteDir:      configString(cfg, "CCB_CARRIER_SSH_REMOTE_DIR", ""),
-		StageConfig:    configString(cfg, "CCB_CARRIER_SSH_STAGE_CONFIG", ""),
 		Command:        configString(cfg, "CCB_CARRIER_SSH_COMMAND", ""),
 	}
 }
