@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/security"
-	htcondor "github.com/bbockelm/golang-htcondor"
+	htcondor "github.com/htcondor/golang-htcondor"
 )
 
 // TestGoCCBUnderCondorMaster runs the Go CCB as the pool's CCB daemon under a

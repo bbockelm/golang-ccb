@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 
 	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/golang-htcondor/config"
-	"github.com/bbockelm/golang-htcondor/mapfile"
+	"github.com/htcondor/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/mapfile"
 )
 
 // defaultForeignTokenIssuers is SEC_SCITOKENS_FOREIGN_TOKEN_ISSUERS's default

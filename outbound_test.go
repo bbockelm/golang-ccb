@@ -14,7 +14,7 @@ import (
 	"github.com/bbockelm/cedar/security"
 	cedarserver "github.com/bbockelm/cedar/server"
 	"github.com/bbockelm/cedar/stream"
-	"github.com/bbockelm/golang-htcondor/authz"
+	"github.com/htcondor/golang-htcondor/authz"
 )
 
 // nonLoopbackIPv4 returns a routable (global-unicast, non-loopback, non-link-local)

@@ -23,12 +23,12 @@ import (
 
 	"github.com/bbockelm/cedar/ccb"
 	"github.com/bbockelm/cedar/security"
-	htcondor "github.com/bbockelm/golang-htcondor"
-	"github.com/bbockelm/golang-htcondor/config"
-	"github.com/bbockelm/golang-htcondor/daemon"
-	"github.com/bbockelm/golang-htcondor/logging"
-	"github.com/bbockelm/golang-htcondor/sessioncache"
-	"github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
+	htcondor "github.com/htcondor/golang-htcondor"
+	"github.com/htcondor/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/daemon"
+	"github.com/htcondor/golang-htcondor/logging"
+	"github.com/htcondor/golang-htcondor/sessioncache"
+	"github.com/htcondor/golang-htcondor/sessioncache/sqlite"
 
 	ccbserver "github.com/bbockelm/golang-ccb"
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"

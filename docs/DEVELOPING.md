@@ -27,7 +27,7 @@ reads HTCondor configuration and wires it up.
 
 Dependencies of note: [`cedar`](https://github.com/bbockelm/cedar) for the
 CEDAR wire protocol and security, and
-[`golang-htcondor`](https://github.com/bbockelm/golang-htcondor) for
+[`golang-htcondor`](https://github.com/htcondor/golang-htcondor) for
 configuration, logging and the DaemonCore conventions.
 
 ---

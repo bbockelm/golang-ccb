@@ -2,8 +2,6 @@ github.com/PelicanPlatform/classad v0.43.0 h1:x9lZvh0zNAlzFn/DavsA/hR67CBFcnyUJ3
 github.com/PelicanPlatform/classad v0.43.0/go.mod h1:PEBQZp1N+KqUcAPMWhHqdCq+P5OSEYT2V14SeiXVM04=
 github.com/bbockelm/cedar v0.7.16 h1:03Ti8digqS1dK+SCGFpkJTb4v8HPKcDsylNPidA9vMA=
 github.com/bbockelm/cedar v0.7.16/go.mod h1:i2/CctKzhvEyYKOfxTHx4zcRKujI4nblDX76sb9dU88=
-github.com/bbockelm/golang-htcondor v0.24.0 h1:Uwe//LsEQi0yJtKBLN9HPzBGKUWhDY7L6lPFEruCJlQ=
-github.com/bbockelm/golang-htcondor v0.24.0/go.mod h1:s5CFHGU7o7qyRZ61E0vPH2h+gPyPBiUNiF/rKAja0JA=
 github.com/bbockelm/gosssd v0.0.4 h1:VfPc8eqINew99vwq3+si4FC+tpcauXrSntGmaii4zqY=
 github.com/bbockelm/gosssd v0.0.4/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
@@ -29,6 +27,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hashicorp/yamux v0.1.2 h1:XtB8kyFOyHXYVFnwT5C3+Bdo8gArse7j2AQ0DA0Uey8=
 github.com/hashicorp/yamux v0.1.2/go.mod h1:C+zze2n6e/7wshOZep2A70/aQU6QBRWJO/G6FT1wIns=
+github.com/htcondor/golang-htcondor v0.25.0 h1:Yzb3YA5LAFY/x5nDN+eqdD97/+eYvhEyMLbkosLtgiA=
+github.com/htcondor/golang-htcondor v0.25.0/go.mod h1:5eBWmg9RchyUZK/AWsOoptyj1i1x/9HmMmAiNX+efPY=
 github.com/jcmturner/aescts/v2 v2.0.0 h1:9YKLH6ey7H4eDBXW8khjYslgyqG2xZikXP0EQFKrle8=
 github.com/jcmturner/aescts/v2 v2.0.0/go.mod h1:AiaICIRyfYg35RUkr8yESTqvSy7csK90qZ5xfvvsoNs=
 github.com/jcmturner/dnsutils/v2 v2.0.0 h1:lltnkeZGL0wILNvrNiVCR6Ro5PGU/SeBvVO/8c/iPbo=

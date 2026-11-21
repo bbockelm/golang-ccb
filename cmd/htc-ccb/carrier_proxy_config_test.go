@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bbockelm/golang-htcondor/config"
+	"github.com/htcondor/golang-htcondor/config"
 )
 
 // The site's environment and the pool's configuration can disagree about how to

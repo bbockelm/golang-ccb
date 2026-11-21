@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	htsqlite "github.com/bbockelm/golang-htcondor/sessioncache/sqlite"
+	htsqlite "github.com/htcondor/golang-htcondor/sessioncache/sqlite"
 )
 
 // openSharedTestStore opens an encrypted session-cache database at path and
