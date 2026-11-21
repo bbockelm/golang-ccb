@@ -513,21 +513,25 @@ flowchart LR
     LOGIN -->|"one yamux tunnel<br/>back over the same session"| OUT
 ```
 
-#### Send a configuration too
+#### Nothing is sent but the binary
 
-Name a configuration file to stage alongside the binary. You almost always
-want this:
+The staged process is a splice helper: it accepts connections on the far host
+and copies each onto its own stream of the carrier. It reads no HTCondor
+configuration, authenticates nobody and holds no credentials, so there is
+nothing to send alongside it and nothing on that host to get wrong.
+
+Say what it should listen on, and daemons there name that as their CCB:
 
 ```condor
-CCB_CARRIER_SSH_STAGE_CONFIG = /etc/condor/ccb/remote-broker.conf
+CCB_CARRIER_SSH_HELPER_LISTEN = 127.0.0.1:9700
 ```
 
-The staged broker is started with its environment cleared — no
-`_CONDOR_*`, nothing inherited from the login shell — so the only thing it
-reads is the file you sent. Without that, a login node that already has
-HTCondor on it hands your broker *that* pool's security settings, trust domain
-and token directory, and the failure looks like an authentication problem with
-no hint where the setting came from.
+This is the part that changed when the far end stopped being a broker. A
+staged *broker* had to be sent a configuration and started with its
+environment cleared, because a login node that already runs HTCondor would
+otherwise hand it that pool's security settings and trust domain — and
+`_CONDOR_*` in the login shell could override the file. A byte relay has no
+settings to capture. The authorization boundary stays here, at this broker.
 
 Because the environment is cleared and there is no command line to edit on a
 host you do not install on, that file is your only channel to the remote
@@ -560,16 +564,17 @@ CCB_CARRIER_SSH_STAGE_BINARY_DIR = /usr/share/htc-ccb/remote
 with files named as the release tarballs name them:
 
 ```
-/usr/share/htc-ccb/remote/htc-ccb-relay-linux-amd64
-/usr/share/htc-ccb/remote/htc-ccb-relay-linux-arm64
+/usr/share/htc-ccb/remote/htc-ccb-splice-linux-amd64
+/usr/share/htc-ccb/remote/htc-ccb-splice-linux-arm64
 ```
 
-`htc-ccb-relay` is the binary meant to cross the network: the same broker
-without the session cache and reconnect store, which a staged process cannot
-use anyway because it does not outlive the ssh session that started it. On
-linux/amd64 it is 4.7 MB gzipped against the full binary's 6.6 MB. A directory
-holding `htc-ccb-<os>-<arch>` instead still works — it is a complete broker
-and runs the same role — and if both are present the relay is sent.
+`htc-ccb-splice` is the binary meant to cross the network: a byte relay that
+accepts connections on the far host and copies each onto its own stream of the
+carrier. It terminates nothing, reads no configuration and holds no
+credentials. On linux/amd64 it is 1.43 MB gzipped against the full binary's
+6.6 MB. A directory of `htc-ccb-<os>-<arch>` is **not** a substitute: the full
+broker would run as an inside CCB, a different topology with a different
+authorization boundary, so a missing helper build is an error instead.
 
 A host whose platform has no build there fails by name, and the message lists
 the builds that *were* available — usually the answer is that one was never
@@ -914,9 +919,9 @@ Set it to your pool and nothing more.
 | `CCB_CARRIER_SSH_KNOWN_HOSTS` / `CCB_CARRIER_SSH_HOST_KEY` | host keys, as a file or inline. **One is required** — there is no setting that accepts an unverified key |
 | `CCB_CARRIER_SSH_USER` / `CCB_CARRIER_SSH_IDENTITY` / `CCB_CARRIER_SSH_AGENT` | login name, private keys to offer, and whether to consult `SSH_AUTH_SOCK` |
 | `CCB_CARRIER_SSH_PROXY_JUMP` | bastion hops, nearest first, as `ssh -J` takes them. Every hop is host-key verified |
-| `CCB_CARRIER_SSH_STAGE_BINARY` | a local `htc-ccb` to put on the far host — the zero-touch install |
-| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-relay-<os>-<arch>` builds instead, chosen by what the far host reports. Unneeded when the far host matches this broker's own platform, which it stages itself |
-| `CCB_CARRIER_SSH_STAGE_CONFIG` | the configuration the staged broker runs with, its environment cleared. You want this |
+| `CCB_CARRIER_SSH_STAGE_BINARY` | a local `htc-ccb-splice` to put on the far host — the zero-touch install |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | a directory of `htc-ccb-splice-<os>-<arch>` builds instead, chosen by what the far host reports. Needed for every platform staged onto, including this broker's own |
+| `CCB_CARRIER_SSH_HELPER_LISTEN` | the address the staged helper accepts connections on — what daemons there name as their CCB. Unset leaves the helper's default |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | where a staged binary goes (default under the login account) |
 | `CCB_CARRIER_SSH_COMMAND` | run a binary the site installed its own way, instead of staging |
 | `CCB_OPERATOR_WAIT` | seconds an attached administrator waits for a question to arrive (120) |

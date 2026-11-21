@@ -892,57 +892,57 @@ sequenceDiagram
     FAR-->>OUT: yamux over the session's stdin/stdout
 ```
 
-#### 6.3.1 What gets staged: `htc-ccb-relay`
+#### 6.3.1 What gets staged: `htc-ccb-splice`
 
-What should cross the network is `cmd/htc-ccb-relay`, not `htc-ccb`.
+What crosses the network is `cmd/htc-ccb-splice`, not `htc-ccb`, and not a
+broker of any kind.
 
-It is the same broker with the parts a staged process cannot use taken out. It
-keeps what matters on an execute host — the CCB server, upstream registration
-over the carrier, the outbound proxy, and HTCondor's own authorization policy
-— and drops the two things whose state cannot outlive the process:
-
-- **The session cache.** Its purpose is to let clients resume across a restart.
-  A process whose carrier is its own stdin does not restart: it exits when the
-  ssh session ends and is staged afresh next time.
-- **The shared reconnect store**, for the same reason — a CCBID kept across a
-  restart that never happens.
-
-Both are SQLite, and that is most of the difference:
+It is a byte relay: it accepts connections on the far host and copies each
+onto its own stream of the carrier (§5.7). It terminates no CEDAR, allocates
+no CCBIDs, authenticates nobody and reads no configuration. Everything the
+staged *broker* used to do on that host — authorization policy, upstream
+registration, the outbound proxy — happens at the outside broker instead.
 
 | linux/amd64, stripped | raw | gzipped |
 |---|---|---|
 | `htc-ccb` | 16.0 MiB | 6.59 MiB |
-| `htc-ccb-relay`, ordinary build | 15.9 MiB | 6.53 MiB |
-| **`htc-ccb-relay -tags condor_nosqlite`** | **11.7 MiB** | **4.70 MiB** |
+| `htc-ccb-relay` (the former staged broker, `-tags condor_nosqlite`) | 11.7 MiB | 4.70 MiB |
+| **`htc-ccb-splice`** | **3.4 MiB** | **1.43 MiB** |
 
-The middle row is the point of the third: `golang-htcondor/daemon` links the
-SQLite session store unconditionally, so until that dependency is optional the
-relay saves almost nothing. `-tags condor_nosqlite` is what makes it optional
-(it leaves out the daemon's default store registration, and a daemon built
-that way *refuses* `SEC_PERSIST_SESSIONS` rather than ignoring it). Whether
-the tag took effect is invisible in behaviour, only in size, so
+Size is the smaller half of why. The helper holds no keys, so a compromised
+staged binary is a pipe rather than a broker identity, and a host you are
+staging onto is precisely one you are not administering.
+
+`-tags condor_nosqlite` still matters to the build: `golang-htcondor/daemon`
+links the SQLite session store unconditionally, and whether the tag took
+effect is invisible in behaviour and visible only in size, so
 `scripts/embed-builds.sh` asserts the dependency is actually gone rather than
 trusting the flag.
 
-The relay is deliberately not a smaller `htc-ccb` for general use: it has one
-role and one carrier and refuses anything else, because a broker that silently
-ran without configured persistence would be worse than one that would not
-start.
+A full `htc-ccb` is **not** accepted as a substitute. It would start and run
+as an inside CCB — a different topology with a different authorization
+boundary — so a missing helper build is an error rather than a silent change
+of model.
 
 #### 6.3.2 Which build, for which host
 
-The far host's architecture is discovered, not configured, so there are four
+The far host's architecture is discovered, not configured, so there are three
 places the matching build can come from, tried in this order:
 
 | Source | Knob | For |
 |---|---|---|
 | A named file | `CCB_CARRIER_SSH_STAGE_BINARY` | One architecture, or a build you want to pin. Refused if it is for the wrong platform — before the transfer, not after. |
-| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. `htc-ccb-relay-<os>-<arch>`, or `htc-ccb-<os>-<arch>` — the relay is preferred when both are there. |
+| A directory of builds | `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A mixed fleet. `htc-ccb-splice-<os>-<arch>` only; `htc-ccb-<os>-<arch>` is not a substitute. |
 | Compiled into the broker | *(a build-time choice)* | A single-file install with nowhere to keep a directory. Only an `htc-ccb` built with `-tags embedremote` carries any. |
-| **This running binary** | *(nothing to configure)* | A far host of the broker's own platform. |
 
 The directory outranks a compiled-in copy, so a site that ships its own builds
 keeps control of what lands on its hosts even when both exist.
+
+There used to be a fourth source: the broker's own running binary, for a far
+host of its own platform. That made staging always work and let the embedded
+set skip the host platform, halving what `-tags embedremote` cost. It ended
+with the relay — this broker is not a splice helper — so every platform staged
+onto must now be present.
 
 **A broker never needs to carry a copy of itself.** A linux/amd64 `htc-ccb`
 staging onto a linux/amd64 host already has a binary that runs the role, on
@@ -988,41 +988,38 @@ key — agent and file alike — is offered through a *single* publickey method.
 method each would offer only the first key, and a bastion wanting any other
 would fail with `no supported methods remain` and no hint why.
 
-### 6.5 What the staged broker is configured with
+### 6.5 What the staged helper is configured with
 
-A staged broker starts with `env -i`: no environment at all beyond `HOME` and
-`PATH`, and `CONDOR_CONFIG` pointing at a file the outside broker put there.
+Nothing. That is the point.
 
-This is deliberate and it is the main thing staging buys beyond the binary.
-HTCondor reads configuration from the environment — every `_CONDOR_<PARAM>`
-overrides the config files — so a login node that already has a pool on it
-would otherwise hand the staged broker that pool's security settings, trust
-domain and token directory, and the symptom would be an authentication failure
-with nothing in it to suggest where the setting came from. Clearing the
-environment makes the staged broker depend on nothing it found over there.
-
-The consequence is that **the staged configuration file is the only channel to
-the remote process.** There is no command line to edit on a host you do not
-install on, so anything the remote broker needs has to be in that file:
+The staged process is a splice helper (§5.7): it accepts connections on the
+far host and copies each onto its own stream of the carrier. It terminates no
+CEDAR, allocates no CCBIDs, authenticates nobody and reads no HTCondor
+configuration. The only thing it is told is where to listen:
 
 ```
-# staged with CCB_CARRIER_SSH_STAGE_CONFIG
-CCB_LISTEN  = 127.0.0.1:9700
-CCB_PUBLIC  = 127.0.0.1:9700
-SEC_DEFAULT_AUTHENTICATION = REQUIRED
-ALLOW_DAEMON = ...
+CCB_CARRIER_SSH_HELPER_LISTEN = 127.0.0.1:9700
 ```
 
-`CCB_LISTEN` and `CCB_PUBLIC` are the config spellings of `-listen` and
-`-public`, and they exist for exactly this. The default `:9618` is the one
-port a login node most likely already has in use, so a staged broker with no
-way to be told otherwise dies at startup with `bind: address already in use` —
-on precisely the hosts staging is for.
+Daemons on that host name that address as their CCB, and the authorization
+boundary stays at the outside broker, which is the one with the credentials
+and the policy.
 
-Without `CCB_CARRIER_SSH_STAGE_CONFIG` the staged broker reads whatever
-configuration the far host has, which on a bare login node is nothing and
-elsewhere is another pool's. Staging one is strongly preferred; the
-configuration is content-addressed and skipped when unchanged, like the binary.
+**This replaced a much larger contract.** A staged *broker* had to be started
+with `env -i` — no environment beyond `HOME` and `PATH`, `CONDOR_CONFIG`
+pointing at a file the outside broker put there — because HTCondor reads every
+`_CONDOR_<PARAM>` from the environment and lets it override the config files.
+A login node that already ran a pool would otherwise hand the staged broker
+that pool's security settings, trust domain and token directory, and the
+symptom was an authentication failure with nothing in it to say where the
+setting came from. The staged configuration file was then the *only* channel
+to the remote process, since there is no command line to edit on a host you do
+not install on.
+
+A byte relay has none of that surface: no settings to capture, no trust domain
+to inherit, no credentials to leak if the far host is hostile. The default
+`:9618` is still the port a login node most likely already has in use, which
+is why the listen address remains worth setting.
 
 ### 6.6 A login only a person can finish
 
@@ -1118,18 +1115,14 @@ different block, so the two do not collide with each other.
 | `CCB_CARRIER_SSH_AGENT` | Consult `SSH_AUTH_SOCK`. |
 | `CCB_CARRIER_SSH_PROXY_JUMP` | Bastion hops, nearest first, comma-separated, as `ssh -J` takes them. Every hop is host-key verified (§6.4). |
 | `CCB_CARRIER_SSH_STAGE_BINARY` | A local `htc-ccb` to put on the far host — the zero-touch install. |
-| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A directory of `htc-ccb-relay-<os>-<arch>` builds, chosen by what the far host reports. For a mixed fleet (§6.3.2). |
-| `CCB_CARRIER_SSH_STAGE_CONFIG` | A local HTCondor configuration file to stage beside the binary and point the remote broker at, with a cleared environment. Strongly preferred (§6.5). |
+| `CCB_CARRIER_SSH_STAGE_BINARY_DIR` | A directory of `htc-ccb-splice-<os>-<arch>` builds, chosen by what the far host reports. Needed for every platform staged onto, including this broker's own (§6.3.2). |
+| `CCB_CARRIER_SSH_HELPER_LISTEN` | The address the staged helper accepts connections on, which daemons on that host name as their CCB. Empty leaves the helper's own default (§6.5). |
 | `CCB_CARRIER_SSH_REMOTE_DIR` | Where a staged binary goes (default under the login account). |
 | `CCB_CARRIER_SSH_COMMAND` | Override what runs on the far host. |
 | `CCB_OPERATOR_WAIT` | Seconds an attached administrator waits for a question to arrive (default 120). |
 
-On the *staged* broker, in the file `CCB_CARRIER_SSH_STAGE_CONFIG` names:
-
-| Knob | Meaning |
-|---|---|
-| `CCB_LISTEN` | The config spelling of `-listen`. A staged broker has no command line to edit, and the default `:9618` collides on most login nodes (§6.5). |
-| `CCB_PUBLIC` | The config spelling of `-public`. |
+The staged helper reads no configuration of its own; `CCB_CARRIER_SSH_HELPER_LISTEN`
+above is the whole of what it is told (§6.5).
 
 One of `CCB_CARRIER_SSH_STAGE_BINARY`, `CCB_CARRIER_SSH_STAGE_BINARY_DIR` or
 `CCB_CARRIER_SSH_COMMAND` must be set, unless this `htc-ccb` was built with

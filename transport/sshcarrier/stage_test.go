@@ -449,11 +449,3 @@ func TestNoStagedConfigLeavesTheEnvironmentAlone(t *testing.T) {
 		t.Errorf("ran %v; with no staged config the environment should be left alone", cmd)
 	}
 }
-
-func keysOf(m map[string][]byte) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}

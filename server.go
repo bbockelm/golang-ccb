@@ -300,13 +300,14 @@ type SSHCarrierConfig struct {
 	// under the login account.
 	RemoteDir string
 
-	// StageConfig is a local HTCondor configuration file to stage beside the
-	// binary and point the remote broker at, with a cleared environment.
+	// HelperListen is the address the staged splice helper accepts local
+	// connections on -- what daemons on the far host name as their CCB.
+	// Empty leaves the helper's own default.
 	//
-	// Without it the staged broker reads whatever configuration the far host
-	// has -- nothing on a bare login node, or another pool's where one is
-	// installed, bringing that pool's security settings with it.
-	StageConfig string
+	// There is no configuration to stage alongside the helper: it reads none,
+	// authenticates nobody and holds no credentials, so the authorization
+	// boundary stays at this broker.
+	HelperListen string
 
 	// Command overrides what runs on the far host. With StageBinary set it is
 	// derived from where the binary landed, which is what an operator usually

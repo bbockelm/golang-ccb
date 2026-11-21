@@ -84,37 +84,6 @@ func helperBinary(t *testing.T) string {
 	return helperPath
 }
 
-// remoteConfig writes the configuration the staged broker will run with.
-//
-// CCB_LISTEN matters here for the same reason it matters in the field: the
-// staged broker's default is :9618, several of these tests run in one process
-// against one loopback host, and the first one to start would own the port for
-// all of them -- as the real login node's own HTCondor already does. The
-// configuration file is the only way to tell a staged broker otherwise.
-func remoteConfig(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "remote.conf")
-	addr := freeLoopbackAddr(t)
-	body := fmt.Sprintf(`LOG = %s
-LOCK = %s
-RUN = %s
-SPOOL = %s
-SEC_DEFAULT_AUTHENTICATION = NEVER
-SEC_DEFAULT_ENCRYPTION = NEVER
-SEC_DEFAULT_INTEGRITY = NEVER
-ALLOW_DAEMON = *
-ALLOW_READ = *
-CCB_OUTBOUND_PROXY = TRUE
-CCB_LISTEN = %s
-CCB_PUBLIC = %s
-`, dir, dir, dir, dir, addr, addr)
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
 // sshCarrierBroker starts an outside broker whose carrier is an ssh:// session
 // to srv, staging the real binary.
 func sshCarrierBroker(t *testing.T, srv *sshtest.Server, extra func(*SSHCarrierConfig)) (outsideAddr string, server *Server) {
@@ -128,8 +97,7 @@ func sshCarrierBroker(t *testing.T, srv *sshtest.Server, extra func(*SSHCarrierC
 	sc := SSHCarrierConfig{
 		User:          "tester",
 		KnownHosts:    []string{kh},
-		StageBinary:   brokerBinary(t),
-		StageConfig:   remoteConfig(t),
+		StageBinary:   helperBinary(t),
 		RemoteDir:     filepath.Join(t.TempDir(), "staged"),
 		IdentityFiles: []string{identityFile(t, srv)},
 	}
@@ -165,7 +133,7 @@ func TestIntegrationSSHCarrierStagesAndRunsTheRealBinary(t *testing.T) {
 	defer func() { _ = srv.Close() }()
 
 	_, broker := sshCarrierBroker(t, srv, nil)
-	waitForStagedBroker(t, broker)
+	waitForStagedHelper(t, broker)
 }
 
 // A site that wants a one-time code. Nothing can answer it but a person, so
@@ -182,7 +150,7 @@ func TestIntegrationKeyboardInteractiveLogin(t *testing.T) {
 		sc.IdentityFiles = nil // no key will do; only the code
 	})
 	answerFromConsole(t, outsideAddr, "Verification code:", "424242")
-	waitForStagedBroker(t, broker)
+	waitForStagedHelper(t, broker)
 }
 
 // The same, with a password.
@@ -197,7 +165,7 @@ func TestIntegrationPasswordLogin(t *testing.T) {
 		sc.IdentityFiles = nil
 	})
 	answerFromConsole(t, outsideAddr, "Password:", "hunter2")
-	waitForStagedBroker(t, broker)
+	waitForStagedHelper(t, broker)
 }
 
 // Through a bastion, which is the usual shape for a cluster you cannot reach
@@ -231,8 +199,7 @@ func TestIntegrationProxyJump(t *testing.T) {
 			User:        "tester",
 			KnownHosts:  []string{kh},
 			ProxyJump:   []string{bastion.Addr},
-			StageBinary: brokerBinary(t),
-			StageConfig: remoteConfig(t),
+			StageBinary: helperBinary(t),
 			RemoteDir:   filepath.Join(t.TempDir(), "staged"),
 			IdentityFiles: []string{
 				identityFile(t, target),
@@ -248,46 +215,36 @@ func TestIntegrationProxyJump(t *testing.T) {
 	t.Cleanup(cancel)
 	go func() { _ = s.Serve(ctx, ln) }()
 
-	waitForStagedBroker(t, s)
+	waitForStagedHelper(t, s)
 }
 
-// waitForStagedBroker waits until the far broker has registered through the
+// waitForStagedHelper waits until the staged helper has brought up the
 // carrier, which is the signal that staging, the configuration and the
 // -carrier-stdio mode all worked.
-func waitForStagedBroker(t *testing.T, s *Server) {
+func waitForStagedHelper(t *testing.T, s *Server) {
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		if registeredCount(s) > 0 {
+		if carrierPipeCount(s) > 0 {
 			return
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatal("the staged broker never registered through the carrier")
+	t.Fatal("the staged helper never brought up a carrier pipe")
 }
 
-// registeredCount is how many brokers have registered with this one.
-func registeredCount(s *Server) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.targets)
-}
-
-// freeLoopbackAddr picks a loopback port nothing is using. The usual caveat
-// applies -- another process could take it in the gap -- but on a loopback
-// interface in a test run that is not a practical risk, and the alternative
-// (a fixed port) is the collision this exists to avoid.
-func freeLoopbackAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return addr
+// carrierPipeCount is how many carrier pipes this broker holds.
+//
+// This is what a staged SPLICE HELPER can be observed by. The old assertion
+// counted registrations, which worked when the far end was a broker that
+// joined the pool through the carrier. A helper joins nothing: it accepts
+// local connections and copies bytes, and the daemons that register through
+// it live on the far host, which a test SSH server does not run. The pipe
+// coming up is the whole of what staging is responsible for.
+func carrierPipeCount(s *Server) int {
+	s.carriers.mu.Lock()
+	defer s.carriers.mu.Unlock()
+	return len(s.carriers.byPip)
 }
 
 func mustListen(t *testing.T) net.Listener {
@@ -349,7 +306,7 @@ func TestIntegrationSSHCarrierStagesTheRelay(t *testing.T) {
 	_, broker := sshCarrierBroker(t, srv, func(sc *SSHCarrierConfig) {
 		sc.StageBinary = helperBinary(t)
 	})
-	waitForStagedBroker(t, broker)
+	waitForStagedHelper(t, broker)
 }
 
 // A directory holding both builds must stage the relay: it is the one meant
@@ -373,7 +330,7 @@ func TestIntegrationADirectoryOfBuildsPrefersTheRelay(t *testing.T) {
 		sc.StageBinaryDir = dir
 		sc.RemoteDir = remoteDir
 	})
-	waitForStagedBroker(t, broker)
+	waitForStagedHelper(t, broker)
 
 	// Which build crossed is the whole point, and it is only visible in what
 	// landed: both run the same role, so a working tunnel proves nothing

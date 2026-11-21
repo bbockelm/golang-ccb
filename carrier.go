@@ -281,6 +281,7 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 		Agent:         cfg.CarrierSSH.Agent,
 		ProxyJump:     cfg.CarrierSSH.ProxyJump,
 		Command:       cfg.CarrierSSH.Command,
+		HelperListen:  cfg.CarrierSSH.HelperListen,
 		Logger:        c.log,
 	}
 	if sc.User == "" {
@@ -517,7 +518,15 @@ func (s *Server) startCarrierListener(ctx context.Context) {
 		s.log.Error("failed to start carrier listener", "carrier", s.cfg.CarrierListen, "error", err)
 		return
 	}
-	ml := carrier.NewMuxListener(inner, carrier.WithFirstStreamTimeout(s.pipeProbation()))
+	// WithPipeHooks is what makes a target that registers over this carrier
+	// carrier-attached: one pipe gets one CCBID, so its contact nests as
+	// <outside>#P#T and the broker collapses the hop locally. Without the
+	// hooks the set stays empty, every registrant looks directly attached,
+	// and the nesting the splice model depends on never happens.
+	ml := carrier.NewMuxListener(inner,
+		carrier.WithFirstStreamTimeout(s.pipeProbation()),
+		carrier.WithPipeHooks(s.CarrierHooks()),
+	)
 	go func() {
 		<-ctx.Done()
 		_ = ml.Close()

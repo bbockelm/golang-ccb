@@ -55,29 +55,29 @@ the binary instead: the `CGO_ENABLED` build setting recorded by the toolchain
 workflow on every artifact, and the Dockerfile on the binary it is about to put
 on a `distroless/static` base.
 
-### htc-ccb-relay, and builds for other hosts
+### htc-ccb-splice, and builds for other hosts
 
-`cmd/htc-ccb-relay` is what an SSH carrier stages: the broker with the session
-cache and reconnect store removed, neither of which a process whose carrier is
-its own stdin can use (`docs/TRANSPORTS.md` §6.3.1). Built with
-`-tags condor_nosqlite` it is 4.7 MB gzipped against `htc-ccb`'s 6.6 MB; built
-without it, almost the same size, because `golang-htcondor/daemon` links
-SQLite unconditionally otherwise.
+`cmd/htc-ccb-splice` is what an SSH carrier stages: a byte relay that accepts
+connections on the far host and copies each onto its own stream of the carrier
+(`docs/TRANSPORTS.md` §6.3.1). It terminates no CEDAR and reads no
+configuration. Built with `-tags condor_nosqlite` it is 1.43 MB gzipped
+against `htc-ccb`'s 6.6 MB.
 
-A broker stages the binary it is *running* when the far host shares its
-platform, so builds are only ever needed for other platforms:
+Builds are needed for **every** platform staged onto, including this one. A
+broker used to stage the binary it was running when the far host shared its
+platform; that ended when the far end stopped being a broker.
 
 ```sh
-scripts/embed-builds.sh                      # skips this build's own platform
+scripts/embed-builds.sh                      # every platform in PLATFORMS
 go build -tags embedremote -o htc-ccb ./cmd/htc-ccb
 ```
 
-For the usual linux/amd64 release that carries one arm64 relay, about 4.7 MB.
-`SELF=` turns the skip off; `OUT=<dir>` writes a directory for
-`CCB_CARRIER_SSH_STAGE_BINARY_DIR` instead of the embed directory; `TAGS=`
-builds without `condor_nosqlite`. The script refuses to build a tagged relay
-that still links SQLite, because that only shows up as size, never as
-behaviour.
+For the usual linux/amd64 release that carries both helpers, about 2.9 MB --
+still less than the single 4.7 MB relay it replaced. `OUT=<dir>` writes a
+directory for `CCB_CARRIER_SSH_STAGE_BINARY_DIR` instead of the embed
+directory; `TAGS=` builds without `condor_nosqlite`. The script refuses to
+build a tagged helper that still links SQLite, because that only shows up as
+size, never as behaviour.
 
 `transport/sshcarrier/remotebin/builds/` holds the embedded copies and is
 gitignored: a binary in git would be a blob per release, and the release
@@ -104,7 +104,7 @@ Four tiers, in ascending cost:
 | in-process end-to-end | `carrier_e2e_test.go`, `carrier_proxy_e2e_test.go`, `outbound_test.go` | nothing — the `CONNECT` proxy is `internal/proxytest` | every push |
 | pool integration | `ccb_master_integration_test.go`, `binary_e2e_test.go` | `condor_master`, `condor_submit`, `condor_wait` on `PATH` | every push in CI, which installs HTCondor |
 | SSH carrier | `ssh_integration_test.go` | nothing — the sshd is `internal/sshtest`, in-process | every push |
-| relay staging | `ssh_integration_test.go` | nothing; builds `cmd/htc-ccb-relay` once per run | every push |
+| helper staging | `ssh_integration_test.go` | nothing; builds `cmd/htc-ccb-splice` once per run | every push |
 | container | `test/e2e-squid/` | Docker, a real squid | nightly, on push, or on a PR labelled `squid-e2e` |
 
 The SSH tier runs the *real* binary at the far end: an in-process sshd that
