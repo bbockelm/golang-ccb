@@ -40,16 +40,37 @@ func carrierTokenVerifier(_ context.Context, tok string) (string, error) {
 }
 
 // wssCarrier builds a wss:// carrier endpoint on a free port with matching TLS.
-func wssCarrier(t *testing.T) (url string, serverTLS, clientTLS *tls.Config) {
+func wssCarrier(t *testing.T) (url string, inner net.Listener, serverTLS, clientTLS *tls.Config) {
 	t.Helper()
 	serverTLS, clientTLS = proxytest.SelfSignedTLS(t)
-	return fmt.Sprintf("wss://127.0.0.1:%d/ccb/tunnel", freePort(t)), serverTLS, clientTLS
+	u, ln := heldCarrier(t, "wss")
+	return u, ln, serverTLS, clientTLS
+}
+
+// heldCarrier binds a loopback port and KEEPS it, returning the carrier URL that
+// names it and the listener to serve it on.
+//
+// Not freePort(): that binds a port, closes it, and returns the number, so
+// between the close and the server's own bind the port belongs to nobody and
+// any other process -- including a parallel test -- can take it. Holding the
+// listener makes the reservation real, and the address is accepting from the
+// moment the caller has it, with no window in which a dial is refused.
+//
+// Pass the listener to the server as Config.carrierInner.
+func heldCarrier(t *testing.T, scheme string) (url string, inner net.Listener) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("binding a carrier port: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return fmt.Sprintf("%s://%s/ccb/tunnel", scheme, ln.Addr().String()), ln
 }
 
 // startOutsideWSSCCB starts an outside CCB facing the pool over TCP and
 // accepting inside CCBs over a token-authenticated wss:// carrier. With
 // allowlist non-empty it is also the exit for outbound proxy-connects.
-func startOutsideWSSCCB(t *testing.T, carrierURL string, serverTLS *tls.Config, allowlist []string) (tcpAddr string, rec *logCatcher, cancel func()) {
+func startOutsideWSSCCB(t *testing.T, carrierURL string, carrierLn net.Listener, serverTLS *tls.Config, allowlist []string) (tcpAddr string, rec *logCatcher, cancel func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -64,6 +85,7 @@ func startOutsideWSSCCB(t *testing.T, carrierURL string, serverTLS *tls.Config, 
 		OutboundProxy:           len(allowlist) > 0,
 		OutboundTargetAllowlist: allowlist,
 		CarrierListen:           carrierURL,
+		carrierInner:            carrierLn,
 		CarrierTLS:              serverTLS,
 		CarrierTokenVerify:      carrierTokenVerifier,
 		Logger:                  slog.New(rec),
@@ -183,10 +205,10 @@ func startLingeringDialTarget(t *testing.T, listenIP string, served chan<- struc
 // carrier. The CONNECT assertion is the point -- without it, a carrier that
 // ignored the proxy and dialed the endpoint directly would pass identically.
 func TestInboundTunnel2CCBOverWSCarrierViaProxy(t *testing.T) {
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.Start(t, nil)
 
-	outsideAddr, _, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, nil)
+	outsideAddr, _, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, nil)
 	defer stopOut()
 
 	insideAddr, insideSrv, _, stopIn := startInsideWSSCCB(t, carrierURL, clientTLS, proxy, false)
@@ -243,7 +265,7 @@ func TestInboundTunnel2CCBOverWSCarrierViaProxy(t *testing.T) {
 // chain over the WebSocket carrier at all; it previously existed only for the
 // filesystem carrier.
 func TestOutboundProxyTwoCCBOverWSCarrierViaProxy(t *testing.T) {
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.Start(t, nil)
 	targetIP := nonLoopbackIPv4(t)
 
@@ -251,7 +273,7 @@ func TestOutboundProxyTwoCCBOverWSCarrierViaProxy(t *testing.T) {
 	targetAddr, stopTgt := startLingeringDialTarget(t, targetIP, served)
 	defer stopTgt()
 
-	_, outsideRec, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, []string{targetIP + "/32"})
+	_, outsideRec, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, []string{targetIP + "/32"})
 	defer stopOut()
 
 	insideAddr, insideSrv, insideRec, stopIn := startInsideWSSCCB(t, carrierURL, clientTLS, proxy, true)
@@ -288,7 +310,7 @@ func TestOutboundProxyTwoCCBOverWSCarrierViaProxy(t *testing.T) {
 // each, and the node still holds exactly one proxied TCP connection -- because
 // yamux multiplexes every logical connection over the single carrier.
 func TestCarrierFootprintIsOneConnection(t *testing.T) {
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.Start(t, nil)
 	targetIP := nonLoopbackIPv4(t)
 
@@ -296,7 +318,7 @@ func TestCarrierFootprintIsOneConnection(t *testing.T) {
 	targetAddr, stopTgt := startLingeringDialTarget(t, targetIP, served)
 	defer stopTgt()
 
-	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, []string{targetIP + "/32"})
+	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, []string{targetIP + "/32"})
 	defer stopOut()
 
 	insideAddr, insideSrv, _, stopIn := startInsideWSSCCB(t, carrierURL, clientTLS, proxy, true)
@@ -351,10 +373,10 @@ func assertSingleCONNECT(t *testing.T, proxy *proxytest.Proxy, carrierURL string
 // distinguishes "a WebSocket opened" from "the expected broker answered and our
 // credentials agree".
 func TestCarrierHealthCheckThroughProxy(t *testing.T) {
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.Start(t, nil)
 
-	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, nil)
+	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, nil)
 	defer stopOut()
 
 	_, insideSrv, _, stopIn := startInsideWSSCCB(t, carrierURL, clientTLS, proxy, false)
@@ -388,10 +410,10 @@ func TestCarrierHealthCheckThroughProxy(t *testing.T) {
 // destination, the check must say so instead of reporting a generic dial
 // failure, and must not go on to blame the far broker.
 func TestCarrierHealthCheckNamesRefusingProxy(t *testing.T) {
-	carrierURL, serverTLS, clientTLS := wssCarrier(t)
+	carrierURL, carrierLn, serverTLS, clientTLS := wssCarrier(t)
 	proxy := proxytest.Start(t, proxytest.Deny(http.StatusForbidden))
 
-	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, serverTLS, nil)
+	_, _, stopOut := startOutsideWSSCCB(t, carrierURL, carrierLn, serverTLS, nil)
 	defer stopOut()
 
 	_, insideSrv, _, stopIn := startInsideWSSCCB(t, carrierURL, clientTLS, proxy, false)

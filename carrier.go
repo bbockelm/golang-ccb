@@ -448,6 +448,7 @@ func (s *Server) carrierNetListener(ref carrierRef) (net.Listener, error) {
 		}
 		return wscarrier.Listen(wscarrier.ListenConfig{
 			Addr:                 u.Host,
+			Inner:                s.cfg.carrierInner,
 			Path:                 u.Path,
 			TLS:                  s.cfg.CarrierTLS,
 			Verify:               verify,

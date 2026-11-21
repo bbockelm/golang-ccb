@@ -132,6 +132,15 @@ type Config struct {
 	// Empty ⇒ TCP only.
 	CarrierListen string
 
+	// carrierInner, if set, is the already-bound listener to serve the carrier
+	// on, instead of binding the address in CarrierListen.
+	//
+	// Unexported: this exists so a test can bind the port FIRST, name it in
+	// CarrierListen, and keep holding it. Handing out a port number from a
+	// socket that has since been closed leaves it free for anyone else to take
+	// before this server binds it.
+	carrierInner net.Listener
+
 	// CarrierTLS is the server TLS config for a wss:// CarrierListen (required for
 	// wss). Ignored for fs: and ws://.
 	CarrierTLS *tls.Config

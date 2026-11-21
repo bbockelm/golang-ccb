@@ -18,7 +18,7 @@ import (
 // identity comes from the CEDAR handshake on the first command, which happens
 // inside the carrier and never puts a credential on the wire.
 func TestUnauthenticatedCarrierStillTunnels(t *testing.T) {
-	carrierURL := fmt.Sprintf("ws://127.0.0.1:%d/ccb/tunnel", freePort(t))
+	carrierURL, carrierLn := heldCarrier(t, "ws")
 
 	outLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -30,6 +30,7 @@ func TestUnauthenticatedCarrierStillTunnels(t *testing.T) {
 		Security:       plaintextSec(),
 		RequestTimeout: 5 * time.Second,
 		CarrierListen:  carrierURL,
+		carrierInner:   carrierLn,
 		// No CarrierTokenVerify at all.
 		CarrierUnauthenticated: true,
 	})
@@ -85,7 +86,7 @@ func TestUnauthenticatedCarrierStillTunnels(t *testing.T) {
 // must still be refused by the ALLOW_/DENY_ policy, which is what actually
 // guards the broker once the token is gone.
 func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
-	carrierURL := fmt.Sprintf("ws://127.0.0.1:%d/ccb/tunnel", freePort(t))
+	carrierURL, carrierLn := heldCarrier(t, "ws")
 
 	outLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -101,6 +102,7 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 		Security:               plaintextSec(),
 		RequestTimeout:         5 * time.Second,
 		CarrierListen:          carrierURL,
+		carrierInner:           carrierLn,
 		CarrierUnauthenticated: true,
 		// Refuse everything, as a policy with no matching entry does.
 		Authorizer: func(perm, peerAddr, _ string) bool {
@@ -175,12 +177,13 @@ func TestUnauthenticatedCarrierStillAuthorizes(t *testing.T) {
 // TestCarrierListenRejectsSilentlyUnauthenticated: a ws:// listener with no
 // verifier and no explicit opt-in must be an error, not an open door.
 func TestCarrierListenRejectsSilentlyUnauthenticated(t *testing.T) {
-	carrierURL := fmt.Sprintf("ws://127.0.0.1:%d/ccb/tunnel", freePort(t))
+	carrierURL, carrierLn := heldCarrier(t, "ws")
 	srv, err := New(Config{
 		PublicAddress:  "127.0.0.1:1",
 		Security:       plaintextSec(),
 		RequestTimeout: 5 * time.Second,
 		CarrierListen:  carrierURL,
+		carrierInner:   carrierLn,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -195,12 +198,13 @@ func TestCarrierListenRejectsSilentlyUnauthenticated(t *testing.T) {
 // one -- otherwise the knob would appear to work while nodes without a token
 // still failed to dial.
 func TestCarrierUnauthenticatedOverridesVerifier(t *testing.T) {
-	carrierURL := fmt.Sprintf("ws://127.0.0.1:%d/ccb/tunnel", freePort(t))
+	carrierURL, carrierLn := heldCarrier(t, "ws")
 	srv, err := New(Config{
 		PublicAddress:  "127.0.0.1:1",
 		Security:       plaintextSec(),
 		RequestTimeout: 5 * time.Second,
 		CarrierListen:  carrierURL,
+		carrierInner:   carrierLn,
 		CarrierTokenVerify: func(context.Context, string) (string, error) {
 			return "", fmt.Errorf("this verifier must not be consulted")
 		},
