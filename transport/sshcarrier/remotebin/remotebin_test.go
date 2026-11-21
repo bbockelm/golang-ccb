@@ -9,8 +9,8 @@ import (
 
 func TestADirectoryBuildIsFoundByPlatform(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "amd64 build")
-	write(t, filepath.Join(dir, "htc-ccb-linux-arm64"), "arm64 build")
+	write(t, filepath.Join(dir, "htc-ccb-splice-linux-amd64"), "amd64 build")
+	write(t, filepath.Join(dir, "htc-ccb-splice-linux-arm64"), "arm64 build")
 
 	body, src, err := Find(dir, "linux", "arm64")
 	if err != nil {
@@ -22,7 +22,7 @@ func TestADirectoryBuildIsFoundByPlatform(t *testing.T) {
 	if src.Embedded {
 		t.Error("the build came from a directory; the source should not say embedded")
 	}
-	if !strings.Contains(src.String(), "htc-ccb-linux-arm64") {
+	if !strings.Contains(src.String(), "htc-ccb-splice-linux-arm64") {
 		t.Errorf("the source %q does not name the file it came from", src)
 	}
 }
@@ -32,7 +32,7 @@ func TestADirectoryBuildIsFoundByPlatform(t *testing.T) {
 // was never made, and the fix is invisible from "no linux/arm64 build".
 func TestAMissingPlatformErrorNamesWhatIsAvailable(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "amd64 build")
+	write(t, filepath.Join(dir, "htc-ccb-splice-linux-amd64"), "amd64 build")
 
 	// A platform nothing can supply: not the host's, and not one that gets
 	// embedded. linux/arm64 would not do -- an embedremote build carries it.
@@ -43,15 +43,14 @@ func TestAMissingPlatformErrorNamesWhatIsAvailable(t *testing.T) {
 	if !strings.Contains(err.Error(), "plan9/mips64") {
 		t.Errorf("the error does not say which platform was wanted: %v", err)
 	}
-	if !strings.Contains(err.Error(), "htc-ccb-linux-amd64") {
+	if !strings.Contains(err.Error(), "htc-ccb-splice-linux-amd64") {
 		t.Errorf("the error does not say what was available: %v", err)
 	}
 }
 
 func TestNoSourceAtAllSaysHowToGetOne(t *testing.T) {
-	// A platform this build cannot possibly have: not the host's, and not
-	// one anybody embeds. Asking for a real one would succeed by
-	// self-staging or from an embedded copy, which is not what this checks.
+	// A platform this build cannot possibly have, so an embedded copy cannot
+	// answer it either.
 	_, _, err := Find("", "plan9", "mips64")
 	if err == nil {
 		t.Fatal("with no directory and nothing embedded, Find should fail")
@@ -59,56 +58,31 @@ func TestNoSourceAtAllSaysHowToGetOne(t *testing.T) {
 	if !strings.Contains(err.Error(), "embedremote") {
 		t.Errorf("the error does not name the way to carry builds: %v", err)
 	}
-	// The inventory must mention that this binary can always stage itself for
-	// its own platform, so an operator is not told to build something they
-	// already have.
-	if !strings.Contains(err.Error(), "own platform") {
-		t.Errorf("the error does not say this binary can stage its own platform: %v", err)
+	if !strings.Contains(err.Error(), "htc-ccb-splice") {
+		t.Errorf("the error does not name the build to produce: %v", err)
 	}
 }
 
-// A broker never needs to carry a copy of itself: asked for its own
-// platform with nothing configured, it stages the binary it is running.
-// This is what keeps the embed tag to the OTHER architectures.
-func TestItStagesItselfForItsOwnPlatform(t *testing.T) {
+// A broker does NOT stage a copy of itself.
+//
+// It used to: asked for its own platform with nothing configured, it sent the
+// binary it was running, which made staging "always work" and let the embedded
+// set skip the host platform. That ended with the relay. The far end is a
+// splice helper and this broker is not one, so its own binary is not a
+// candidate for any platform, including its own.
+func TestItNeverStagesItself(t *testing.T) {
 	goos, goarch := Local()
-	body, src, err := Find("", goos, goarch)
-	if err != nil {
-		t.Fatalf("Find(own platform): %v", err)
-	}
-	if len(body) == 0 {
-		t.Fatal("staged an empty binary")
-	}
-	if !src.Self && !src.Embedded {
-		t.Errorf("source is %v; with nothing configured it should be this running binary", src)
-	}
-	if src.Self {
-		exe, err := os.Executable()
-		if err != nil {
-			t.Fatal(err)
+	_, src, err := Find("", goos, goarch)
+	if Any() {
+		// An embedremote build may legitimately answer from a compiled-in
+		// copy; what it must never do is reach for the running binary.
+		if err == nil && !src.Embedded {
+			t.Errorf("staged %v for the host's own platform; the only sources are a directory and an embedded copy", src)
 		}
-		fi, err := os.Stat(exe)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if int64(len(body)) != fi.Size() {
-			t.Errorf("staged %d bytes; the running binary is %d", len(body), fi.Size())
-		}
+		return
 	}
-}
-
-// ...but only for its own platform. A different architecture cannot come
-// from the running binary, and saying it could would stage something that
-// cannot exec.
-func TestItDoesNotStageItselfForAnotherPlatform(t *testing.T) {
-	goos, goarch := Local()
-	otherArch := "arm64"
-	if goarch == "arm64" {
-		otherArch = "amd64"
-	}
-	_, src, err := Find("", goos, otherArch)
-	if err == nil && src.Self {
-		t.Errorf("staged this %s/%s binary onto a %s/%s host", goos, goarch, goos, otherArch)
+	if err == nil {
+		t.Errorf("staged %v with no directory and nothing embedded; the running binary is not a splice helper", src)
 	}
 }
 
@@ -147,7 +121,7 @@ func TestTheDirectoryWinsOverAnEmbeddedCopy(t *testing.T) {
 
 func TestNamesMatchTheReleaseSpelling(t *testing.T) {
 	got := Names("linux", "arm64")
-	want := []string{"htc-ccb-relay-linux-arm64", "htc-ccb-linux-arm64"}
+	want := []string{"htc-ccb-splice-linux-arm64"}
 	if len(got) != len(want) {
 		t.Fatalf("Names = %v, want %v", got, want)
 	}
@@ -161,34 +135,23 @@ func TestNamesMatchTheReleaseSpelling(t *testing.T) {
 	}
 }
 
-// The relay is preferred, but a site that ships only the full binary must
-// still get a staged broker -- it runs the same role.
-func TestTheFullBinaryIsUsedWhenNoRelayIsShipped(t *testing.T) {
+// The full broker is NOT a stand-in for the helper.
+//
+// It used to be the fallback: htc-ccb ran the same -carrier-stdio role, so a
+// site shipping only the full binary still got a staged broker. The splice
+// helper is a different thing -- a byte relay with no CEDAR, no ClassAds and
+// no credentials -- and htc-ccb is a broker. Staging it would silently give
+// the far host an inside CCB, a different model with a different
+// authorization boundary. Failing is the correct outcome.
+func TestTheFullBinaryIsNotAHelper(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "the full binary")
-	body, src, err := Find(dir, "linux", "amd64")
-	if err != nil {
-		t.Fatalf("Find: %v", err)
+	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "the full broker")
+	_, src, err := Find(dir, "linux", "amd64")
+	if err == nil {
+		t.Fatalf("staged %v; the full broker is not a splice helper", src)
 	}
-	if string(body) != "the full binary" {
-		t.Errorf("got %q", body)
-	}
-	if !strings.Contains(src.String(), "htc-ccb-linux-amd64") {
-		t.Errorf("source %q does not name the file used", src)
-	}
-}
-
-// With both present the relay wins: it is the one meant to cross the network.
-func TestTheRelayOutranksTheFullBinary(t *testing.T) {
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "htc-ccb-linux-amd64"), "the full binary")
-	write(t, filepath.Join(dir, "htc-ccb-relay-linux-amd64"), "the relay")
-	body, _, err := Find(dir, "linux", "amd64")
-	if err != nil {
-		t.Fatalf("Find: %v", err)
-	}
-	if string(body) != "the relay" {
-		t.Errorf("staged %q; the relay should be preferred", body)
+	if !strings.Contains(err.Error(), "htc-ccb-splice") {
+		t.Errorf("the error does not say what build is wanted: %v", err)
 	}
 }
 
@@ -210,7 +173,7 @@ func TestAnEmbeddedBuildComesBackDecompressed(t *testing.T) {
 		n = strings.TrimSuffix(n, " (embedded)")
 		goos, goarch, ok := ParsePlatform(n)
 		if !ok {
-			t.Fatalf("embedded build %q is not named htc-ccb[-relay]-<os>-<arch>", n)
+			t.Fatalf("embedded build %q is not named htc-ccb-splice-<os>-<arch>", n)
 		}
 		body, src, err := Find("", goos, goarch)
 		if err != nil {
@@ -228,11 +191,11 @@ func TestAnEmbeddedBuildComesBackDecompressed(t *testing.T) {
 	}
 }
 
-func TestParsePlatformReadsBothSpellings(t *testing.T) {
+func TestParsePlatformReadsTheReleaseSpelling(t *testing.T) {
 	for _, tc := range []struct{ name, goos, goarch string }{
-		{"htc-ccb-linux-amd64", "linux", "amd64"},
-		{"htc-ccb-relay-linux-arm64", "linux", "arm64"},
-		{"htc-ccb-relay-linux-arm64.gz", "linux", "arm64"},
+		{"htc-ccb-splice-linux-amd64", "linux", "amd64"},
+		{"htc-ccb-splice-linux-arm64", "linux", "arm64"},
+		{"htc-ccb-splice-linux-arm64.gz", "linux", "arm64"},
 	} {
 		goos, goarch, ok := ParsePlatform(tc.name)
 		if !ok || goos != tc.goos || goarch != tc.goarch {
