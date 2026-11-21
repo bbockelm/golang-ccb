@@ -271,6 +271,7 @@ type Server struct {
 	reconnects map[uint64]*ReconnectRecord // ccbid -> reconnect credentials (survive disconnect)
 	requests   map[uint64]*request         // requestID -> pending standard request
 	proxies    map[string]*proxySession    // connectID -> pending proxy session
+	carriers   carrierSet                  // live carrier ids (see carrier_target.go)
 
 	// Inbound tunneling (Config.Upstream). tunnelContact is this inside CCB's own
 	// contact via the upstream ("<outside>#<id>"), used as the broker prefix when
@@ -303,6 +304,12 @@ type target struct {
 	stream  *stream.Stream
 	conn    net.Conn
 	writeMu sync.Mutex
+
+	// carrierID is the carrier this target registered over, or 0 for an
+	// ordinary target that reached us directly. A carrier-attached target
+	// advertises a nested contact and can only ever be reached by proxy; see
+	// carrier_target.go.
+	carrierID uint64
 }
 
 func (t *target) write(ctx context.Context, ad *classad.ClassAd) error {
@@ -610,6 +617,9 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 		stream: c.Stream,
 		conn:   c.Stream.GetConnection(),
 	}
+	if cid, ok := s.carrierOf(t.conn); ok {
+		t.carrierID = cid
+	}
 
 	peerIPStr := ""
 	if ip := peerIP(c.RemoteAddr); ip != nil {
@@ -660,6 +670,11 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 	}
 
 	contact := s.contactString(t.id)
+	if t.carrierID != 0 {
+		// Nest through the carrier's id so a client reading this contact takes
+		// the streaming path. Nothing lives behind that id but this broker.
+		contact = s.carrierContactString(t.carrierID, t.id)
+	}
 	reply := ccb.NewAd(map[string]any{
 		ccb.AttrCommand:      ccb.CommandRegister,
 		ccb.AttrCCBID:        contact,

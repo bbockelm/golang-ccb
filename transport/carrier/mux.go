@@ -11,9 +11,11 @@ package carrier
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -62,8 +64,52 @@ func yamuxConfig(keepalive time.Duration) *yamux.Config {
 // peer can park on the broker.
 const DefaultFirstStreamTimeout = 60 * time.Second
 
+// PipeHooks observe the lifetime of individual pipes behind a MuxListener.
+// One pipe is one carrier: a consumer that must tell a target reached over pipe
+// A from one reached over pipe B registers here and reads each stream's pipe id
+// with PipeIDOf.
+type PipeHooks struct {
+	Open  func(pipeID uint64)
+	Close func(pipeID uint64)
+}
+
+// pipeConn is a stream tagged with the pipe it arrived on.
+//
+// It must forward CloseWrite. A relay probes for that method, and an embedded
+// net.Conn does not expose it, so a wrapper that forgets leaves every spliced
+// bulk transfer looking truncated while control traffic still works -- see
+// halfCloseStream.
+type pipeConn struct {
+	net.Conn
+	pipeID uint64
+}
+
+func (c *pipeConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return fmt.Errorf("carrier: %T cannot half-close", c.Conn)
+}
+
+// PipeIDOf reports the pipe a connection arrived on, for a connection that came
+// from a MuxListener. Pipe ids are unique for the life of that listener.
+func PipeIDOf(c net.Conn) (uint64, bool) {
+	pc, ok := c.(*pipeConn)
+	if !ok {
+		return 0, false
+	}
+	return pc.pipeID, true
+}
+
 // MuxOption adjusts a MuxListener.
 type MuxOption func(*MuxListener)
+
+// WithPipeHooks reports each pipe as it opens and closes. A consumer that keys
+// state on the carrier uses this for its lifetime; Close runs exactly once per
+// pipe that Open ran for.
+func WithPipeHooks(h PipeHooks) MuxOption {
+	return func(l *MuxListener) { l.hooks = h }
+}
 
 // WithFirstStreamTimeout closes a pipe that opens no stream within d. Zero or
 // negative disables the check; unset means DefaultFirstStreamTimeout.
@@ -80,6 +126,8 @@ type MuxListener struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	firstStream time.Duration
+	hooks       PipeHooks
+	nextPipe    atomic.Uint64
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -117,13 +165,19 @@ func (l *MuxListener) acceptPipes() {
 			continue
 		}
 		l.wg.Add(1)
-		go l.acceptStreams(sess)
+		go l.acceptStreams(sess, l.nextPipe.Add(1))
 	}
 }
 
-func (l *MuxListener) acceptStreams(sess *yamux.Session) {
+func (l *MuxListener) acceptStreams(sess *yamux.Session, pipeID uint64) {
 	defer l.wg.Done()
 	defer sess.Close()
+	if l.hooks.Open != nil {
+		l.hooks.Open(pipeID)
+	}
+	if l.hooks.Close != nil {
+		defer l.hooks.Close(pipeID)
+	}
 	// Probation: a pipe that never opens a stream is dropped. Stopping the
 	// timer on the first stream leaves an established carrier untouched.
 	var probation *time.Timer
@@ -136,7 +190,7 @@ func (l *MuxListener) acceptStreams(sess *yamux.Session) {
 		if err != nil {
 			return // session died
 		}
-		st := withHalfClose(raw)
+		st := net.Conn(&pipeConn{Conn: withHalfClose(raw), pipeID: pipeID})
 		if probation != nil {
 			probation.Stop()
 			probation = nil
@@ -252,3 +306,8 @@ func (s halfCloseStream) CloseWrite() error { return s.Close() }
 // applied wherever a stream leaves this package, so nothing downstream has to
 // know that yamux spells half-close differently.
 func withHalfClose(s *yamux.Stream) net.Conn { return halfCloseStream{Stream: s} }
+
+// WithHalfClose gives a yamux stream the CloseWrite a relay needs. Anything
+// that splices onto a yamux stream must use it -- see halfCloseStream for what
+// goes wrong without it, which is silent truncation of bulk transfers only.
+func WithHalfClose(s *yamux.Stream) net.Conn { return withHalfClose(s) }

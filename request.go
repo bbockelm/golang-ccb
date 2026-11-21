@@ -56,14 +56,26 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 	t := s.targets[targetID]
 	s.mu.Unlock()
 	if t == nil {
-		return s.replyFailure(ctx, c, fmt.Sprintf("no target registered for ccbid %d", targetID))
+		// The id may name a CARRIER rather than a target: a carrier-attached
+		// target advertises "<public>#P#T", so the client sends ccbid=P with
+		// the real target at the head of the route. Both ids are ours, so
+		// there is no hop to forward -- collapse it here.
+		if ct, rest, ok := s.resolveCarrierHop(targetID, route); ok {
+			s.log.Info("collapsed carrier hop", "carrier", targetID, "ccbid", ct.id, "route", rest)
+			t, route = ct, rest
+		} else {
+			return s.replyFailure(ctx, c, fmt.Sprintf("no target registered for ccbid %d", targetID))
+		}
 	}
 
 	// Decide mode: the requester is private (and needs proxying) if it asked
 	// for streaming, if the return address is itself CCB-routed, or if there is a
 	// downstream route to follow (a tunnel).
 	returnInfo, _ := addresses.ParseSinful(returnAddr)
-	if streamingRequired || returnInfo.IsCCB() || route != "" {
+	// A carrier-attached target can never serve a standard request: standard
+	// mode tells it to connect to the REQUESTER, which is further away than the
+	// broker it reached us through. Such a target is always proxied.
+	if streamingRequired || returnInfo.IsCCB() || route != "" || t.carrierID != 0 {
 		rc := routeContext{
 			route: route,
 			// This is the client-facing (entry) broker: stamp the audit trail from

@@ -723,6 +723,48 @@ term, and reconnect IP pinning does not apply to them.
 
 ---
 
+### 5.7 The far end need not be a broker
+
+Everything above assumes the inside end of a carrier is a second CCB: it
+authenticates local daemons, allocates its own CCBIDs, and registers upstream,
+so it needs HTCondor configuration, credentials and an authorization policy on
+the far host.
+
+It can instead be a **splice helper** (`transport/splice`,
+`cmd/htc-ccb-splice`): a byte relay that accepts local connections and copies
+each onto its own stream of the carrier. It terminates nothing.
+
+```
+   inside CCB                                 splice helper
+
+ EP --CEDAR--> inside CCB                EP ------CEDAR (end to end)------> outside CCB
+                    |                       \                                  ^
+                 CEDAR                       \ bytes                           |
+                    v                         v                                |
+               outside CCB               helper ------------ carrier ----------+
+                                       (accept, copy, copy)
+
+ contact: <outside>#42#17                contact: <outside>#P#T
+          two hops, two brokers                   two ids, ONE broker
+```
+
+A client cannot tell the two apart: both give it a nested contact, both put it
+on the streaming path, and in both the EP reverse-connects to whatever is on
+its own side of the pipe. What differs is entirely server-side — with a helper
+the outside broker owns both ids and collapses the hop locally instead of
+forwarding it to a peer.
+
+| | inside CCB | splice helper |
+|---|---|---|
+| far host runs | a broker: CEDAR, authz, credentials, config | `io.Copy` |
+| staged payload (linux/amd64, gz) | 4.71 MiB | **1.43 MiB** |
+| authorization | on the far host | at the outside broker |
+
+Use it where the far host is one you are staging onto rather than
+administering, and the inside CCB where you want the authorization boundary
+near the daemons. See `SPLICE_HELPER.md` for the model, what it costs, and the
+experiments behind each decision.
+
 ## 6. Package layout (`transport/fstun`)
 
 - `frame.go` — types, header/CRC encode+decode, partial-frame detection.
