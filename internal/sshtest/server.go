@@ -227,7 +227,8 @@ func Echo(_ string, stdin io.Reader, stdout, _ io.Writer) int {
 //
 // The command is handed to a shell because that is how sshd runs an exec
 // request, and the carrier relies on it: a staged broker is started with
-// `env -i CONDOR_CONFIG=... binary -carrier-stdio`.
+// `binary -listen <addr>`, and historically `env -i CONDOR_CONFIG=... binary
+// -carrier-stdio` when the far end was a broker.
 func RunReal(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
 	c := exec.Command("/bin/sh", "-c", cmd)
 	c.Stdin = stdin

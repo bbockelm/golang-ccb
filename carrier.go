@@ -306,10 +306,10 @@ func (c *carrierClient) sshConfig(cfg Config) (sshcarrier.Config, *sshcarrier.St
 			"ccbserver: an ssh:// carrier needs CCB_CARRIER_SSH_STAGE_BINARY, CCB_CARRIER_SSH_STAGE_BINARY_DIR or CCB_CARRIER_SSH_COMMAND (this htc-ccb carries no built-in builds to stage; one built with -tags embedremote does)")
 	}
 	return sc, &sshcarrier.StageConfig{
-		Binary:       cfg.CarrierSSH.StageBinary,
-		BinaryDir:    cfg.CarrierSSH.StageBinaryDir,
-		RemoteDir:    cfg.CarrierSSH.RemoteDir,
-		Logger:       c.log,
+		Binary:    cfg.CarrierSSH.StageBinary,
+		BinaryDir: cfg.CarrierSSH.StageBinaryDir,
+		RemoteDir: cfg.CarrierSSH.RemoteDir,
+		Logger:    c.log,
 	}, nil
 }
 

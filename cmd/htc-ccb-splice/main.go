@@ -11,9 +11,12 @@
 // what makes that cheap -- nothing has to be configured on the far host, and a
 // compromise of this binary yields a pipe, not a broker identity.
 //
-// Contrast htc-ccb-relay, which is a real inside CCB: it terminates CEDAR,
-// enforces HTCondor's authorization policy and needs a configuration staged
-// alongside it. See docs/SPLICE_HELPER.md for which to reach for.
+// Contrast an inside CCB (htc-ccb at the far end of a cmd: carrier, or
+// -carrier-stdio): a real broker that terminates CEDAR, enforces HTCondor's
+// authorization policy and needs a configuration of its own on that host. It
+// is still the right far end where you want the authorization boundary near
+// the daemons; this is the right one where you are staging onto a host rather
+// than administering it. See docs/SPLICE_HELPER.md.
 package main
 
 import (

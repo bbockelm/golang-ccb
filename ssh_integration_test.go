@@ -28,9 +28,9 @@ var (
 	builtPath string
 	builtErr  error
 
-	relayOnce sync.Once
-	relayPath string
-	relayErr  error
+	helperOnce sync.Once
+	helperPath string
+	helperErr  error
 )
 
 // brokerBinary compiles htc-ccb once for the whole run.
@@ -57,32 +57,31 @@ func brokerBinary(t *testing.T) string {
 	return builtPath
 }
 
-// relayBinary compiles htc-ccb-relay once for the whole run.
+// helperBinary compiles htc-ccb-splice once for the whole run.
 //
-// The relay is what a staging carrier should actually send, so it gets the
-// same end-to-end treatment as the full binary rather than being trusted to
-// behave because it shares a library: it is a different main with a
-// different, smaller wiring, and the ways it could differ -- a knob it does
-// not read, a role it does not take, a flag it rejects -- are exactly the
-// ones a unit test cannot see.
-func relayBinary(t *testing.T) string {
+// The helper is what a staging carrier actually sends, so it gets the same
+// end-to-end treatment as the full binary rather than being trusted to behave
+// because it shares a library: it is a different main with a different, much
+// smaller wiring, and the ways it could differ -- a flag it rejects, a role it
+// does not take -- are exactly the ones a unit test cannot see.
+func helperBinary(t *testing.T) string {
 	t.Helper()
-	relayOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "htc-ccb-relay-integration")
+	helperOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "htc-ccb-splice-integration")
 		if err != nil {
-			relayErr = err
+			helperErr = err
 			return
 		}
-		relayPath = filepath.Join(dir, "htc-ccb-relay")
-		out, err := exec.Command("go", "build", "-buildvcs=false", "-o", relayPath, "./cmd/htc-ccb-relay").CombinedOutput()
+		helperPath = filepath.Join(dir, "htc-ccb-splice")
+		out, err := exec.Command("go", "build", "-buildvcs=false", "-o", helperPath, "./cmd/htc-ccb-splice").CombinedOutput()
 		if err != nil {
-			relayErr = fmt.Errorf("building htc-ccb-relay: %w\n%s", err, out)
+			helperErr = fmt.Errorf("building htc-ccb-splice: %w\n%s", err, out)
 		}
 	})
-	if relayErr != nil {
-		t.Fatal(relayErr)
+	if helperErr != nil {
+		t.Fatal(helperErr)
 	}
-	return relayPath
+	return helperPath
 }
 
 // remoteConfig writes the configuration the staged broker will run with.
@@ -348,7 +347,7 @@ func TestIntegrationSSHCarrierStagesTheRelay(t *testing.T) {
 	defer func() { _ = srv.Close() }()
 
 	_, broker := sshCarrierBroker(t, srv, func(sc *SSHCarrierConfig) {
-		sc.StageBinary = relayBinary(t)
+		sc.StageBinary = helperBinary(t)
 	})
 	waitForStagedBroker(t, broker)
 }
@@ -365,7 +364,7 @@ func TestIntegrationADirectoryOfBuildsPrefersTheRelay(t *testing.T) {
 
 	dir := t.TempDir()
 	goos, goarch := runtime.GOOS, runtime.GOARCH
-	copyFile(t, relayBinary(t), filepath.Join(dir, "htc-ccb-relay-"+goos+"-"+goarch))
+	copyFile(t, helperBinary(t), filepath.Join(dir, "htc-ccb-splice-"+goos+"-"+goarch))
 	copyFile(t, brokerBinary(t), filepath.Join(dir, "htc-ccb-"+goos+"-"+goarch))
 
 	remoteDir := filepath.Join(t.TempDir(), "staged")
@@ -384,7 +383,7 @@ func TestIntegrationADirectoryOfBuildsPrefersTheRelay(t *testing.T) {
 		t.Fatalf("expected exactly one staged binary, found %v", staged)
 	}
 	got := fileSize(t, filepath.Join(remoteDir, staged[0]))
-	relaySize := fileSize(t, relayBinary(t))
+	relaySize := fileSize(t, helperBinary(t))
 	if got != relaySize {
 		t.Errorf("staged %d bytes; the relay is %d and the full binary %d -- the wrong build was sent",
 			got, relaySize, fileSize(t, brokerBinary(t)))
