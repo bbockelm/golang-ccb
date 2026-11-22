@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/security"
-	"github.com/htcondor/golang-htcondor/config"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/htcondor/golang-htcondor/config"
 )
 
 func testConfig(t *testing.T, text string) *config.Config {
