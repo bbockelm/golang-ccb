@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/bbockelm/cedar/security"
-	"github.com/htcondor/golang-htcondor/mapfile"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/htcondor/golang-htcondor/mapfile"
 )
 
 // TestBearerTokenVerifierAcceptsIDToken proves the CCB WebSocket-carrier verifier
