@@ -25,7 +25,7 @@ reads HTCondor configuration and wires it up.
 | `test/e2e-squid/` | the container tier: a real squid, a node with no route out |
 | `packaging/` | nfpm configuration, the RPM build, the no-cgo check |
 
-Dependencies of note: [`cedar`](https://github.com/bbockelm/cedar) for the
+Dependencies of note: [`cedar`](https://github.com/htcondor/cedar) for the
 CEDAR wire protocol and security, and
 [`golang-htcondor`](https://github.com/htcondor/golang-htcondor) for
 configuration, logging and the DaemonCore conventions.

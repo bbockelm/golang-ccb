@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
+	"github.com/htcondor/cedar/ccb"
 
 	"github.com/bbockelm/golang-ccb/transport/cmdcarrier"
 )

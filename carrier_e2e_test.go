@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
+	"github.com/htcondor/cedar/ccb"
 )
 
 // startOutsideCarrierCCB starts an outside CCB that faces the pool over TCP

@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
-	cedarserver "github.com/bbockelm/cedar/server"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/ccb"
+	cedarserver "github.com/htcondor/cedar/server"
+	"github.com/htcondor/cedar/stream"
 )
 
 // proxySession coordinates a streaming (private<->private) connection. The

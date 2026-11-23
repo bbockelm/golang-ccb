@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/ccb"
+	cedarserver "github.com/htcondor/cedar/server"
 
 	"github.com/bbockelm/golang-ccb/transport/sshcarrier"
 )

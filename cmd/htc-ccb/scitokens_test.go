@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/security"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/htcondor/cedar/security"
 	"github.com/htcondor/golang-htcondor/config"
 )
 

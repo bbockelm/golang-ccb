@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/addresses"
-	"github.com/bbockelm/cedar/ccb"
+	"github.com/htcondor/cedar/addresses"
+	"github.com/htcondor/cedar/ccb"
 )
 
 func echoHandler(conn net.Conn, _ ccb.InboundMeta) {
