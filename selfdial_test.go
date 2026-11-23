@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
+	"github.com/htcondor/cedar/ccb"
 )
 
 // Can a broker's outbound proxy dial the broker's OWN address?

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bbockelm/cedar/addresses"
-	"github.com/bbockelm/cedar/ccb"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/addresses"
+	"github.com/htcondor/cedar/ccb"
+	cedarserver "github.com/htcondor/cedar/server"
 )
 
 // handleRequest handles CCB_REQUEST. It looks up the target, decides between

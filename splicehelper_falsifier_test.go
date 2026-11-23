@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/addresses"
-	"github.com/bbockelm/cedar/ccb"
-	"github.com/bbockelm/cedar/commands"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/addresses"
+	"github.com/htcondor/cedar/ccb"
+	"github.com/htcondor/cedar/commands"
+	cedarserver "github.com/htcondor/cedar/server"
 
 	"github.com/bbockelm/golang-ccb/transport/carrier"
 	"github.com/bbockelm/golang-ccb/transport/splice"

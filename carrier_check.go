@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bbockelm/cedar/commands"
-	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/commands"
+	"github.com/htcondor/cedar/security"
+	"github.com/htcondor/cedar/stream"
 
 	"github.com/bbockelm/golang-ccb/transport/wscarrier"
 )

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
+	"github.com/htcondor/cedar/ccb"
 )
 
 // A repeating 0..255 ramp: the byte at global stream offset o is byte(o%256).

@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
-	"github.com/bbockelm/cedar/commands"
-	cedarserver "github.com/bbockelm/cedar/server"
+	"github.com/htcondor/cedar/ccb"
+	"github.com/htcondor/cedar/commands"
+	cedarserver "github.com/htcondor/cedar/server"
 	htcondor "github.com/htcondor/golang-htcondor"
 )
 

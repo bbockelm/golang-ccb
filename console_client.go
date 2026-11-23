@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bbockelm/cedar/ccb"
-	"github.com/bbockelm/cedar/security"
-	"github.com/bbockelm/cedar/stream"
+	"github.com/htcondor/cedar/ccb"
+	"github.com/htcondor/cedar/security"
+	"github.com/htcondor/cedar/stream"
 )
 
 // OperatorChallenge is a login a broker is stuck on, as the console presents

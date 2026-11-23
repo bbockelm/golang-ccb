@@ -3,10 +3,10 @@ module github.com/bbockelm/golang-ccb
 go 1.26.0
 
 require (
-	github.com/PelicanPlatform/classad v0.43.0
-	github.com/bbockelm/cedar v0.7.16
+	github.com/PelicanPlatform/classad v0.44.1
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/yamux v0.1.2
+	github.com/htcondor/cedar v0.7.17
 	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.48.0
@@ -21,6 +21,7 @@ require (
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
 	github.com/jcmturner/gofork v1.7.6 // indirect
+	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect
@@ -41,7 +42,7 @@ require (
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/htcondor/golang-htcondor v0.25.0
+	github.com/htcondor/golang-htcondor v0.26.1
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.59.0
 )
