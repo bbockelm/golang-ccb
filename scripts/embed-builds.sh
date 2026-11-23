@@ -80,7 +80,7 @@ ERROR: $n SQLite-related packages are still linked into the relay for
        that predates it ignores the tag without complaint, and the result is
        a staged binary roughly 4 MB larger than it needs to be.
 
-       Either update github.com/bbockelm/golang-htcondor to a version whose
+       Either update github.com/htcondor/golang-htcondor to a version whose
        daemon package has sessionstore_nosqlite.go, or set TAGS= to build
        without the tag deliberately.
 MSG
