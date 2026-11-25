@@ -6,7 +6,7 @@ require (
 	github.com/PelicanPlatform/classad v0.44.1
 	github.com/coder/websocket v1.8.15
 	github.com/hashicorp/yamux v0.1.2
-	github.com/htcondor/cedar v0.7.18-0.20261125225448-a2565666c4e7
+	github.com/htcondor/cedar v0.7.18-0.20261125230610-4ec12bb2b80c
 	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 	golang.org/x/term v0.48.0
