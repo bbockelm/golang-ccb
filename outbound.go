@@ -119,6 +119,17 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 		s.log.Warn("proxy-connect denied", "remote", c.RemoteAddr, "error", err)
 		return s.replyFailure(ctx, c, "authorization denied")
 	}
+	reqEp := s.limits.endpointOf(c.Stream.GetConnection())
+	if err := s.limits.take(ctx, kindProxyConnect, s.maxWait(), reqEp); err != nil {
+		return s.replyFailure(ctx, c, err.Error())
+	}
+	// Hold the requester's side of the splice caps before dialing, so a
+	// refused relay costs no connection to the target.
+	releaseSplice, err := s.limits.acquire(kindSplices, reqEp)
+	if err != nil {
+		return s.replyFailure(ctx, c, err.Error())
+	}
+	defer func() { releaseSplice() }()
 	ad, err := ccb.ReadControlAd(ctx, c.Stream)
 	if err != nil {
 		return fmt.Errorf("proxy-connect: reading ad: %w", err)
@@ -152,6 +163,25 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 		return s.replyFailure(ctx, c, err.Error())
 	}
 
+	// An exit CCB knows where it actually connected, so the target's network
+	// is charged too: its caps and bandwidth limits protect that network from
+	// the relay. A forwarding broker's connection goes to its next hop, not
+	// the target; the exit that dials accounts for the target.
+	eps := []endpoint{reqEp}
+	if _, direct := s.outbound.(*tcpDirectTransport); direct {
+		eps = append(eps, s.limits.endpointFor(targetConn.RemoteAddr()))
+		// Trade the requester-only hold for one covering both ends, so a
+		// splice whose ends share a class counts once there. Released first:
+		// held across the acquire, it would count this splice against itself.
+		releaseSplice()
+		both, err := s.limits.acquire(kindSplices, eps...)
+		if err != nil {
+			_ = targetConn.Close()
+			return s.replyFailure(ctx, c, err.Error())
+		}
+		releaseSplice = both
+	}
+
 	// Reply {Result:true} (no ProxyMode, no hello -- the requester is the CEDAR
 	// connector) while the requester socket still has broker-session crypto, THEN
 	// splice the raw sockets (crypto off both sides) and relay opaque bytes.
@@ -161,7 +191,7 @@ func (s *Server) handleProxyConnect(ctx context.Context, c *cedarserver.Conn) er
 	}
 	s.log.Info("proxy-connect splice established", "remote", c.RemoteAddr, "target", target,
 		"via", s.outbound.describe(), "name", name)
-	st := spliceConns(c.Stream.GetConnection(), targetConn)
+	st := spliceConns(c.Stream.GetConnection(), targetConn, s.limits.bandwidthFor(eps...)...)
 	// A relay that only ever logs its start cannot be used to tell a transport
 	// failure from an application one. The counterpart carries how much crossed
 	// in each direction, how long it lasted, and why it stopped.

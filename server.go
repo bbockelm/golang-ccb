@@ -255,6 +255,13 @@ type Config struct {
 	// outbound proxy refuses local addresses whether or not this is set.
 	DialControl func(network, address string, c syscall.RawConn) error
 
+	// Limits is the rate-limit policy: how often each source network may
+	// connect, register, request and proxy, how much it may hold at once, and
+	// how much bandwidth relayed connections may use. The zero value limits
+	// nothing; the htc-ccb daemon starts from DefaultLimits. SetLimits
+	// replaces it while the server runs.
+	Limits Limits
+
 	// Logger is used for operational logging (default slog.Default()).
 	Logger *slog.Logger
 }
@@ -349,6 +356,8 @@ type Server struct {
 	proxies    map[string]*proxySession    // connectID -> pending proxy session
 	carriers   carrierSet                  // live carrier ids (see carrier_target.go)
 
+	limits *limiter // rate limits and caps (see limiter.go)
+
 	// Inbound tunneling (Config.Upstream). tunnelContact is this inside CCB's own
 	// contact via the upstream ("<outside>#<id>"), used as the broker prefix when
 	// stamping local registrants' contacts so they nest; empty until the upstream
@@ -396,6 +405,13 @@ type target struct {
 	// advertises a nested contact and can only ever be reached by proxy; see
 	// carrier_target.go.
 	carrierID uint64
+
+	// ep is the target as the rate limits see it; lim holds the limits on
+	// requests to it, replaced when the policy changes; pending counts the
+	// requests forwarded to it that it has not yet answered.
+	ep      endpoint
+	lim     atomic.Pointer[targetLimits]
+	pending atomic.Int64
 }
 
 func (t *target) write(ctx context.Context, ad *classad.ClassAd) error {
@@ -436,7 +452,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	lim, err := newLimiter(cfg.Limits, cfg.Logger)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
+		limits:           lim,
 		cfg:              cfg,
 		log:              cfg.Logger,
 		targets:          map[uint64]*target{},
@@ -505,6 +526,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.srv = cedarserver.New(cfg.Security)
 	s.srv.Authorizer = cfg.Authorizer
+	s.srv.AdmitConnection = s.AdmitConnection
 	s.RegisterOn(s.srv)
 	return s, nil
 }
@@ -566,6 +588,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 }
 
 func (s *Server) startBackground(ctx context.Context) {
+	go s.limits.run(ctx, time.Minute)
 	if s.cfg.ReconnectStore != nil {
 		go s.sweepLoop(ctx)
 	}
@@ -684,6 +707,19 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 		s.log.Warn("register denied", "remote", c.RemoteAddr, "error", err)
 		return err
 	}
+	// Rate and cap before anything else: a refused registration is closed
+	// unanswered, and the daemon's CCB client retries it later.
+	conn := c.Stream.GetConnection()
+	ep := s.limits.endpointOf(conn)
+	if err := s.limits.take(ctx, kindRegister, s.maxWait(), ep); err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	releaseReg, err := s.limits.acquire(kindRegistrations, ep)
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	defer releaseReg()
+
 	ad, err := ccb.ReadControlAd(ctx, c.Stream)
 	if err != nil {
 		return fmt.Errorf("register: reading ad: %w", err)
@@ -713,8 +749,10 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 	t := &target{
 		name:   name,
 		stream: c.Stream,
-		conn:   c.Stream.GetConnection(),
+		conn:   conn,
+		ep:     ep,
 	}
+	t.lim.Store(s.limits.targetLimitsFor(ep))
 	if cid, ok := s.carrierOf(t.conn); ok {
 		t.carrierID = cid
 	}
@@ -799,6 +837,13 @@ func (s *Server) handleRegister(ctx context.Context, c *cedarserver.Conn) error 
 // (e.g. a network partition with no TCP RST), so its registration does not leak.
 func (s *Server) serveTarget(ctx context.Context, t *target) {
 	for {
+		// Pace a daemon that talks too much by reading from it more slowly:
+		// TCP pushes back on it, and nothing it sent is lost.
+		if ml := t.lim.Load().message; ml != nil {
+			if err := ml.Wait(ctx); err != nil {
+				return
+			}
+		}
 		if s.cfg.TargetIdleTimeout > 0 {
 			_ = t.conn.SetReadDeadline(time.Now().Add(s.cfg.TargetIdleTimeout))
 		}
@@ -918,6 +963,73 @@ func parseContactID(contact string) (uint64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// AdmitConnection decides whether to take a new connection, before anything
+// is read from it: it applies the per-source connection rate and the cap on a
+// source's connections still in their security handshake. New installs it on
+// the server's own command server; a host daemon serving the CCB commands on
+// its server (RegisterOn) installs it there if it wants the CCB's limits on
+// its socket.
+func (s *Server) AdmitConnection(conn net.Conn) (func(), error) {
+	return s.limits.admitConn(conn)
+}
+
+// SetLimits replaces the rate-limit policy while the server runs, as a
+// reconfig does. Rate buckets restart full; what sources hold (registrations,
+// relayed connections) stays counted, so a lowered cap applies to new work at
+// once without disturbing what exists.
+func (s *Server) SetLimits(l Limits) error {
+	p, err := compilePolicy(l)
+	if err != nil {
+		return err
+	}
+	s.limits.setPolicy(p)
+	s.mu.Lock()
+	targets := make([]*target, 0, len(s.targets))
+	for _, t := range s.targets {
+		targets = append(targets, t)
+	}
+	s.mu.Unlock()
+	for _, t := range targets {
+		t.lim.Store(s.limits.targetLimitsFor(t.ep))
+	}
+	return nil
+}
+
+// Limits returns the rate-limit policy in force.
+func (s *Server) Limits() Limits {
+	return s.limits.policy().limits
+}
+
+func (s *Server) maxWait() time.Duration {
+	return s.limits.policy().limits.MaxWait
+}
+
+// beginTargetRequest admits one request forwarded to t against the limits on
+// t itself, which protect the daemon rather than the broker: how often it is
+// asked, and how many requests it may have unanswered. end marks the request
+// answered; it is safe to call more than once.
+func (s *Server) beginTargetRequest(ctx context.Context, t *target) (end func(), err error) {
+	tl := t.lim.Load()
+	if err := s.limits.takeTargetRequest(ctx, tl, t.id, s.maxWait()); err != nil {
+		return func() {}, err
+	}
+	n := t.pending.Add(1)
+	if tl != nil && tl.maxPending > 0 && n > int64(tl.maxPending) {
+		t.pending.Add(-1)
+		e := &LimitError{
+			What:   "pending requests",
+			Scope:  "per-target",
+			Class:  tl.class,
+			Source: fmt.Sprintf("ccbid %d", t.id),
+			Limit:  fmt.Sprintf("%d at once", tl.maxPending),
+		}
+		s.limits.refusals.note(e)
+		return func() {}, e
+	}
+	var once sync.Once
+	return func() { once.Do(func() { t.pending.Add(-1) }) }, nil
 }
 
 // proxyAddrSinful returns the broker's rendezvous address as an HTCondor sinful.

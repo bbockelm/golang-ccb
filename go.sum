@@ -25,8 +25,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hashicorp/yamux v0.1.2 h1:XtB8kyFOyHXYVFnwT5C3+Bdo8gArse7j2AQ0DA0Uey8=
 github.com/hashicorp/yamux v0.1.2/go.mod h1:C+zze2n6e/7wshOZep2A70/aQU6QBRWJO/G6FT1wIns=
-github.com/htcondor/cedar v0.7.17 h1:erMDgx/cBu297Vfal81vEvviu4mSWIdpq7447oL3PBY=
-github.com/htcondor/cedar v0.7.17/go.mod h1:4vL7aMownWVDg2K4Y2GSOehb1JzasahSA83J08TJTo0=
+github.com/htcondor/cedar v0.7.18-0.20261125225448-a2565666c4e7 h1:eAKr5K0nauA2dyjysuReU+A/58vHj0oNjvU1YA7ktiQ=
+github.com/htcondor/cedar v0.7.18-0.20261125225448-a2565666c4e7/go.mod h1:4vL7aMownWVDg2K4Y2GSOehb1JzasahSA83J08TJTo0=
 github.com/htcondor/golang-htcondor v0.26.1 h1:Uoy4i4G2aEOTmxP+kcRFxpcES3Xfj+uEyGAvU6jl7gA=
 github.com/htcondor/golang-htcondor v0.26.1/go.mod h1:yOsYi3LCrckugYjEuiPQwa4ymEneh4kXsXCk0SPgkMY=
 github.com/jcmturner/aescts/v2 v2.0.0 h1:9YKLH6ey7H4eDBXW8khjYslgyqG2xZikXP0EQFKrle8=

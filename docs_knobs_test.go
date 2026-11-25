@@ -25,7 +25,7 @@ func TestEveryDocumentedKnobIsReadBySomething(t *testing.T) {
 
 	var missing []string
 	for name := range documented {
-		if read[name] || notAKnob[name] {
+		if read[name] || notAKnob[name] || perClassSpelling(name, read) {
 			continue
 		}
 		missing = append(missing, name+" ("+strings.Join(documented[name], ", ")+")")
@@ -56,7 +56,25 @@ var notAKnob = map[string]bool{
 	// Prose, not a name: "the CCB_CARRIER_* knobs" and a design-document
 	// filename both match the pattern.
 	"CCB_CARRIER_":         true,
+	"CCB_LIMIT_":           true, // CCB_LIMIT_<CLASS>_... in the rate-limit reference
 	"CCB_TUNNELING_DESIGN": true,
+}
+
+// perClassSpelling reports whether name is a rate-limit knob spelled for a
+// network class, CCB_LIMIT_<CLASS>_<KNOB>, whose default-class spelling
+// CCB_LIMIT_<KNOB> is read. A misspelt knob still fails: its suffix is read
+// nowhere.
+func perClassSpelling(name string, read map[string]bool) bool {
+	rest, ok := strings.CutPrefix(name, "CCB_LIMIT_")
+	if !ok {
+		return false
+	}
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '_' && read["CCB_LIMIT_"+rest[i+1:]] {
+			return true
+		}
+	}
+	return false
 }
 
 var knobPattern = regexp.MustCompile(`\bCCB_[A-Z0-9_]+`)

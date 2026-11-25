@@ -263,6 +263,15 @@ and `<local-name>.CCB_SESSION_CACHE_FILE` beat the bare name.
 | `CCB_DIAL_REFUSE_LOCAL_ADDRESSES` | `false` | refuse reverse connects to loopback and link-local addresses. The address comes from the requester, so this is worth setting wherever the brokered daemons are not all trusted |
 | `CCB_RECONNECT_ALLOWED_FROM_ANY_IP` | `false` | let a target reconnect from an address other than the one it registered from. Needed where targets legitimately move — and where they only appear to: behind a load-balanced NAT a host's source address can change between connections without the host going anywhere |
 
+### Rate limits
+
+Limits on how often each network may connect, register, request and proxy,
+how many registrations and relayed connections it may hold, and how much
+bandwidth relays may use are on by default, at per-host values a well-behaved
+host does not reach. Networks such as offsite clients can be given their own
+limits. See [docs/RATE_LIMITS.md](docs/RATE_LIMITS.md); `CCB_LIMIT_ENABLE =
+false` turns them off.
+
 ### Authorization
 
 The broker uses the pool's own authorization levels, as the collector's CCB

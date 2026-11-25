@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/htcondor/cedar/ccb"
 	cedarserver "github.com/htcondor/cedar/server"
 	"github.com/htcondor/cedar/stream"
@@ -52,6 +54,27 @@ func (s *Server) handleProxyRequest(ctx context.Context, c *cedarserver.Conn, t 
 // splicing; when nil (an intermediate relay hop) it only splices, because the outer
 // broker already answered the client.
 func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replyStream *stream.Stream, t *target, connectID, name string, rc routeContext) error {
+	// Both ends count against the relay caps and share the bandwidth limits:
+	// a splice ties up the broker for both networks it joins. Checked before
+	// the target is asked to connect, so a refused relay costs it nothing.
+	reqEp := s.limits.endpointOf(requesterConn)
+	releaseSplice, err := s.limits.acquire(kindSplices, reqEp, t.ep)
+	if err != nil {
+		return s.proxyFail(ctx, replyStream, requesterConn, err.Error())
+	}
+	defer releaseSplice()
+	// The per-target limits protect a daemon. A request with a route is for
+	// a downstream broker, which carries every connection into its cluster
+	// and applies these limits itself to the daemon it relays to.
+	endTarget := func() {}
+	if rc.route == "" {
+		endTarget, err = s.beginTargetRequest(ctx, t)
+		if err != nil {
+			return s.proxyFail(ctx, replyStream, requesterConn, err.Error())
+		}
+	}
+	defer endTarget()
+
 	s.mu.Lock()
 	s.nextReq++
 	reqID := fmt.Sprintf("%d", s.nextReq)
@@ -108,6 +131,7 @@ func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replySt
 
 	select {
 	case targetConn := <-sess.targetCh:
+		endTarget()
 		if replyStream != nil {
 			// Tell the requester the connection will be proxied on this socket, then
 			// replay a reverse-connect hello (its accept logic validates
@@ -128,7 +152,7 @@ func (s *Server) proxyRelay(ctx context.Context, requesterConn net.Conn, replySt
 		}
 		// Splice raw bytes until either side closes.
 		s.log.Info("proxy splice established", "ccbid", t.id, "request", reqID)
-		st := spliceConns(sess.requesterConn, targetConn)
+		st := spliceConns(sess.requesterConn, targetConn, s.limits.bandwidthFor(reqEp, t.ep)...)
 		args := append([]any{"ccbid", t.id, "request", reqID}, st.LogArgs()...)
 		if st.OK() {
 			s.log.Info("proxy splice closed", args...)
@@ -401,8 +425,15 @@ type writeOnly struct{ io.Writer }
 // drain. Note that this is about delivering what was already written; a relay
 // cannot invent bytes a peer never sent, so a peer that closes without replying
 // still produces an EOF at the far end, correctly.
-func spliceConns(c1, c2 net.Conn) spliceStats {
+//
+// lims, if any, pace the relay: every byte in either direction draws on each
+// of them. A paced relay copies through userspace in chunks no larger than the
+// smallest bucket, giving up the kernel splice fast path; an unpaced one keeps
+// it.
+func spliceConns(c1, c2 net.Conn, lims ...*rate.Limiter) spliceStats {
 	start := time.Now()
+	pace, stopPacing := context.WithCancel(context.Background())
+	defer stopPacing()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -418,7 +449,7 @@ func spliceConns(c1, c2 net.Conn) spliceStats {
 
 	pipe := func(dst, src net.Conn, n *atomic.Int64, side string) {
 		defer wg.Done()
-		_, err := io.Copy(countingConn{Conn: dst, n: n}, src)
+		_, err := io.Copy(countingConn{Conn: dst, n: n}, newThrottledReader(pace, src, lims))
 		if err != nil {
 			errMu.Lock()
 			if firstErr == nil {
@@ -457,6 +488,7 @@ func spliceConns(c1, c2 net.Conn) spliceStats {
 	}
 	_ = c1.Close()
 	_ = c2.Close()
+	stopPacing() // a direction still waiting on a bucket gives up now
 
 	errMu.Lock()
 	err, side, half, first := firstErr, firstSide, noHalfClose, finishedFirst
