@@ -69,9 +69,15 @@ func (s *Server) startUpstream(ctx context.Context) {
 			// serve it as our own broker so the client's next-hop CCB_REQUEST (for a
 			// local registrant) is dispatched here.
 			if meta.Route != "" {
+				s.limits.trust(conn)
+				defer s.limits.untrust(conn)
 				s.startInboundRelay(ctx, conn, meta)
 				return
 			}
+			// A connection the upstream broker forwarded down our own
+			// registration: that broker applied its limits to whoever asked.
+			s.limits.trust(conn)
+			defer s.limits.untrust(conn)
 			_ = s.srv.ServeConn(ctx, conn)
 		},
 	})

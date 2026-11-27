@@ -427,10 +427,19 @@ func newBroker(d *daemon.Daemon, cfg ccbserver.Config) (*ccbserver.Server, *daem
 		return nil, nil, fmt.Errorf("building authorization policy: %w", err)
 	}
 	cfg.Authorizer = az.Authorize
+	// Rate limits come from the configuration (CCB_LIMIT_*) and follow it on
+	// reconfig, as the authorization policy does.
+	limits, err := brokerLimits(d.Config())
+	if err != nil {
+		return nil, nil, fmt.Errorf("rate limits: %w", err)
+	}
+	cfg.Limits = limits
 	srv, err := ccbserver.New(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating CCB server: %w", err)
 	}
+	logLimits(d.Logger(), limits)
+	d.OnReconfig(func(c *config.Config) { reloadLimits(d.Logger(), srv, c) })
 	cs := srv.CommandServer()
 	d.RegisterDefaultCommands(cs)
 	if err := d.InstallSecurityLevels(cs); err != nil {

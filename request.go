@@ -33,6 +33,9 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 		s.log.Warn("request denied", "remote", c.RemoteAddr, "error", err)
 		return s.replyFailure(ctx, c, "authorization denied")
 	}
+	if err := s.limits.take(ctx, kindRequest, s.maxWait(), s.limits.endpointOf(c.Stream.GetConnection())); err != nil {
+		return s.replyFailure(ctx, c, err.Error())
+	}
 
 	targetContact := ccb.AdString(ad, ccb.AttrCCBID)
 	connectID := ccb.AdString(ad, ccb.AttrClaimID)
@@ -92,6 +95,12 @@ func (s *Server) handleRequest(ctx context.Context, c *cedarserver.Conn) error {
 // handleStandardRequest forwards a direct reverse-connect request to the target
 // and relays the target's result to the requester.
 func (s *Server) handleStandardRequest(ctx context.Context, c *cedarserver.Conn, t *target, connectID, returnAddr, name string) error {
+	endTarget, err := s.beginTargetRequest(ctx, t)
+	if err != nil {
+		return s.replyFailure(ctx, c, err.Error())
+	}
+	defer endTarget()
+
 	s.mu.Lock()
 	s.nextReq++
 	reqID := s.nextReq
