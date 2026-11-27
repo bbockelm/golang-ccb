@@ -32,6 +32,12 @@ const (
 	// before reporting without it. The child has normally already exited -- that
 	// is why the read failed -- so this is a race margin, not a timeout.
 	exitReportGrace = time.Second
+	// stderrDrainGrace bounds how long an exited child's report waits for its
+	// stderr to be read. The pipe normally reaches EOF the moment the child is
+	// gone; a grandchild that inherited stderr can hold it open indefinitely.
+	// It must stay well under exitReportGrace, or an I/O error would be
+	// reported without the exit status it waited for.
+	stderrDrainGrace = 250 * time.Millisecond
 )
 
 // DialConfig describes the child process whose stdin and stdout are the carrier
@@ -150,13 +156,15 @@ func Dial(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 	closeAll(inR, outW, errW)
 
 	p := &process{
-		cmd:    cmd,
-		label:  label,
-		prog:   prog,
-		grace:  orDuration(cfg.TerminateGrace, DefaultTerminateGrace),
-		waited: make(chan struct{}),
-		tail:   newTail(orInt(cfg.StderrLines, DefaultStderrLines)),
-		log:    log,
+		cmd:     cmd,
+		label:   label,
+		prog:    prog,
+		grace:   orDuration(cfg.TerminateGrace, DefaultTerminateGrace),
+		waited:  make(chan struct{}),
+		reaped:  make(chan struct{}),
+		drained: make(chan struct{}),
+		tail:    newTail(orInt(cfg.StderrLines, DefaultStderrLines)),
+		log:     log,
 	}
 	go p.drainStderr(errR)
 	go p.reap()
@@ -195,13 +203,25 @@ type process struct {
 	log   *slog.Logger
 	tail  *tail
 
-	waited  chan struct{} // closed once Wait has returned
+	waited  chan struct{} // closed once the exit is recorded and stderr read; see reap
+	reaped  chan struct{} // closed once Wait has returned
+	drained chan struct{} // closed once the stderr reader has stopped
 	mu      sync.Mutex
 	exitErr error
 }
 
 func (p *process) reap() {
 	err := p.cmd.Wait()
+	close(p.reaped)
+	// Wait returns when the child exits, not when its stderr has been read:
+	// stderr is an *os.File, so os/exec runs no copier for Wait to join. The
+	// last lines are the ones that say why the child left, so the exit is not
+	// reported until the reader has them -- or until the bound, for a
+	// grandchild still holding the pipe.
+	select {
+	case <-p.drained:
+	case <-time.After(stderrDrainGrace):
+	}
 	p.mu.Lock()
 	p.exitErr = err
 	p.mu.Unlock()
@@ -220,6 +240,7 @@ func (p *process) exited() (error, bool) {
 }
 
 func (p *process) drainStderr(r *os.File) {
+	defer close(p.drained)
 	defer func() { _ = r.Close() }()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 4096), DefaultStderrLineLimit)
@@ -275,22 +296,30 @@ func (p *process) annotate(err error) error {
 // shutdown stops the child. The pipes are already closed by the time this runs,
 // so the child has EOF on stdin and a well-behaved one is leaving anyway; the
 // signals are for one that is not.
+//
+// The signals follow reaped, not waited: a child that is gone but whose stderr
+// a grandchild still holds has exited, and must not be reported as ignoring
+// SIGTERM. Returning waits for waited, which follows reaped within
+// stderrDrainGrace, so a caller that has closed the carrier sees it exited.
 func (p *process) shutdown() error {
 	select {
-	case <-p.waited:
+	case <-p.reaped:
+		<-p.waited
 		return nil
 	default:
 	}
 	terminate(p.cmd)
 	select {
-	case <-p.waited:
+	case <-p.reaped:
+		<-p.waited
 		return nil
 	case <-time.After(p.grace):
 	}
 	p.log.Warn("carrier command did not exit on SIGTERM; killing", "grace", p.grace)
 	kill(p.cmd)
 	select {
-	case <-p.waited:
+	case <-p.reaped:
+		<-p.waited
 	case <-time.After(p.grace):
 		// Unkillable (uninterruptible sleep, most likely a hung network
 		// filesystem). Report it rather than blocking the broker's teardown on

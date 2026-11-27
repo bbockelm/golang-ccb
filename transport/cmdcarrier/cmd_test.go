@@ -114,6 +114,53 @@ func TestExitedAndStderrAreReadable(t *testing.T) {
 	}
 }
 
+// Once Exited reports the child gone, Stderr must hold everything the child
+// wrote. This child leaves its whole stderr in the pipe buffer as it exits, so
+// the reader is still working when Wait returns.
+func TestStderrCompleteOnceExited(t *testing.T) {
+	c := dialArgv(t, "/bin/sh", "-c", `s=$(i=0; while [ $i -lt 400 ]; do echo "line $i"; i=$((i+1)); done; echo last); printf '%s\n' "$s" >&2; exit 3`)
+	_, _ = io.ReadAll(c)
+	if _, exited := c.Exited(); !exited {
+		t.Fatal("child not reported as exited after its output ended")
+	}
+	if got := c.Stderr(); !strings.HasSuffix(got, "; last") {
+		t.Fatalf("Stderr() does not end with the child's last line: %q", got[max(0, len(got)-80):])
+	}
+}
+
+// A grandchild that inherits stderr holds the pipe open after the child is gone.
+// The exit is still reported, at most stderrDrainGrace late, with what the
+// child said before leaving.
+func TestExitReportedWhileGrandchildHoldsStderr(t *testing.T) {
+	c := dialArgv(t, "/bin/sh", "-c", "echo bye >&2; sleep 30 </dev/null >/dev/null & exit 4")
+	pgid := c.proc.cmd.Process.Pid
+	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+
+	_, _ = io.ReadAll(c)
+	deadline := time.Now().Add(exitReportGrace + stderrDrainGrace)
+	exitErr, exited := c.Exited()
+	for !exited && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		exitErr, exited = c.Exited()
+	}
+	if !exited {
+		t.Fatal("exit never reported while a grandchild held stderr open")
+	}
+	if exitErr == nil || !strings.Contains(exitErr.Error(), "exit status 4") {
+		t.Errorf("Exited() = %v, want exit status 4", exitErr)
+	}
+	if got := c.Stderr(); got != "bye" {
+		t.Errorf("Stderr() = %q, want %q", got, "bye")
+	}
+	start := time.Now()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if d := time.Since(start); d > stderrDrainGrace {
+		t.Errorf("Close took %v for a child that had already exited", d)
+	}
+}
+
 // Close must reap the child. A carrier that is re-established on every failure
 // would otherwise leave an ssh process behind each time.
 func TestCloseStopsTheChild(t *testing.T) {
